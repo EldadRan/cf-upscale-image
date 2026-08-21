@@ -119,9 +119,16 @@ RUN set -eux; \
     rm -f /tmp/encoders.txt /tmp/mp4muxer.txt /tmp/ffver.txt
 
 # ── pinned third-party source ───────────────────────────────────────────────────────────────
-RUN git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git "$SEEDVR2_DIR" \
- && git -C "$SEEDVR2_DIR" checkout "$SEEDVR2_COMMIT" \
- && rm -rf "$SEEDVR2_DIR/.git"
+# **Vendored, not cloned.** The tree is committed at `vendor/SeedVR2`, pristine at the commit
+# `SEEDVR2_COMMIT` names, so this build reaches no third-party host for its source. It used to
+# `git clone` upstream and check that commit out, which made every build — including a rollback
+# rebuild of an image that already shipped — depend on a repository nobody here controls staying
+# up, keeping its history, and keeping that commit reachable.
+#
+# `SEEDVR2_COMMIT` is no longer a checkout instruction. It is the provenance stamp naming which
+# upstream commit this copy was taken from, reported in every run record, and the string
+# `vendor_patch.py` fails against if the tree under it is not the one it expects.
+COPY vendor/SeedVR2 $SEEDVR2_DIR
 
 # **The one edit to the pinned source, and the only one.** Everything else this worker changes
 # about SeedVR2 is a runtime rebinding of a module-level name (`build_args`, `phasewatch`,

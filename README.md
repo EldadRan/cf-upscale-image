@@ -11,17 +11,35 @@ one code path and one image for both.
 
 ```
 handler/                        the worker, and the Docker build context
+handler/vendor/SeedVR2/         the upstream SeedVR2 source, vendored pristine
 .github/workflows/              the build-and-publish workflow
 ```
 
 `handler/Dockerfile` is the whole build. It starts from `runpod/pytorch:2.8.0-py3.11-cuda12.8.1`,
-fetches the SeedVR2 source pinned by `SEEDVR2_COMMIT`, applies `vendor_patch.py`, installs a
-pinned ffmpeg and bakes the model weights into the image, so a cold worker reaches for nothing
-over the network before its first frame.
+copies in the vendored SeedVR2 source, applies `vendor_patch.py`, installs a pinned ffmpeg and
+bakes the model weights into the image, so a cold worker reaches for nothing over the network
+before its first frame.
 
-`vendor_patch.py` is the only modification made to the vendored source. It states each patch at
-length and fails the build if the upstream text it expects has moved, so a silently rebased
-dependency stops the build rather than producing a subtly different image.
+## The vendored source
+
+`handler/vendor/SeedVR2/` is [SeedVR2](https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler)
+committed here **pristine**, exactly as upstream published it at the commit `SEEDVR2_COMMIT`
+names. It is licensed Apache-2.0 and upstream's `LICENSE` is kept alongside it.
+
+It is vendored rather than cloned at build time so that building this image depends on nothing
+outside this repository — including a rebuild of a version that already shipped, which would
+otherwise need a third-party repository to still exist, still have its history, and still have
+that commit reachable.
+
+`SEEDVR2_COMMIT` is therefore not a checkout instruction. It records which upstream commit this
+copy was taken from, and the worker reports it in every run record.
+
+**`vendor_patch.py` is the only modification, and it is applied at build rather than baked into
+the vendored tree.** That is deliberate: keeping the tree pristine and the change in a script
+means the modification is stated rather than buried, the tree stays diffable against upstream in
+one command, and the patch's exact-match-or-fail guard doubles as a tamper check on this
+repository's own copy — if the text it expects is not there, the build stops instead of quietly
+producing a different image.
 
 ## Building
 
