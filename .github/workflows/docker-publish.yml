@@ -1,0 +1,334 @@
+# Build and publish the CF upscale worker to GHCR.
+#
+# **The contract suite gates the publish**, so a red suite ships nothing and a pull request never
+# publishes. CI publishes; the endpoint is pinned to a sha; that sha is the only link between
+# them.
+name: cf-upscale-worker
+
+on:
+  # **No `push` trigger, deliberately.** Not every push is meant to be tested on CI and none of
+  # them is meant to produce an image: work lands in several commits and gets built once, when
+  # somebody decides it is ready. The suite runs on a laptop in seconds, which is where a push
+  # should be checked.
+  #
+  # It used to trigger on pushes touching `handler/**` or `tests/**`, and the `publish` job was
+  # already gated to `workflow_dispatch` — so those runs never built anything. They still did
+  # damage: a one-minute test run shares the concurrency group below with an in-flight publish and
+  # **cancelled it**. A stray commit killed a build that had been asked for on purpose, twice in
+  # one session.
+  pull_request:
+  workflow_dispatch:
+
+# **One build per ref at a time, and the newest wins.** Two pushes in quick succession otherwise
+# run two publishes concurrently, racing to push the same `:latest` tag — the loser can land last
+# and leave `:latest` pointing at the older commit. It also doubles a ~40 minute build's cost for
+# a result nobody wants. Superseded runs are cancelled rather than left to finish.
+# **Keyed on the event as well as the ref**, so a test run and a publish are never in the same
+# group. Two publishes on one ref still supersede each other — which is what this is for, since
+# they race to push the same `:latest` tag — but nothing that does not publish can cancel one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # Python 3.11 because that is what the base image ships (docs/decisions.md 2.1). Resolving the
+  # suite's dependencies against a different version than the container runs is how a set that
+  # cannot install in the image gets discovered after a 17 GB rebuild.
+  PYTHON_VERSION: "3.11"
+  # Kept in step with handler/Dockerfile. The distribution's ffmpeg is 4.4 and this code is
+  # written against 9.x; `-vsync` and `-fps_mode` have no version accepting both.
+  FFMPEG_RELEASE: autobuild-2026-08-08-13-06
+  FFMPEG_ASSET: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # **Cached because the release CDN is not reliable from a runner.** This exact 125 MB object
+      # returned 503 to six consecutive attempts, twice, while downloading fine from a laptop and
+      # while a *different* asset on the same host succeeded in the same run. The tarball is pinned
+      # and immutable, so the cache key is the asset name and a hit never needs the network at all.
+      - name: Cache the pinned ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: ~/ffmpeg-cache
+          key: ffmpeg-${{ env.FFMPEG_ASSET }}
+
+      # The same pinned build the image installs, so rung 1 runs against the encoder the worker
+      # will actually use. A suite green on a different ffmpeg proves less than it looks.
+      #
+      # A ~10 minute retry window rather than the ~15 seconds `--retry 5 --retry-delay 3` gives.
+      # The outage that broke this twice lasted longer than the old window and not much longer
+      # than a coffee, which is the range worth waiting out rather than failing in.
+      - name: Install the pinned ffmpeg
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/ffmpeg-cache
+          if [ ! -s ~/ffmpeg-cache/"${FFMPEG_ASSET}".tar.xz ]; then
+            curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 600 \
+              -o ~/ffmpeg-cache/"${FFMPEG_ASSET}".tar.xz \
+              "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_ASSET}.tar.xz"
+          else
+            echo "cache hit: no network needed"
+          fi
+          tar -xJf ~/ffmpeg-cache/"${FFMPEG_ASSET}".tar.xz -C /tmp
+          sudo install -m755 "/tmp/${FFMPEG_ASSET}/bin/ffmpeg" /usr/local/bin/ffmpeg
+          sudo install -m755 "/tmp/${FFMPEG_ASSET}/bin/ffprobe" /usr/local/bin/ffprobe
+
+      # Assert the capabilities the code needs rather than trusting the tarball's name. A build
+      # without libwebp fails every poster and every crop on the first job; a muxer without
+      # use_metadata_tags drops the identity tags with a zero exit code.
+      # Files, not `grep -q` on a pipe — see the Dockerfile's note. `grep -q` exits on first match
+      # and SIGPIPEs ffmpeg, which `pipefail` turns into exit 141. These lines passed here and
+      # failed in the image build on the same commit: it is a race, so a green run proves nothing.
+      - name: Assert the toolchain
+        run: |
+          set -euxo pipefail
+          python3 -c "import sys; assert sys.version_info[:2] == (3, 11), sys.version"
+          ffmpeg -hide_banner -encoders > /tmp/encoders.txt
+          ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
+          grep -q libwebp /tmp/encoders.txt
+          grep -q libx264 /tmp/encoders.txt
+          grep -q use_metadata_tags /tmp/mp4muxer.txt
+          ffmpeg -version > /tmp/ffver.txt
+          head -1 /tmp/ffver.txt
+
+      # Deliberately NOT handler/requirements.txt: that pulls runpod and the model chain, and
+      # rung 1 must run without them. If this ever needs torch, the suite has stopped being
+      # CI-runnable and the fix is the code, not this line.
+      - name: Install test dependencies
+        run: pip install --quiet boto3 requests numpy pillow
+
+      - run: python3 tests/make_fixtures.py
+      - run: python3 tests/run_local.py
+
+  # Non-blocking. It reports drift rather than gating a release on someone else's tree, and when
+  # it fires it is a signal to read rather than a build to fix.
+  #
+  # **A canary that only asks whether the suite passes catches nothing** — it has to assert what
+  # the toolchain *reports*. So this one checks the flags and behaviours the worker depends on,
+  # not merely that the tests are green.
+  toolchain-drift:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install ffmpeg master
+        run: |
+          set -euxo pipefail
+          # Same long retry window as the pinned fetch — same CDN, and this asset 503'd too. Not
+          # cached, because `latest` moves by design and a cached copy of it would defeat the
+          # entire point of a drift canary.
+          curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 600 \
+            -o /tmp/ffmpeg.tar.xz \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo install -m755 /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg
+          sudo install -m755 /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/ffprobe
+
+      - name: Report what master does with the flags this worker depends on
+        run: |
+          set -uxo pipefail
+          ffmpeg -version > /tmp/ffver.txt
+          head -1 /tmp/ffver.txt
+          echo "--- flags and encoders the encode path needs ---"
+          ffmpeg -hide_banner -encoders > /tmp/encoders.txt
+          ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
+          grep -E 'libwebp|libx264' /tmp/encoders.txt || echo "MISSING an encoder"
+          grep -q use_metadata_tags /tmp/mp4muxer.txt \
+            && echo "use_metadata_tags: present" || echo "use_metadata_tags: GONE — identity tags would silently vanish"
+          # `-vsync` is already removed in 9.x and `-fps_mode` did not exist before 5.0. Neither
+          # is used, and this records what master thinks of them so a future reader knows the
+          # state rather than the history.
+          ffmpeg -hide_banner -h full > /tmp/ffhelp.txt 2>/dev/null || true
+          grep -q -- '-fps_mode' /tmp/ffhelp.txt \
+            && echo "fps_mode: present" || echo "fps_mode: absent"
+
+      - name: Install test dependencies
+        run: pip install --quiet boto3 requests numpy pillow
+      - run: python3 tests/make_fixtures.py
+      - run: python3 tests/run_local.py
+
+  publish:
+    needs: contract-tests
+    # **Publishing is asked for, never automatic.** The suite is a minute and worth running on
+    # every push; the image is ~21 minutes and only matters when something is about to be
+    # deployed. Tying them together meant a comment in a handler docstring rebuilt 26 GB.
+    #
+    # So: `workflow_dispatch` from `main`, still behind a green suite, and a pull request still
+    # never publishes. Run it from the Actions tab, or `gh workflow run cf-upscale-worker`.
+    # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
+    # it can only be pinned to a sha that somebody chose to build.
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # **A GitHub-hosted runner needs help to hold this image.** Whether it can hold it at all is
+      # still unmeasured — no build has yet reached the weights stage, and the sibling worker bakes
+      # a 15.68 GB fp16 layer on this same runner class with no cleanup whatsoever.
+      # All measured from this workflow's own `df`, not estimated: the runner ships with **15 GB
+      # free** of 72 GB; this cleanup recovers ~23 GB; the base costs **27 GB extracted** from 10.05
+      # GB compressed; the checkpoint and VAE are 17 GB, and safetensors do not compress, so the
+      # pushed blob is ~16 GB again — though whether the extracted layer and the blob are resident
+      # at the same time is an assumption about BuildKit, not something observed.
+      #
+      # **There is no second disk to escape to** — `/mnt` is a directory on `/`, and the only real
+      # filesystem is `/dev/root`. See docs/decisions.md 3.5; the remaining levers all cost either
+      # money or model quality.
+      #
+      # Removed inline rather than via a third-party action: this step runs with `packages: write`
+      # and a registry login, which is not where an unpinned action belongs. The sizes are what
+      # the runner image documents; `df` below reports what was actually recovered.
+      - name: Make room for the image
+        run: |
+          # **No `pipefail` here, and nothing piped into `head`.** `head` exits after its count and
+          # SIGPIPEs whatever is upstream; under `pipefail` plus the runner's default `-e` that
+          # kills the step. It killed this one, in the very step added to diagnose the last
+          # SIGPIPE — cleanup never ran and the build never started. Written to a file instead.
+          set -ux
+          echo "--- every filesystem, before ---"
+          df -h
+          echo "--- what is large under / ---"
+          sudo du -shx /* 2>/dev/null | sort -rh > /tmp/usage.txt || true
+          head -12 /tmp/usage.txt
+          # Everything here is preinstalled tooling this build never touches. **This job does not
+          # use setup-python**, so the whole tool cache goes, not just CodeQL — it only checks out
+          # and builds. The target is the ~44 GB peak the image needs (27 GB base extracted plus
+          # a 17 GB weights layer); the sibling worker's equivalent peak is ~36 GB and it fits,
+          # which is why more cleanup is the cheap thing to try before anything that costs.
+          sudo rm -rf /usr/local/lib/android       # ~9-14 GB, the single biggest win
+          sudo rm -rf /opt/hostedtoolcache         # ~9 GB — CodeQL, Python, Node, Go, Ruby
+          sudo rm -rf /usr/share/dotnet            # ~2 GB
+          sudo rm -rf /opt/ghc /usr/local/.ghcup   # ~5 GB — Haskell
+          sudo rm -rf /usr/share/swift /usr/lib/jvm /usr/share/miniconda /opt/az
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/vcpkg
+          sudo rm -rf /usr/local/lib/node_modules /usr/lib/google-cloud-sdk /usr/lib/firefox
+          sudo rm -rf /usr/local/graalvm /usr/local/share/boost /usr/local/julia* /opt/pipx
+          # ~3 GB, and this build is I/O bound rather than memory bound on a 16 GB runner.
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo docker system prune --all --force --volumes  # preinstalled images and volumes
+          echo "--- every filesystem, after ---"
+          df -h
+          # Also to a file, for the artifact below.
+          { echo "=== after cleanup ==="; df -h; echo; echo "=== largest under / before ==="; \
+            head -12 /tmp/usage.txt; } > /tmp/disk-report.txt 2>&1 || true
+
+      # **Uploaded immediately, because a runner that fills its disk takes every log with it.**
+      # Two failures so far ended with the job's entire log missing — not just the failing step's
+      # — so a reading that only exists in the log is a reading that vanishes exactly when it
+      # matters. The artifact is written while the runner is still healthy.
+      - name: Keep the disk report even if the runner dies
+        uses: actions/upload-artifact@v7
+        with:
+          name: disk-report-after-cleanup
+          path: /tmp/disk-report.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      # The default `docker` driver cannot export a cache at all, and fails in seconds.
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A GHCR repository name must be lowercase and a GitHub owner name need not be, so the
+      # name is folded rather than interpolated — otherwise the build runs and *then* fails on
+      # the push with `repository name must be lowercase`.
+      - name: Compute the image name
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          # Stamped here rather than in the Dockerfile: a `date` inside a RUN would be a new
+          # value on every layer rebuild and would invalidate everything below it.
+          echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: ./handler
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          # **What the image needs in order to identify itself in its own bundles.** Ten
+          # calibration runs were banked against an image that reported `"image": null`, so the
+          # only evidence they shared a build was that nobody remembered changing one. The
+          # immutable `:sha-` tag rather than `:latest`, because `:latest` moves and a worker
+          # reporting it would name a build it is not necessarily running.
+          #
+          # Below the weights layer in the Dockerfile, so these change every build and cost one
+          # small layer rather than a 17 GB re-download.
+          build-args: |
+            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_UTC=${{ env.BUILD_UTC }}
+          # **Registry cache, never type=gha.** The weights layer is ~17 GB and GitHub's Actions
+          # cache budget is 10 GB per repository, so `type=gha` cannot hold it — it fails to help
+          # while evicting whatever else was there. The media worker uses type=gha and is right
+          # to; it has nothing large to cache. Do not copy that line from it.
+          #
+          # **Inline, against `:latest`, not a separate `:buildcache` tag.** `mode=max` to a second
+          # tag exports every intermediate layer — but this Dockerfile is single-stage and linear,
+          # so every one of those layers is already in the published image. It bought a duplicate
+          # ~42 GB push and the disk to stage it, to cache what the image caches for free. Inline
+          # metadata rides in the image itself and gives the same handler-only rebuild.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to: type=inline
+
+      # `always()`, because the reading that matters most is the one taken after a build that ran
+      # out of disk — and that is exactly the run where a normal step is skipped.
+      - name: What the build actually cost in disk
+        if: always()
+        run: |
+          set -uxo pipefail
+          df -h / | tail -1
+          echo "Record the headroom in docs/deployment.md. If it is thin, the next checkpoint"
+          echo "size change is what breaks this, and it will look like an unrelated failure."
+
+      # **Pin the endpoint to this, never to `:latest`.** `:latest` moves, and an endpoint on it
+      # cannot tell you what it is running — neither can RunPod.
+      - name: The tag to pin
+        run: |
+          echo "Pin the endpoint to: ${IMAGE}:sha-${GITHUB_SHA}"
+          echo "Record it in docs/deployment.md — RunPod's API will not tell anyone what an endpoint is."
+
+      # **The half of the image's identity the image cannot hold.** A digest exists only once the
+      # push completes, so no layer can carry it; the worker reports the immutable `:sha-` tag it
+      # was built as, and this is where that tag is tied to the digest it resolved to. Written to
+      # the run summary rather than only the log, because a calibration key assembled six weeks
+      # later is assembled from whatever is still readable.
+      - name: Record the digest this build resolved to
+        if: always()
+        run: |
+          {
+            echo "## Image identity"
+            echo
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| reference | \`${IMAGE}:sha-${GITHUB_SHA}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| built (UTC) | ${BUILD_UTC} |"
+            echo
+            echo "The worker self-reports every row above except the digest, in \`build\` on each"
+            echo "bundle and ledger row. Pair them here when keying a calibration measurement."
+          } >> "$GITHUB_STEP_SUMMARY"

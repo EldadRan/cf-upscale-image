@@ -1,0 +1,19 @@
+# Handler-only dependencies. torch, torchvision, opencv and the rest of the model chain come
+# from the base image plus the vendored SeedVR2 repo's own requirements.txt, installed alongside
+# this file in the Dockerfile.
+runpod
+boto3
+requests
+pillow          # the crop derive's lossless WebP write
+huggingface_hub # build-time weight bake only (bake_weights.py)
+
+# **No diffusers pin.** The image worker pins diffusers==0.33.1, and that pin is specific to
+# torch 2.4.0: newer diffusers ships an attention_dispatch custom op whose `X | None` type hints
+# are rejected by 2.4.0's infer_schema, which crashes the whole model import at runtime. This
+# image is on torch 2.8.0, so the constraint does not apply — and carrying a pin whose reason has
+# gone is how a workaround outlives the problem and starts causing its own.
+#
+# SeedVR2's own requirements ask for diffusers>=0.33.1, which is what resolves here. If the
+# build-time `import inference_cli` check ever fails on a diffusers release, this is the first
+# place to look — and the fix is a pin with today's reason written next to it, not this one
+# restored.

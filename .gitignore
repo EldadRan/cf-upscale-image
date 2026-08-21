@@ -1,0 +1,15 @@
+# **Build-side rules only.** This repository is `handler/` and the workflow that builds it;
+# nothing here generates a tree, so this file is short and that is the correct length rather
+# than a sign something was dropped in the migration. Test fixtures, measurement records and
+# history bundles have rules of their own, in the repository that holds those trees.
+
+.DS_Store
+__pycache__/
+*.pyc
+
+# **Credentials, and this repository is public.** Neither is read at build time — the workflow
+# takes its secrets from Actions and the worker takes its own from the job envelope — so a file
+# by either name here is a local convenience that must never become a commit. Ignored by name
+# so that `git add -A` cannot publish one irreversibly.
+.env
+.venv/
