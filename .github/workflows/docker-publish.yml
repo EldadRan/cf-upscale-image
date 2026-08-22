@@ -101,6 +101,9 @@ jobs:
       # Assert the capabilities the code needs rather than trusting the tarball's name. A build
       # without libwebp fails every poster and every crop on the first job; a muxer without
       # use_metadata_tags drops the identity tags with a zero exit code.
+      # **libx265 is asserted for the same reason and not because it has ever been missing.** The
+      # pin is a GPL static build and those normally carry it — "normally" is not evidence, and a
+      # codec the request can ask for is one the image has to have before a job asks for it.
       # Files, not `grep -q` on a pipe — see the Dockerfile's note. `grep -q` exits on first match
       # and SIGPIPEs ffmpeg, which `pipefail` turns into exit 141. These lines passed here and
       # failed in the image build on the same commit: it is a race, so a green run proves nothing.
@@ -112,6 +115,7 @@ jobs:
           ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
           grep -q libwebp /tmp/encoders.txt
           grep -q libx264 /tmp/encoders.txt
+          grep -q libx265 /tmp/encoders.txt
           grep -q use_metadata_tags /tmp/mp4muxer.txt
           ffmpeg -version > /tmp/ffver.txt
           head -1 /tmp/ffver.txt
@@ -172,6 +176,12 @@ jobs:
     # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run docker-publish.yml -R eldadran/cf-upscale-image --ref main`.
     # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
     # it can only be pinned to a sha that somebody chose to build.
+    # **Two conditions, and neither is the redundant one.** The ref refuses a `workflow_dispatch`
+    # fired from a branch, which is the only way a non-`main` tree could otherwise publish. The
+    # event refuses a trigger that fires on its own: it held while `push:` was live (see `on:`
+    # above) and would hold again if one returned. Trim the ref and a dispatch from any branch
+    # publishes, today. Trim the event and nothing stops a self-firing trigger the day one is
+    # added back.
     if: >-
       github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
