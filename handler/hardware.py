@@ -40,6 +40,19 @@ def _gpu():
         return None, None, None
 
 
+def _torch_version():
+    """`torch.__version__`, or None where torch will not import.
+
+    Separate from `_cuda_versions` rather than folded into it: that function returns a pair whose
+    two halves are only meaningful together, and this is a third fact about a different thing.
+    """
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        return None
+    return getattr(torch, "__version__", None)
+
+
 def _cuda_versions():
     """(driver_cuda, torch_built_for) — both as strings, or `None` where unknowable.
 
@@ -369,6 +382,12 @@ def read(workdir="/"):
         # Which driver actually ran this job, and what torch was built against. See _cuda_versions.
         "cuda_driver": driver_cuda,
         "cuda_built_for": built_cuda,
+        # **Which torch, not which CUDA it targets.** `cuda_built_for` is `torch.version.cuda`,
+        # so every snapshot has said what torch aims at and none has said what torch IS — and
+        # torch's own API surface moves between minors: `set_default_tensor_type` is deprecated
+        # since 2.1 and its replacement pair is version-gated, so a measurement taken on one
+        # minor does not transfer without this line beside it.
+        "torch_version": _torch_version(),
         # What the card is, and what this build has kernels for. A card outside the list either
         # JITs from PTX or fails at the first launch — see _compute_arch.
         "compute_capability": capability,

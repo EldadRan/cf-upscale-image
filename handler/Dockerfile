@@ -32,6 +32,22 @@ ARG SEEDVR2_COMMIT=4490bd1f482e026674543386bb2a4d176da245b9
 # value as `routing.provider_model`, per endpoint.
 ARG SEEDVR2_MODEL=seedvr2_ema_7b_fp16.safetensors
 
+# **The route-C image is this image without the weights** (contract §6b). Route C never loads
+# SeedVR2, so a build that omits the checkpoint is not a stripped worker — it is the correct one
+# for that route, and it does not pay a cold start for ~15 GiB it will never read.
+#
+# **`0` or `1`, and anything else fails the build.** An earlier draft baked on a mistyped value
+# — fail-safe in isolation, but two ENV flags below derive from this one arg, and a value that is
+# neither cannot set both honestly. A typo that stops a build costs minutes; a typo that ships an
+# image whose flags disagree about its own bytes costs a campaign. Default 1, and the default
+# path is the shell that ran before this arg existed: with the weights baked the RUN's contents
+# are what they were.
+# **The layer's DIGEST necessarily changes**
+# — the instruction text is part of a layer's identity, so `if` here is a new layer even when it
+# does exactly what the old one did. Contents identical, digest not; the two are different claims
+# and only the first was ever available.
+ARG BAKE_WEIGHTS=1
+
 # A pinned static ffmpeg, not the distribution's. Ubuntu 22.04 ships 4.4, this repo is developed
 # against 9.x, and the gap is not cosmetic: `-vsync` was removed in 9.x while `-fps_mode` arrived
 # in 5.0, so a command written for one is invalid on the other (docs/decisions.md 3.3). Pinning
@@ -193,8 +209,16 @@ print('release seams OK: colour pyramid patchable, bfloat16 handoff removed, wei
 # projections there were written.
 COPY bake_weights.py ./
 RUN set -eux; \
+    case "$BAKE_WEIGHTS" in 0|1) ;; \
+      *) echo "BAKE_WEIGHTS must be 0 or 1, got '$BAKE_WEIGHTS'" >&2; exit 2 ;; \
+    esac; \
     echo "--- disk before the bake ---"; df -h /; \
-    python3 bake_weights.py; \
+    if [ "$BAKE_WEIGHTS" = "0" ]; then \
+      echo "BAKE_WEIGHTS=0 — route-C image, no checkpoint baked (contract 6b)"; \
+      mkdir -p "$SEEDVR2_MODEL_DIR"; \
+    else \
+      python3 bake_weights.py; \
+    fi; \
     echo "--- disk after the bake ---"; df -h /; \
     du -sh "$SEEDVR2_MODEL_DIR"
 
@@ -211,7 +235,14 @@ RUN set -eux; \
 # bake is ever made conditional, this must move with it: an image that claims baked weights it
 # does not have would skip the validation of a file that really is missing — which the patch's
 # surviving `os.path.exists` guard then catches, but the honest place to be right is here.
-ENV SEEDVR2_WEIGHTS_BAKED=1
+#
+# **Made conditional 2026-08-22 with the bake itself, exactly as the paragraph above required.**
+# `CF_WEIGHTS_BAKED` rides here rather than in the ENV block near the top of the file for two
+# reasons: this is where the fact becomes true, and an ENV up there would put `BAKE_WEIGHTS` above
+# the system packages, the ffmpeg fetch, the vendor copy and the pip install — so building the
+# route-C variant would invalidate all of them and pay a cold build for a one-byte difference.
+ENV SEEDVR2_WEIGHTS_BAKED=${BAKE_WEIGHTS} \
+    CF_WEIGHTS_BAKED=${BAKE_WEIGHTS}
 
 # ── build identity ──────────────────────────────────────────────────────────────────────────
 # **An image that cannot say what it is makes every measurement taken on it an assertion.** The

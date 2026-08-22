@@ -70,6 +70,12 @@ WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 #: it as `routing.provider_model`, per endpoint.
 MODEL_BUILD = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
 
+#: **Whether this image actually carries the checkpoint `SEEDVR2_MODEL` names** (contract §6b).
+#: The route-C image is built with `--build-arg BAKE_WEIGHTS=0` and loads SeedVR2 on no path, so
+#: it must not report a model it does not contain. Absent — a local run, an older image — is read
+#: as baked, because every image that existed before this flag did carry its weights.
+WEIGHTS_BAKED = os.environ.get("CF_WEIGHTS_BAKED", "1") != "0"
+
 
 def build_identity():
     """What code produced this result, in a form that survives the run.
@@ -97,9 +103,17 @@ def build_identity():
         "commit": os.environ.get("BUILD_COMMIT"),
         "built_utc": os.environ.get("BUILD_UTC"),
         # The pinned vendored source, which is half of what any VRAM figure is a measurement of.
+        # **Reported by the route-C image too, and truthfully**: that image drops the weights, not
+        # the vendored tree, which it still carries and still does not load.
         "seedvr2_commit": os.environ.get("SEEDVR2_COMMIT"),
         "worker_version": WORKER_VERSION,
-        "model": MODEL_BUILD,
+        # **Null when this image does not carry the checkpoint** (contract §6b). A weightless
+        # build naming a model would be a falsehood about its own bytes, and every bundle,
+        # manifest and ledger row carries this field. `weights_baked` rides beside it because a
+        # bare null is ambiguous — a local build nulls most of these too, and "no weights in this
+        # image" and "this build could not identify itself" must not read alike.
+        "model": MODEL_BUILD if WEIGHTS_BAKED else None,
+        "weights_baked": WEIGHTS_BAKED,
         # **Which constants planned the run, beside which build carried them.** CF compares this
         # against the version its own embedded predicate reports and alerts when the two drift
         # apart, which is the ratified use rather than a nicety.
