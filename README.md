@@ -44,12 +44,12 @@ producing a different image.
 ## Building
 
 The workflow has **no `push` trigger, deliberately** — not every commit is meant to become an
-image. Builds are dispatched on purpose, from the Actions tab, and pull requests run the tests
-without publishing.
+image. Builds are dispatched on purpose, from the Actions tab, and a pull request never publishes.
 
-`publish` is gated on `contract-tests` (`needs: contract-tests`), so a red suite publishes
-nothing. The suite also pins the ffmpeg build and asserts the codecs the worker relies on before
-any GPU-free test runs, because a bad pin should cost seconds rather than a full build.
+`publish` is gated on `toolchain-gate` (`needs: toolchain-gate`), which installs the pinned ffmpeg
+and asserts that `libwebp`, `libx264` and `use_metadata_tags` are present before a build starts.
+A bad pin costs seconds that way rather than a full build — and the assertion is only meaningful
+because the gate installs the exact binary the image will carry, not a distribution's.
 
 A dispatched build publishes two tags to GHCR:
 
@@ -72,12 +72,18 @@ To build the same thing locally:
 docker build handler/
 ```
 
-## Running the tests
+## Tests
 
-The contract suite runs without a GPU: it exercises the planner, the validator, the schedule
-arithmetic and the encode path, and stops where the model would be called. That is what makes it
-a gate worth having on every build — it is fast enough to run before one, and it fails for the
-reasons a job would fail.
+**The contract suite is not in this repository, and that is deliberate rather than missing.** It
+lives with the test harness and the operating scripts it exercises, and it is run before a build
+is dispatched rather than by this workflow — its result is quoted in the request that asks for
+the build.
 
-CI runs it as the `contract-tests` job. It needs Python 3.11, the pinned ffmpeg the workflow
-installs, and `pip install boto3 requests numpy pillow`.
+It needs no GPU: it exercises the planner, the validator, the schedule arithmetic and the encode
+path, and stops where the model would be called. What it does need is the same pinned ffmpeg this
+workflow installs, because a suite green on a different encoder proves less than it looks.
+
+So what CI enforces is narrower than a green suite, and worth stating plainly: **`toolchain-gate`
+checks the toolchain, not the worker.** A dispatched build proves the image assembles and that
+its ffmpeg has the capabilities the encode path needs. Whether the worker behaves is established
+before the dispatch, not by it.

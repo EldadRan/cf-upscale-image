@@ -1,8 +1,14 @@
 # Build and publish the CF upscale worker to GHCR.
 #
-# **The contract suite gates the publish**, so a red suite ships nothing and a pull request never
+# **The toolchain gates the publish**, so a bad ffmpeg pin ships nothing and a pull request never
 # publishes. CI publishes; the endpoint is pinned to a sha; that sha is the only link between
 # them.
+#
+# **The contract suite does not run here, and that is deliberate rather than missing.** It lives
+# in the private project repository with the harness and the operating scripts, and it is run
+# locally before a dispatch is ordered — its green run is quoted in the dispatch order, which
+# makes it evidence rather than a claim. What CI keeps is the half of the old gate that needs no
+# test tree: the pinned ffmpeg and the capabilities the encode path depends on.
 name: cf-upscale-worker
 
 on:
@@ -11,7 +17,8 @@ on:
   # somebody decides it is ready. The suite runs on a laptop in seconds, which is where a push
   # should be checked.
   #
-  # It used to trigger on pushes touching `handler/**` or `tests/**`, and the `publish` job was
+  # It used to trigger on pushes touching `handler/**` or `tests/**` back when both lived here,
+  # and the `publish` job was
   # already gated to `workflow_dispatch` — so those runs never built anything. They still did
   # damage: a one-minute test run shares the concurrency group below with an in-flight publish and
   # **cancelled it**. A stray commit killed a build that had been asked for on purpose, twice in
@@ -31,9 +38,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Python 3.11 because that is what the base image ships (docs/decisions.md 2.1). Resolving the
-  # suite's dependencies against a different version than the container runs is how a set that
-  # cannot install in the image gets discovered after a 17 GB rebuild.
+  # Python 3.11 because that is what the base image ships. **It has exactly one consumer left:**
+  # the `sys.version_info[:2] == (3, 11)` assertion in the toolchain gate, which is what makes
+  # `setup-python` there load-bearing rather than habit — delete the step and that assertion
+  # checks whatever Python the runner image happened to ship.
   PYTHON_VERSION: "3.11"
   # Kept in step with handler/Dockerfile. The distribution's ffmpeg is 4.4 and this code is
   # written against 9.x; `-vsync` and `-fps_mode` have no version accepting both.
@@ -41,7 +49,12 @@ env:
   FFMPEG_ASSET: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1
 
 jobs:
-  contract-tests:
+  # **The gate that survives the suite living elsewhere.** It installs the *pinned* ffmpeg and
+  # asserts the capabilities the encode path needs, which is what stops a bad pin costing
+  # twenty-one minutes of build. It requires no `tests/` tree, so it keeps working with the suite
+  # in another repository — and it is the only thing between a dispatch and a publish, which is
+  # worth knowing when reading what it does and does not check.
+  toolchain-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -60,8 +73,12 @@ jobs:
           path: ~/ffmpeg-cache
           key: ffmpeg-${{ env.FFMPEG_ASSET }}
 
-      # The same pinned build the image installs, so rung 1 runs against the encoder the worker
-      # will actually use. A suite green on a different ffmpeg proves less than it looks.
+      # **The same pinned build the image installs**, which is the whole point of fetching a 125 MB
+      # tarball rather than `apt install ffmpeg`: the assertion below is only worth making against
+      # the exact binary the worker will run. It used to also host rung 1 so the suite ran on that
+      # encoder; the suite runs locally now, and this install survives on the assertion alone.
+      # **Do not simplify it to a distro ffmpeg** — that would leave a capability check that
+      # passes for a binary this image never uses.
       #
       # A ~10 minute retry window rather than the ~15 seconds `--retry 5 --retry-delay 3` gives.
       # The outage that broke this twice lasted longer than the old window and not much longer
@@ -99,29 +116,18 @@ jobs:
           ffmpeg -version > /tmp/ffver.txt
           head -1 /tmp/ffver.txt
 
-      # Deliberately NOT handler/requirements.txt: that pulls runpod and the model chain, and
-      # rung 1 must run without them. If this ever needs torch, the suite has stopped being
-      # CI-runnable and the fix is the code, not this line.
-      - name: Install test dependencies
-        run: pip install --quiet boto3 requests numpy pillow
-
-      - run: python3 tests/make_fixtures.py
-      - run: python3 tests/run_local.py
 
   # Non-blocking. It reports drift rather than gating a release on someone else's tree, and when
   # it fires it is a signal to read rather than a build to fix.
   #
-  # **A canary that only asks whether the suite passes catches nothing** — it has to assert what
-  # the toolchain *reports*. So this one checks the flags and behaviours the worker depends on,
-  # not merely that the tests are green.
+  # **A canary that only asks whether a suite passes catches nothing** — it has to assert what the
+  # toolchain *reports*. So this one checks the flags and behaviours the worker depends on, and
+  # reports them; it runs no tests, and never usefully did.
   toolchain-drift:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install ffmpeg master
         run: |
@@ -154,19 +160,16 @@ jobs:
           grep -q -- '-fps_mode' /tmp/ffhelp.txt \
             && echo "fps_mode: present" || echo "fps_mode: absent"
 
-      - name: Install test dependencies
-        run: pip install --quiet boto3 requests numpy pillow
-      - run: python3 tests/make_fixtures.py
-      - run: python3 tests/run_local.py
-
   publish:
-    needs: contract-tests
-    # **Publishing is asked for, never automatic.** The suite is a minute and worth running on
-    # every push; the image is ~21 minutes and only matters when something is about to be
-    # deployed. Tying them together meant a comment in a handler docstring rebuilt 26 GB.
+    needs: toolchain-gate
+    # **Publishing is asked for, never automatic.** The image is ~21 minutes and only matters
+    # when something is about to be deployed; tying it to every push meant a comment in a
+    # handler docstring rebuilt 26 GB.
     #
-    # So: `workflow_dispatch` from `main`, still behind a green suite, and a pull request still
-    # never publishes. Run it from the Actions tab, or `gh workflow run cf-upscale-worker`.
+    # So: `workflow_dispatch` from `main`, behind the toolchain gate, and a pull request still
+    # never publishes. **The contract suite is green before a dispatch is ordered, not because
+    # this workflow ran it** — it runs locally against the private repository's harness and its
+    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run cf-upscale-worker`.
     # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
     # it can only be pinned to a sha that somebody chose to build.
     if: >-
