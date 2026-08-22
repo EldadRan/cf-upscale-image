@@ -9,7 +9,7 @@
 # locally before a dispatch is ordered — its green run is quoted in the dispatch order, which
 # makes it evidence rather than a claim. What CI keeps is the half of the old gate that needs no
 # test tree: the pinned ffmpeg and the capabilities the encode path depends on.
-name: cf-upscale-worker
+name: cf-upscale-image
 
 on:
   # **No `push` trigger, deliberately.** Not every push is meant to be tested on CI and none of
@@ -169,7 +169,7 @@ jobs:
     # So: `workflow_dispatch` from `main`, behind the toolchain gate, and a pull request still
     # never publishes. **The contract suite is green before a dispatch is ordered, not because
     # this workflow ran it** — it runs locally against the private repository's harness and its
-    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run cf-upscale-worker`.
+    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run docker-publish.yml -R eldadran/cf-upscale-image --ref main`.
     # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
     # it can only be pinned to a sha that somebody chose to build.
     if: >-
