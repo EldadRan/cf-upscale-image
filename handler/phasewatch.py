@@ -182,6 +182,11 @@ def cpu_count():
 #: names — the rung-1 witness asserts the two agree, and this constant is what makes that cheap.
 BUILD_COMMIT_ENV = "BUILD_COMMIT"
 
+#: What CI pushed this image as, set from `IMAGE_REF` in the Dockerfile. **The only honest source
+#: for the reference**: one commit can produce more than one image, so the tag cannot be derived
+#: from the commit. `handler.build_identity()` reads the same variable for `build.image`.
+IMAGE_TAG_ENV = "IMAGE_TAG"
+
 
 #: Every `[host]` reading this job took, in order, wherever it was taken from. **The corpus, and
 #: it used to be a keyhole** (CF, 2026-08-20): the run-record kept only the four readings
@@ -314,9 +319,12 @@ def build_banner():
     reads it back off the registry blob on every verification — but that answers *what did we
     publish*, from outside. A worker log answers *what am I*, from inside, and until now it could
     not: a log pulled off a running endpoint named the host, the slice and the data centre, and
-    left unstated the one fact that decides whether any of the others are worth reading. Ten
-    calibration runs were once banked against an image reporting `"image": null`, and the only
-    evidence they shared a build was that nobody remembered changing one.
+    left unstated the two facts that decide whether any of the others are worth reading. Two,
+    not one: the commit says which source built it, and the reference says which of the images
+    that commit produced is running — a distinction that did not exist until one commit started
+    producing both a full and a weightless build. Ten calibration runs were once banked against
+    an image reporting `"image": null`, and the only evidence they shared a build was that
+    nobody remembered changing one.
 
     Beside the host lines deliberately: one glance at any worker log now names the build, the
     host slice and the DC together, which is the set a measurement has to be sorted by.
@@ -332,10 +340,24 @@ def build_banner():
     if not commit:
         return ("[host] boot: build unknown — {} is not set. A CI image always carries it, so "
                 "this is a local or hand-built one.".format(BUILD_COMMIT_ENV))
-    # **The full sha as well as the short form.** This line is read beside a registry digest and
-    # a `docs/deployment.md` lineage row, where an abbreviation is one collision away from naming
-    # a different commit; the short form leads because that is the one a person types.
-    return "[host] boot: build {} (sha-{})".format(commit[:7], commit)
+    # **The reference is READ, never assembled from the commit.** This line used to build
+    # `sha-<commit>` itself, which was right for every image that had ever existed — CI tagged
+    # them all exactly that — and became wrong the first time one commit produced two images. The
+    # route-C build is tagged `sha-<commit>-routec`, and the constructed form 404s against the
+    # registry while the worker prints it as fact. A person reads this line at the moment they
+    # are establishing what they are looking at; it was used to identify an image the night it
+    # first lied, and nearly certified from.
+    #
+    # **Absent says absent.** No constructed fallback, because "no reference recorded" reads
+    # correctly and a 404ing tag reads as fact — the guess is worse than the admission. The
+    # commit still leads, since it is what a person types and what the ledger sorts by.
+    #
+    # The full sha as well as the short form: read beside a registry digest and a
+    # `docs/deployment.md` lineage row, an abbreviation is one collision away from another commit.
+    reference = _os.environ.get(IMAGE_TAG_ENV)
+    return "[host] boot: build {} (sha-{}) image {}".format(
+        commit[:7], commit,
+        reference if reference else "not recorded — {} is not set".format(IMAGE_TAG_ENV))
 
 
 def boot_banner():
