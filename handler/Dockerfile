@@ -37,7 +37,15 @@ ARG SEEDVR2_MODEL=seedvr2_ema_7b_fp16.safetensors
 # in 5.0, so a command written for one is invalid on the other (docs/decisions.md 3.3). Pinning
 # one build for the container makes the encode path a known quantity instead of a distribution
 # detail. It also guarantees libwebp, which every poster and every crop needs.
-ARG FFMPEG_RELEASE=autobuild-2026-08-08-13-06
+#
+# **The release tag is a MONTH-END snapshot and must stay one.** BtbN keeps fourteen rolling
+# dailies and retains month-end builds for years; the previous pin was a daily and started
+# 404ing the day it aged out, which fails this RUN two minutes into a twenty-one minute build.
+# A newer-looking daily tag is a fourteen-day fuse and, since the dailies have moved past this
+# ffmpeg commit, also a toolchain change. Moving the tag while holding the asset name keeps the
+# ffmpeg commit, the libavcodec version and the x265 build; it does not keep the bytes, which
+# differ between releases. What holds the build steady is the capability assertion below.
+ARG FFMPEG_RELEASE=autobuild-2026-07-31-14-10
 ARG FFMPEG_ASSET=ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1
 
 # **The base image's `cuda>=12.8` label is what kept this off most of RunPod's fleet.**

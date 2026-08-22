@@ -45,7 +45,12 @@ env:
   PYTHON_VERSION: "3.11"
   # Kept in step with handler/Dockerfile. The distribution's ffmpeg is 4.4 and this code is
   # written against 9.x; `-vsync` and `-fps_mode` have no version accepting both.
-  FFMPEG_RELEASE: autobuild-2026-08-08-13-06
+  # **Month-end tag, deliberately** — see the Dockerfile's note. A daily ages out in fourteen
+  # days and the build's uncached fetch dies with it. This gate does NOT die with it and that is
+  # the trap: the cache key below is the asset name, which a dead tag does not change, so a warm
+  # runner passes the gate without ever resolving the release URL. That is how the last dead pin
+  # reached a dispatch green.
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
   FFMPEG_ASSET: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1
 
 jobs:
