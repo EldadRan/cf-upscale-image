@@ -46,10 +46,14 @@ env:
   # Kept in step with handler/Dockerfile. The distribution's ffmpeg is 4.4 and this code is
   # written against 9.x; `-vsync` and `-fps_mode` have no version accepting both.
   # **Month-end tag, deliberately** — see the Dockerfile's note. A daily ages out in fourteen
-  # days and the build's uncached fetch dies with it. This gate does NOT die with it and that is
-  # the trap: the cache key below is the asset name, which a dead tag does not change, so a warm
-  # runner passes the gate without ever resolving the release URL. That is how the last dead pin
-  # reached a dispatch green.
+  # days and the build's uncached fetch dies with it. This gate used to survive that, because the
+  # cache key was the asset name and a dead tag does not change it: a warm runner passed without
+  # ever resolving the release URL, which is how the last dead pin reached a dispatch green. The
+  # key below now carries this value, so moving it forces one cold fetch and the gate finds out.
+  #
+  # **These two lines are duplicated in handler/Dockerfile and nothing enforces the match.** No
+  # build-arg carries them; each file declares its own. Move one alone and the gate certifies a
+  # tarball the image will not install, which is the same blindness by a different route.
   FFMPEG_RELEASE: autobuild-2026-07-31-14-10
   FFMPEG_ASSET: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1
 
@@ -70,13 +74,22 @@ jobs:
 
       # **Cached because the release CDN is not reliable from a runner.** This exact 125 MB object
       # returned 503 to six consecutive attempts, twice, while downloading fine from a laptop and
-      # while a *different* asset on the same host succeeded in the same run. The tarball is pinned
-      # and immutable, so the cache key is the asset name and a hit never needs the network at all.
+      # while a *different* asset on the same host succeeded in the same run.
+      #
+      # **The key carries the release as well as the asset, and the release is the half that
+      # matters.** It used to be the asset name alone, on the reasoning that the tarball is
+      # "pinned and immutable" — but immutable was never the property on offer here. RETAINED
+      # was, and BtbN deleted the pinned release out from under us. Two consequences, both of
+      # which happened: a warm runner satisfied this cache without ever resolving the release
+      # URL, so the gate went green against a tarball it had not fetched and a dead pin reached
+      # a dispatch unseen; and two releases can serve the same asset NAME with different bytes,
+      # which the old key could not tell apart even in principle. Keying on the release means
+      # moving the pin forces one cold fetch, which is exactly when we want to learn it is gone.
       - name: Cache the pinned ffmpeg
         uses: actions/cache@v6
         with:
           path: ~/ffmpeg-cache
-          key: ffmpeg-${{ env.FFMPEG_ASSET }}
+          key: ffmpeg-${{ env.FFMPEG_RELEASE }}-${{ env.FFMPEG_ASSET }}
 
       # **The same pinned build the image installs**, which is the whole point of fetching a 125 MB
       # tarball rather than `apt install ffmpeg`: the assertion below is only worth making against

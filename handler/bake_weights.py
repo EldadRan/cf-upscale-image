@@ -18,12 +18,51 @@ baked would download at runtime on first use and, with no volume, re-download on
 start — a per-job cost, billed, on a path nobody chose.
 """
 
+import hashlib
 import os
 import sys
 
 from huggingface_hub import hf_hub_download
 
 REPO = "numz/SeedVR2_comfyUI"
+
+#: **The weights are pinned by commit, not by branch.** Without this the build took whatever
+#: `main` held on the day, and an upstream content change would have been invisible: same
+#: filename, same size class, same green build, different numbers out of every coefficient in
+#: the calibration. A commit sha cannot be force-pushed to different contents, so this is the
+#: strong half of the pin; the hashes below are what make it checkable from inside the build.
+REVISION = "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
+
+#: filename -> (bytes, sha256).
+#:
+#: **This is a COPY, and its home is `registry-v1.json`'s `calibration_key` in the private
+#: project repository** — that is where the calibration records which weights it measured. The
+#: copy exists because the build cannot read that file: the docker context is `./handler` in
+#: THIS repository (see the workflow's `context:`), and the project repository is not checked
+#: out on the runner at all. Anything that changes there has to be brought here by hand until
+#: something generates this block.
+#:
+#: The pair sums to 15.81 GiB, which is what `deployment.md` records as the baked weight size —
+#: so these identify the files in the live image rather than an intention.
+EXPECTED = {
+    "seedvr2_ema_7b_fp16.safetensors": (
+        16479334424,
+        "7b8241aa957606ab6cfb66edabc96d43234f9819c5392b44d2492d9f0b0bbe4a",
+    ),
+    "ema_vae_fp16.safetensors": (
+        501324814,
+        "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
+    ),
+}
+
+
+def sha256_of(path):
+    """Streamed, because the DiT is 15.3 GiB and the runner has no room to hold it twice."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 #: Shared across every DiT variant, so it is baked whichever checkpoint is selected.
 VAE_FILE = "ema_vae_fp16.safetensors"
@@ -35,9 +74,33 @@ os.makedirs(model_dir, exist_ok=True)
 
 total = 0.0
 for filename in (dit_file, VAE_FILE):
-    path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir)
-    size_gb = os.path.getsize(path) / (1024 ** 3)
+    path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir,
+                           revision=REVISION)
+    size = os.path.getsize(path)
+    size_gb = size / (1024 ** 3)
     total += size_gb
+
+    # **The assertion is what gives the recorded hash a job.** A number written down and never
+    # compared against is the shape of a fact that rots unnoticed; this is the comparison. Size
+    # first because it is free and a truncated download is the common failure, then the hash.
+    expected = EXPECTED.get(filename)
+    if expected is None:
+        print("WARNING: {} has no recorded size or hash — baked UNVERIFIED. The calibration key "
+              "names the 7B model and the shared VAE; a different --build-arg SEEDVR2_MODEL is "
+              "a different checkpoint and nothing here can vouch for it.".format(filename),
+              flush=True)
+    else:
+        want_size, want_sha = expected
+        if size != want_size:
+            sys.exit("{}: expected {} bytes, got {}. The pin resolved to different content than "
+                     "the calibration measured.".format(filename, want_size, size))
+        got_sha = sha256_of(path)
+        if got_sha != want_sha:
+            sys.exit("{}: sha256 mismatch.\n  expected {}\n  got      {}\nThe pin resolved to "
+                     "different content than the calibration measured.".format(
+                         filename, want_sha, got_sha))
+        print("verified {} {} bytes sha256 {}".format(filename, size, got_sha), flush=True)
+
     print("baked {} -> {} ({:.2f} GB)".format(filename, path, size_gb), flush=True)
 
 # Reported because image size is a cold-start cost and a container-disk cost, and CF is waiting
