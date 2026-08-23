@@ -207,6 +207,12 @@ def bake_rife():
         # every entry. `extractall` would ship all of it, and stale `.pyc` files beside their
         # sources are a way to run code nobody can see. It is also the answer to zip-slip: a
         # member is looked up by the name we asked for, so a crafted path cannot escape.
+        # Keyed on the basename, which would collide last-wins if the archive ever held two
+        # files sharing one. It cannot bite: the archive is pinned by hash, so its shape cannot
+        # change, and **the `verify` after each copy is what makes that safe rather than this
+        # lookup** — a wrong file under a right name fails its sha256 and exits. Said here
+        # because an edit that moved the verification would remove the protection without
+        # touching the line that looks load-bearing.
         members = {os.path.basename(name): name
                    for name in bundle.namelist() if not name.startswith("__MACOSX/")}
         for wanted, (want_size, want_sha) in sorted(RIFE_MEMBERS.items()):
@@ -222,6 +228,19 @@ def bake_rife():
                 wanted, destination, os.path.getsize(destination)), flush=True)
 
     os.remove(archive)
+
+    # **Prove only the four arrived, rather than trusting that only four were asked for.** The
+    # archive was built on a Mac and carries a `__MACOSX/` sidecar tree, a 6,148-byte `.DS_Store`
+    # and two `.pyc` files compiled by another Python. `extractall` would have shipped all of it,
+    # and **bytecode beside the source it claims to be is unreviewable** — reading the `.py` says
+    # nothing about the `.pyc`, which is the same class of trust as the pickle. CPython would
+    # very probably ignore them, since extraction rewrites the mtime a `.pyc` is validated
+    # against; probably is not a reason to ship them. Members are taken by name above, and this
+    # asserts the result.
+    landed = set(os.listdir(train_log))
+    if landed != set(RIFE_MEMBERS):
+        sys.exit("train_log holds {} but should hold exactly {} — the extraction shipped "
+                 "something nobody named".format(sorted(landed), sorted(RIFE_MEMBERS)))
 
     # **The `model` package the archive does not carry.** Fetched from the pinned commit and
     # verified the same way, into a sibling of `train_log` so the two names the vendored code
