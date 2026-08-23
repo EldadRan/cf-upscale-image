@@ -305,7 +305,28 @@ def _retime(request, machine, warnings, workdir, progress, started):
     client = storage.client_for(request["output"])
     master_key = storage.upload(client, request["output"], master, master_path,
                                 keys.content_type(master))
+
+    # **The same `output` shape the upscale path returns, and that is a correction rather than a
+    # choice.** Route C first returned `{"master": key}` — a shape nobody reads. `run_one` takes
+    # `output.width`, `output.height` and `output.bytes` off this object and banks them in the
+    # ledger row, so the first route-C job on hardware delivered a correct file and reported
+    # `output NonexNone 0 bytes` with every measured field null. The response-shape question CF
+    # deferred is about `configuration` and the rationale; this is not that. This is the existing
+    # output contract, which route C has no reason to differ from and every reason to satisfy —
+    # the variant runs are the ones whose numbers matter, and a wave that banks nulls is a wave
+    # measured by hand.
     delivered = probe.probe_output(master_path)
+    output_entry = dict(delivered)
+    output_entry.update({
+        "key": master_key,
+        "bytes": os.path.getsize(master_path),
+        "content_type": keys.content_type(master),
+        "faststart": probe.is_faststart(master_path),
+        "channels": 3,
+        # Measured on the far side of the encode, which is the only frame count worth reading
+        # from a container — and on this path it is also the one the witness compares.
+        "frames": probe.written_frame_count(master_path),
+    })
 
     # **The stats and what they were measured on, and nothing shaped like a plan.** A
     # `configuration` block here would look, to anything reading the envelope, exactly like a
@@ -313,14 +334,11 @@ def _retime(request, machine, warnings, workdir, progress, started):
     return _decorate({
         "status": "DELIVERED",
         "route": "C",
-        "output": {"master": master_key},
+        "output": output_entry,
         "retime": dict(stats, target_fps=config["target_fps"],
                        snap_tolerance=config["snap_tolerance"]),
         "source": {"width": source["width"], "height": source["height"],
                    "fps": source["fps"], "duration_s": source["duration_s"]},
-        "delivered": {"width": delivered["width"], "height": delivered["height"],
-                      "fps": delivered["fps"], "duration_s": delivered["duration_s"],
-                      "frames": probe.written_frame_count(master_path)},
         "build": build_identity(),
     }, machine, [], warnings, progress, started)
 
