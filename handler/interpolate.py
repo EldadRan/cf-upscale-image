@@ -159,6 +159,53 @@ def pad_multiple(scale=1):
     return int(max(PAD_BASE, PAD_BASE / scale))
 
 
+class RetimeResult:
+    """What `Interpolator.stream()` hands back: `.frames` and `.stats`, and **not iterable**.
+
+    **Deliberately not a tuple, and the reason is one line of caller code** (contract §5d(a)).
+    A tuple is iterable, so `for f in obj.stream(...)` succeeds — it yields the generator object
+    and then the stats dict, and raises nothing at the line that made the mistake. Measured: a
+    `.shape` access fails later and elsewhere with a confusing message, and a duck-typed writer
+    writes two "frames" and never raises at all.
+
+    **That mistake is not hypothetical.** `for f in obj.stream(...)` was CORRECT one wave ago,
+    when `stream()` returned a generator directly, so it is the natural continuation of the shape
+    that existed an hour before the first call site is written. This class turns it into an
+    immediate `TypeError` at the exact line.
+
+    **The divergence from `build_plan`'s `(plan, stats)` is deliberate.** The oracle is a pure
+    function with one caller inside the kit; `stream()` is the API a pipeline consumes, and at an
+    API boundary a mistake must fail where it was made. Consistency is worth less than that.
+
+    No `__iter__` and no `__getitem__`, which is what makes `for` and unpacking both raise rather
+    than one of them silently working — and no `__match_args__`, so a positional `case` pattern
+    fails too. `__slots__` because a typo'd attribute on a result object is a silent None waiting
+    to happen.
+
+    One consequence of `__slots__` recorded rather than fixed: instances are not weak-referenceable,
+    so a future consumer tracking open streams in a `WeakSet` would fail at construction. Nothing
+    does that today, and `"__weakref__"` in the tuple is the one-line answer when something does.
+    """
+
+    __slots__ = ("frames", "stats")
+
+    def __init__(self, frames, stats):
+        self.frames = frames
+        self.stats = stats
+
+    def __repr__(self):
+        # **A repr may not raise.** The `isinstance` guard covers `stats=None`, but `isinstance`
+        # is true for dict SUBCLASSES too, so a mapping with a custom `get` — or an `n_out` whose
+        # `__str__` raises — would take this down. Unreachable from `stream()`, whose stats are
+        # always the plain dict literal `build_plan` returns; caught anyway, because the moment a
+        # repr detonates is inside the debugger examining the failure it was meant to describe.
+        try:
+            n_out = self.stats.get("n_out") if isinstance(self.stats, dict) else None
+            return "RetimeResult(frames=<stream>, stats={{n_out: {}}})".format(n_out)
+        except Exception:  # noqa: BLE001 — see above; a repr that raises is worse than a vague one
+            return "RetimeResult(frames=<stream>, stats=<unreadable>)"
+
+
 class Interpolator:
     """Runs a plan against a frame stream. One frame of lookahead, one cached pair.
 
@@ -174,9 +221,9 @@ class Interpolator:
     round-tripped through pad/synthesise/crop, which would spend compute to make a real frame
     slightly less real. That is the KPI the whole plan is shaped around.
 
-    **This object publishes no state.** `stream()` hands its stats back beside its generator, so
-    nothing per-call lives here and two concurrent streams share nothing but configuration. That
-    is §5d(a), and it is the shape `retime_oracle.build_plan` has always had.
+    **This object publishes no state.** `stream()` hands its stats back inside a `RetimeResult`,
+    so nothing per-call lives here and two concurrent streams share nothing but configuration.
+    That is §5d(a).
 
     The one field that could be argued against that claim is `_model`, which `prepare()` rebinds
     rather than `__init__` setting once. It is still configuration and the exemption is written
@@ -274,16 +321,19 @@ class Interpolator:
         return self._crop(out, cache["geometry"]).clone()
 
     def stream(self, frames, n_in, src_fps, dst_fps, tol=0.0):
-        """Return `(frames_out, stats)` — a generator of the retimed stream, and its plan's stats.
+        """Return a `RetimeResult` — `.frames` is the generator, `.stats` is the plan's stats.
 
         **The stats travel WITH the result and nothing is published on this object** (contract
         §5d(a)). They used to be an attribute, which made them last-writer-wins: a second
         `stream()` opened while a first generator was still undrained left `stats` reading the
         second plan while the first yielded the first clip's frames — every visible signal
         correct, the number belonging to a different clip. Invalidating on entry could not fix
-        that; it only made the wrong number newer. **`retime_oracle.build_plan` has returned
-        `(plan, stats)` since it was written**, so this is the shim adopting the shape the
-        contract's executable form always had, not a new design.
+        that; it only made the wrong number newer.
+
+        **A result object rather than a tuple**, because a tuple is iterable and
+        `for f in obj.stream(...)` — which was correct one wave ago — would then yield a
+        generator and a dict without raising at the line that made the mistake. See
+        `RetimeResult`.
 
         The consequence worth stating: this object now publishes nothing at all. Two interleaved
         calls cannot confuse their results because there is no shared place for a result to sit,
@@ -299,7 +349,7 @@ class Interpolator:
         buffered beyond the pair in hand.
         """
         plan, stats = build_plan(n_in, src_fps, dst_fps, tol=tol)
-        return self._emit(plan, frames, n_in), stats
+        return RetimeResult(self._emit(plan, frames, n_in), stats)
 
     def _emit(self, plan, frames, n_in):
         """The generator half of `stream`. Its state is per-call and none of it lives on self."""
