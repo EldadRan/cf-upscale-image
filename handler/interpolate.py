@@ -86,6 +86,25 @@ def build_plan(n_in, src_fps, dst_fps, tol=0.0):
         raise ValueError("a retime needs at least two source frames")
 
     n_out = target_count(n_in, src_fps, dst_fps)
+
+    # **A plan that would deliver no frames is refused at the door** (contract §5, ruled
+    # 2026-08-23). Half-up rounding can still land on zero — two frames of 240 fps source at an
+    # 8 fps target rounds to none — and an empty delivery cannot satisfy §2's duration bound
+    # against any source that has a duration, so returning an empty plan would push an
+    # unanswerable job downstream. All three numbers are named because "there is no video to
+    # deliver" is only actionable if you can see which of them made it so.
+    #
+    # Before the stats dict rather than inside it: `real_share` divided by this and raised a bare
+    # `ZeroDivisionError` from the middle of a dict literal, which said nothing about rates. Found
+    # while conforming this shim, and **held unpatched until the oracle carried it too** — both
+    # files had it identically, so fixing one side would have manufactured a divergence out of an
+    # agreement and hidden a contract question inside the mechanism built to surface one.
+    if n_out < 1:
+        raise ValueError(
+            "a {} fps target on {} frames of {} fps source rounds to no output frames at all; "
+            "there is no video to deliver, so this is refused rather than returned empty"
+            .format(dst_fps, n_in, src_fps))
+
     ratio = src_fps / dst_fps
     last = n_in - 1
 
