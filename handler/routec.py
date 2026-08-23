@@ -25,8 +25,8 @@ from errors import INVALID_SOURCE, WorkerError
 _CHANNELS = 3
 
 #: **Slack on the derived count, in source frames.** Zero was wrong: the count comes from a
-#: duration stored to the millisecond times a rate, and `media_trim`'s edit lists are named in
-#: `source_frame_count` as the reason a container and a decode disagree on CF's own files. §2's
+#: duration stored to the millisecond times a rate, and edit-list trims are named in
+#: `source_frame_count` as the reason a container and a decode disagree on real input. §2's
 #: duration bound is +-2 output frames and this is its counterpart on the input side.
 SURPLUS_TOLERANCE_FRAMES = 2
 
@@ -35,9 +35,9 @@ def source_frame_count(source):
     """How many frames the plan is sized from, and why it is not read from the container.
 
     `probe.probe_source` refuses to report a frame count on arbitrary input for a documented
-    reason: CF's `media_trim` bounds a video with an MP4 edit list, leaving frames in the stream
-    the container still counts, so a probe and a decode disagree on exactly the files CF sends.
-    That argument holds here.
+    reason: an upstream trim can bound a video with an MP4 edit list, leaving frames in the
+    stream that the container still counts, so a probe and a decode disagree on precisely the
+    files this worker is sent. That argument holds here.
 
     So the count is **derived from two measured quantities** — the stream's own duration and its
     rate — and then checked against the decode. `stream()` already refuses a source shorter than
@@ -154,8 +154,8 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
             surplus += 1
         # **Two frames of slack, not zero, and the docstring above says why it is needed.** A
         # count derived from a duration stored to the millisecond drifts by a frame over a long
-        # clip, and `media_trim`'s edit lists are exactly the case where a container's numbers and
-        # a decode disagree by a little. §2's bound is +-2 output frames; the same tolerance in
+        # clip, and an edit-list trim is exactly the case where a container's numbers and a
+        # decode disagree by a little. §2's bound is +-2 output frames; the same tolerance in
         # source frames is the smallest one that does not refuse arithmetic noise. Beyond it the
         # disagreement is structural rather than rounding, and a retime would be truncated.
         if surplus > SURPLUS_TOLERANCE_FRAMES:
