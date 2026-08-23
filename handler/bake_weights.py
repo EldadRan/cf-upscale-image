@@ -22,6 +22,7 @@ import hashlib
 import os
 import shutil
 import sys
+import time
 import urllib.request
 import zipfile
 
@@ -180,6 +181,25 @@ def bake_seedvr2():
         raise SystemExit(1)
 
 
+def _fetch(url, destination, attempts=5, pause=5):
+    """One small file, retried. **`hf_hub_download` retries internally and this did not** — a
+    single blip on the plain `urlopen` failed the RUN, which is why the ffmpeg install a hundred
+    lines up in the Dockerfile spends `--retry 12` on the same class of fetch. `timeout` is
+    per-socket-operation rather than total, so it bounds a stall but not a trickle; the retry is
+    what bounds the blip."""
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=120) as response, \
+                    open(destination, "wb") as handle:
+                shutil.copyfileobj(response, handle)
+            return
+        except Exception as exc:  # noqa: BLE001 — any transport failure is worth one more try
+            if attempt == attempts:
+                sys.exit("could not fetch {} after {} attempts: {}".format(url, attempts, exc))
+            print("fetch {} failed ({}); retrying in {}s".format(url, exc, pause), flush=True)
+            time.sleep(pause)
+
+
 def bake_rife():
     """Practical-RIFE's `train_log` — the model code and its weights, from one pinned archive.
 
@@ -250,9 +270,7 @@ def bake_rife():
     for name, (want_size, want_sha) in sorted(RIFE_SOURCE_FILES.items()):
         destination = os.path.join(model_pkg, name)
         url = RIFE_SOURCE_URL.format(RIFE_SOURCE_COMMIT, name)
-        with urllib.request.urlopen(url, timeout=120) as response, \
-                open(destination, "wb") as handle:
-            shutil.copyfileobj(response, handle)
+        _fetch(url, destination)
         verify(destination, "model/" + name, want_size, want_sha)
         print("baked model/{} -> {}".format(name, destination), flush=True)
 
@@ -264,10 +282,13 @@ def bake_rife():
 # has no upscaler by design and still needs its interpolator — so the flag gates one and not the
 # other. The Dockerfile invokes this unconditionally and the decision is made here, where the two
 # fetches and their assertions already live, rather than in shell.
+# **RIFE first, and the order is not cosmetic.** It is 23 MB and fails in seconds; SeedVR2 is
+# ~16 GiB and takes minutes. Baking the large one first meant a transient blip on the small one's
+# fetch discarded the whole download with the layer. Fail fast, then spend.
+bake_rife()
+
 if os.environ.get("BAKE_WEIGHTS") == "0":
     print("BAKE_WEIGHTS=0 — no SeedVR2 checkpoint; RIFE is baked regardless (contract 6b)",
           flush=True)
 else:
     bake_seedvr2()
-
-bake_rife()

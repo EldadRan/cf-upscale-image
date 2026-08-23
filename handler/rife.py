@@ -68,12 +68,16 @@ class Rife:
                 "no flownet.pkl under {} — this image was built without the interpolator, or "
                 "{} points somewhere else".format(train_log, MODEL_DIR_ENV))
 
-        # **First on the path, unconditionally**, for the reason `fable/worker_path.py` records
-        # about the handler: if the directory is already there under a different intent, being
-        # present is not the same as being first, and the module that wins is the one earlier.
-        while directory in sys.path:
-            sys.path.remove(directory)
-        sys.path.insert(0, directory)
+        # **APPENDED, not inserted first, and that is the opposite of `worker_path`'s rule for a
+        # reason.** This directory exports two importable names and one of them is `model` — as
+        # generic a top-level name as Python has. Putting it first would make every later
+        # `import model...` anywhere in the process resolve to Practical-RIFE's package, for the
+        # life of the process, with no reset. Nothing in the vendored SeedVR2 tree or the
+        # installed packages provides either name today, so appending resolves identically while
+        # shadowing nothing — and if something ever does provide `model`, appending loses to it
+        # rather than silently winning.
+        if directory not in sys.path:
+            sys.path.append(directory)
 
         from train_log.RIFE_HDv3 import Model  # noqa: PLC0415 — deliberate lazy heavy import
 

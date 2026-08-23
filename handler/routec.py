@@ -24,6 +24,12 @@ from errors import INVALID_SOURCE, WorkerError
 #: here because a channel order that is wrong is a picture that still plays.
 _CHANNELS = 3
 
+#: **Slack on the derived count, in source frames.** Zero was wrong: the count comes from a
+#: duration stored to the millisecond times a rate, and `media_trim`'s edit lists are named in
+#: `source_frame_count` as the reason a container and a decode disagree on CF's own files. §2's
+#: duration bound is +-2 output frames and this is its counterpart on the input side.
+SURPLUS_TOLERANCE_FRAMES = 2
+
 
 def source_frame_count(source):
     """How many frames the plan is sized from, and why it is not read from the container.
@@ -46,7 +52,15 @@ def source_frame_count(source):
             "a retime needs the source's rate and duration and this container reports "
             "fps={!r} duration={!r}. Neither is guessed: the frame plan is sized from them and a "
             "wrong size is a wrong output length.".format(fps, duration))
-    return int(round(float(duration) * float(fps)))
+    count = int(round(float(duration) * float(fps)))
+    if count < 2:
+        # `build_plan` refuses this too, but with a bare `ValueError`; every other refusal on
+        # this path is a `WorkerError` the caller can read.
+        raise WorkerError(
+            INVALID_SOURCE,
+            "a retime needs at least two source frames and this container's duration ({}s) at "
+            "{} fps implies {}".format(duration, fps, count))
+    return count
 
 
 def _to_tensor(frame_bgr, torch):
@@ -63,17 +77,39 @@ def _to_rgb24(tensor):
     [0, 1]; `uint8` would wrap that into a black pixel in a white region, which is the 16-bit
     downconvert defect in miniature.
     """
-    array = tensor.detach().to("cpu", copy=False).float().clamp_(0.0, 1.0)[0]
+    # **`clamp`, not `clamp_`.** A copy or a hold is yielded as it arrived — the caller's own
+    # tensor, deliberately never cast — and `.to("cpu", copy=False).float()` on a CPU float32
+    # tensor hands back that same object, so an in-place clamp would write through to the source
+    # frame. Harmless here, since a decoded frame is already in [0, 1] by construction; wrong as
+    # a mechanism, and under route A or B the frames entering the shim are model output.
+    array = tensor.detach().to("cpu", copy=False).float().clamp(0.0, 1.0)[0]
     array = (array.numpy().transpose(1, 2, 0) * 255.0).round().astype(np.uint8)
     return np.ascontiguousarray(array).tobytes()
 
 
-def frames_from(capture, cli):
-    """Decode the source into cv2 frames, in order, until it is exhausted."""
+def frames_from(capture, cli, expect=None):
+    """Decode the source into cv2 frames, in order, until it is exhausted.
+
+    `expect` is the `(height, width)` the writer was told, checked once on the first frame.
+    **The writer is sized from the container and the bytes come from the decoder**, and nothing
+    else compares the two: a rotation matrix or any decoder-side adjustment would produce a byte
+    count ffmpeg does not expect, and rawvideo carries no shape — so the master shears from that
+    frame on while the process exits 0. `MasterWriter.write` catches a wrong LENGTH; a transposed
+    frame of the same length it cannot.
+    """
+    checked = False
     while True:
         ok, frame = capture.read()
         if not ok or frame is None:
             return
+        if not checked and expect is not None:
+            checked = True
+            if tuple(frame.shape[:2]) != tuple(expect):
+                raise WorkerError(
+                    INVALID_SOURCE,
+                    "the decoder returns {}x{} frames but the container reports {}x{}; the "
+                    "encode is sized from the container and would shear."
+                    .format(frame.shape[1], frame.shape[0], expect[1], expect[0]))
         yield frame
 
 
@@ -96,7 +132,7 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
         width, height = shape["width"], shape["height"]
         n_in = source_frame_count(source)
         stream = interpolator.stream(
-            _tensors(frames_from(capture, cli)),
+            _tensors(frames_from(capture, cli, expect=(height, width))),
             n_in=n_in, src_fps=shape["fps"], dst_fps=target_fps,
             tol=snap_tolerance or 0.0)
 
@@ -111,18 +147,24 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
         # **The other half of the derived count.** `stream()` refuses a source shorter than the
         # plan; this refuses one longer. A container whose duration and rate imply fewer frames
         # than it holds would otherwise deliver a silently truncated retime.
+        # `grab()` rather than `read()`: this counts, it does not look. Decoding the remainder
+        # of a long file to produce a number we immediately refuse on is work nobody asked for.
         surplus = 0
-        while True:
-            ok, _frame = capture.read()
-            if not ok:
-                break
+        while capture.grab():
             surplus += 1
-        if surplus:
+        # **Two frames of slack, not zero, and the docstring above says why it is needed.** A
+        # count derived from a duration stored to the millisecond drifts by a frame over a long
+        # clip, and `media_trim`'s edit lists are exactly the case where a container's numbers and
+        # a decode disagree by a little. §2's bound is +-2 output frames; the same tolerance in
+        # source frames is the smallest one that does not refuse arithmetic noise. Beyond it the
+        # disagreement is structural rather than rounding, and a retime would be truncated.
+        if surplus > SURPLUS_TOLERANCE_FRAMES:
             raise WorkerError(
                 INVALID_SOURCE,
-                "the source holds {} frame(s) beyond the {} its duration and rate imply, so the "
-                "retime would have been truncated. The container's own numbers disagree with its "
-                "content.".format(surplus, n_in))
+                "the source holds {} frame(s) beyond the {} its duration and rate imply, which "
+                "is past the {}-frame tolerance for rounding, so the retime would have been "
+                "truncated. The container's own numbers disagree with its content."
+                .format(surplus, n_in, SURPLUS_TOLERANCE_FRAMES))
         return stream.stats
     finally:
         if capture is not None:

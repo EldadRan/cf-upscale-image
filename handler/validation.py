@@ -556,6 +556,32 @@ def validate(job_input):
     # emptiness (`upscale: false` with nothing to do) itself.
     release_3 = envelope.derive(params)
 
+    # **What the contract accepts and this worker cannot yet serve is REFUSED, not ignored.**
+    # `envelope.derive` is §5c complete and correct; the paths behind two of its answers are not
+    # wired. Accepting them would deliver the opposite of what was asked — an `upscale: false`
+    # request would be planned as an upscale and die on a null size, and an `h265` request would
+    # return h264 without a word. That is the silent-reinterpretation class this whole section
+    # exists to prevent, and a field that validates and then does nothing is worse than one
+    # refused by name, because the caller has evidence it was understood.
+    if not release_3["upscale"]:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "'upscale: false' is contract-legal and this worker cannot serve it yet: the retime "
+            "path exists but no request reaches it (release-3 plan, Phase 1 step 4). Refused "
+            "rather than silently upscaled.")
+    if release_3["codec"] != envelope.DEFAULT_CODEC:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "'output.codec: {}' is contract-legal and this worker cannot serve it yet; only {!r} "
+            "is implemented. Refused rather than silently encoded as {}.".format(
+                release_3["codec"], envelope.DEFAULT_CODEC, envelope.DEFAULT_CODEC))
+    if release_3["interpolate"] is not None:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "'interpolate' is contract-legal and this worker cannot serve it yet: the shim and "
+            "the retime path exist but no request reaches them. Refused rather than silently "
+            "delivering the source rate.")
+
     target = params.get("target_short_edge_px")
     if target is None and not release_3["upscale"]:
         pass

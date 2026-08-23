@@ -52,6 +52,14 @@ def padded_megapixels(width, height, scale=1):
     it is computable without a single measurement. Reported so Phase 2's readings can be plotted
     against the same quantity the predicate will use, rather than against raw frame size.
     """
+    if int(width) <= 0 or int(height) <= 0:
+        # **The one function here that could invent a number, so it does not.** Negative
+        # dimensions produced a positive, entirely plausible megapixel figure — and a negative
+        # one flowed into the formula and made `fits` return True for an impossible job, while
+        # zero made it `A <= usable` at any resolution. In a module whose whole thesis is that a
+        # placeholder is worse than a refusal because it is indistinguishable from a measurement,
+        # this was the placeholder.
+        raise ValueError("padded area needs positive dimensions, got {}x{}".format(width, height))
     multiple = pad_multiple(scale)
     padded_w = -(-int(width) // multiple) * multiple
     padded_h = -(-int(height) // multiple) * multiple
@@ -101,5 +109,6 @@ def seconds(stats, per_synthesis_s=None):
         raise Unquotable(
             "route C's time model is n_synth x t(pad_MP) and t is unmeasured. This plan holds "
             "{} syntheses out of {} output frames, which is the multiplier the estimate needs — "
-            "the seconds are Phase 2's.".format(stats["n_synth"], stats["n_out"]))
+            "the seconds are Phase 2's.".format(
+                (stats or {}).get("n_synth"), (stats or {}).get("n_out")))
     return stats["n_synth"] * per_synthesis_s
