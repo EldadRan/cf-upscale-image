@@ -172,11 +172,11 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
                 "is past the {}-frame tolerance for rounding, so the retime would have been "
                 "truncated. The container's own numbers disagree with its content."
                 .format(surplus, n_in, SURPLUS_TOLERANCE_FRAMES))
-        stats = dict(stats, scale=scale)
-        peak = _read_peak(peak_reset)
-        if peak is not None:
-            stats["peak_vram_gb"] = peak
-        return stats
+        # **Always present, None when nothing measured it.** Setting the key only on success
+        # makes "no GPU here" and "nobody thought to ask" reach a ledger row identically — as an
+        # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
+        # already argues for every field it reports.
+        return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset))
     finally:
         if capture is not None:
             capture.release()
@@ -189,7 +189,7 @@ def _reset_peak():
         if not torch.cuda.is_available():
             return False
         torch.cuda.reset_peak_memory_stats()
-        return True
+        return True if torch.cuda.memory_allocated() >= 0 else False
     except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
         return False
 

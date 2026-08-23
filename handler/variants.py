@@ -15,7 +15,24 @@ out of the existing plan rather than being special-cased. Same for 48->96. `cas`
 ordinary 48->60 plan over that stream; `casdec` selects instead. Nothing here re-derives a
 position, which is why `retime_cases` still covers the arithmetic under all of them.
 """
-from interpolate import build_plan, target_count
+from fractions import Fraction
+
+from interpolate import target_count
+
+
+def _nearest(k, src_fps, dst_fps):
+    """The nearest source index to output instant `k`, **half-up and in exact arithmetic**.
+
+    `round()` ties to even, which `interpolate.target_count` spends a docstring rejecting for the
+    frame count — and the same rule has to hold here or the control judders on a beat it should
+    not have. At 30->60 the ratio is exactly 0.5, so EVERY odd instant is a tie: ties-to-even
+    gives `0,0,1,2,2,2,3,4,4,4` — frame 1 shown once and frame 2 shown three times — where a 2:2
+    pulldown shows each frame exactly twice. `Fraction` because the tie has to be detected to be
+    broken, and `k * 29.97/59.94` in binary float lands a hair either side of one.
+    """
+    exact = Fraction(k) * Fraction(src_fps).limit_denominator(100000) \
+        / Fraction(dst_fps).limit_denominator(100000)
+    return int((exact + Fraction(1, 2)).__floor__())
 
 #: §8b's codes, in the order the contract lists them. `pull` last because it is the control.
 VARIANTS = ("direct", "cas", "casdec", "pull")
@@ -30,19 +47,18 @@ def _select_nearest(frames, n_in, src_fps, dst_fps):
     source interval and make the control judder worse than the technique it stands in for.
     """
     n_out = target_count(n_in, src_fps, dst_fps)
-    ratio = src_fps / dst_fps
     held = {}
     highest = -1
     source = iter(frames)
-    counts = {"copy": 0, "hold": 0}
 
     for k in range(n_out):
-        index = int(round(k * ratio))
+        # **The same call the stats use, so the two cannot disagree by an ulp.** They were two
+        # different float expressions — `k * (src/dst)` here and `k * src / dst` there — which
+        # differ near a tie: at 29.97->59.94, k=9 gives 4.5 one way and 4.500000000000001 the
+        # other, and the stats then described a stream that was not produced.
+        index = _nearest(k, src_fps, dst_fps)
         if index > n_in - 1:
             index = n_in - 1
-            counts["hold"] += 1
-        else:
-            counts["copy"] += 1
         while highest < index:
             try:
                 frame = next(source)
@@ -53,11 +69,6 @@ def _select_nearest(frames, n_in, src_fps, dst_fps):
             highest += 1
             held = {highest: frame}
         yield held[index]
-
-    _select_nearest.last_stats = {
-        "n_out": n_out, "n_copy": counts["copy"], "n_synth": 0, "n_hold": counts["hold"],
-        "real_frames": counts["copy"], "real_share": 1.0, "worst_snap_frac": 0.0,
-    }
 
 
 def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
@@ -85,10 +96,17 @@ def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
         # Counted from the same arithmetic the selection uses rather than from `direct`'s plan.
         # Every delivered frame is a real one, so the share is 1.0 by construction; what varies
         # is how many instants fall beyond the last source frame and repeat it.
-        picks = [int(round(k * src_fps / dst_fps)) for k in range(n_out)]
+        picks = [_nearest(k, src_fps, dst_fps) for k in range(n_out)]
         held = sum(1 for index in picks if index > n_in - 1)
+        # **`real_frames` is `n_copy`, not `n_out`, and the difference is the control's honesty.**
+        # A first draft reported 1.0 here on the argument that every delivered frame is real
+        # footage — which is true and is the wrong quantity. `interpolate.py`'s stats define a
+        # hold as a repeat rather than new footage, and `direct`'s share excludes them; a control
+        # whose headline KPI counted them would be inflated against the very thing it is the
+        # control for, and would make interpolation look worse than it is by comparison.
         stats = {"n_out": n_out, "n_copy": n_out - held, "n_synth": 0,
-                 "n_hold": held, "real_frames": n_out, "real_share": 1.0,
+                 "n_hold": held, "real_frames": n_out - held,
+                 "real_share": (n_out - held) / n_out,
                  "worst_snap_frac": 0.0, "variant": "pull", "stages": ("select",),
                  "synth_total": 0}
         return stream, stats
@@ -131,7 +149,7 @@ def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
     # is a multiple of four, because two midpoint stages put the source frames at 0, 4, 8, …; the
     # selection takes `round(k * 96/60)`, so a delivered frame is real exactly when that index is
     # divisible by four. That is exact and needs no measurement.
-    picks = [int(round(k * (src_fps * 4) / dst_fps)) for k in range(n_out)]
+    picks = [_nearest(k, src_fps * 4, dst_fps) for k in range(n_out)]
     last_96 = second.stats["n_out"] - 1
     real = sum(1 for index in picks if index <= last_96 and index % 4 == 0)
     held = sum(1 for index in picks if index > last_96)
