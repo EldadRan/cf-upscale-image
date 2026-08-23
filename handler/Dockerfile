@@ -36,6 +36,13 @@ ARG SEEDVR2_MODEL=seedvr2_ema_7b_fp16.safetensors
 # SeedVR2, so a build that omits the checkpoint is not a stripped worker — it is the correct one
 # for that route, and it does not pay a cold start for ~15 GiB it will never read.
 #
+# **It gates SeedVR2 and NOT RIFE** (CF, 2026-08-23). Route C is the image with no upscaler and
+# it is precisely the image that must interpolate, so the interpolator is baked on every variant
+# and the flag decides only whether a checkpoint rides with it. The shell no longer branches: the
+# script is always invoked and reads this value itself, because the two fetches and their hash
+# assertions already live there and a second decision point in shell is a second place to be
+# wrong about which model is which.
+#
 # **`0` or `1`, and anything else fails the build.** An earlier draft baked on a mistyped value
 # — fail-safe in isolation, but two ENV flags below derive from this one arg, and a value that is
 # neither cannot set both honestly. A typo that stops a build costs minutes; a typo that ships an
@@ -105,6 +112,7 @@ ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ENV SEEDVR2_DIR=/app/SeedVR2 \
     SEEDVR2_MODEL_DIR=/app/models/SEEDVR2 \
     SEEDVR2_MODEL=${SEEDVR2_MODEL} \
+    RIFE_MODEL_DIR=/app/models/RIFE \
     PYTHONUNBUFFERED=1
 
 # ── system packages ─────────────────────────────────────────────────────────────────────────
@@ -207,20 +215,17 @@ print('release seams OK: colour pyramid patchable, bfloat16 handoff removed, wei
 # This is the only place the real cost of the weights is visible: every earlier disk figure in
 # docs/decisions.md 3.5 is about the base, and no build had reached this line when the size
 # projections there were written.
-COPY bake_weights.py ./
+COPY bake_weights.py RIFE-LICENSES.txt ./
 RUN set -eux; \
     case "$BAKE_WEIGHTS" in 0|1) ;; \
       *) echo "BAKE_WEIGHTS must be 0 or 1, got '$BAKE_WEIGHTS'" >&2; exit 2 ;; \
     esac; \
     echo "--- disk before the bake ---"; df -h /; \
-    if [ "$BAKE_WEIGHTS" = "0" ]; then \
-      echo "BAKE_WEIGHTS=0 — route-C image, no checkpoint baked (contract 6b)"; \
-      mkdir -p "$SEEDVR2_MODEL_DIR"; \
-    else \
-      python3 bake_weights.py; \
-    fi; \
+    mkdir -p "$SEEDVR2_MODEL_DIR" "$RIFE_MODEL_DIR"; \
+    BAKE_WEIGHTS="$BAKE_WEIGHTS" python3 bake_weights.py; \
+    install -m644 RIFE-LICENSES.txt "$RIFE_MODEL_DIR/LICENSE.txt"; \
     echo "--- disk after the bake ---"; df -h /; \
-    du -sh "$SEEDVR2_MODEL_DIR"
+    du -sh "$SEEDVR2_MODEL_DIR" "$RIFE_MODEL_DIR"
 
 # **The weights are in the image, so nothing re-proves it at runtime** (F-2026-08-19-31). The
 # vendored `download_weight()` validates an existing model file against a size+mtime cache and,
