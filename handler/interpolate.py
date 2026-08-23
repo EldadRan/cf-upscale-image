@@ -185,6 +185,18 @@ class Interpolator:
         self._model = model
         self._device = device
         self._dtype = dtype
+        # **The only thing this object publishes**, and it is declared FIRST so the attribute
+        # exists even if construction fails below it — `pad_multiple` raises on a non-positive
+        # scale, and an instance that survived that (a subclass catching it) would otherwise have
+        # a `stats` property with nothing behind it.
+        #
+        # Audited against §5d: `_device`, `_dtype` and `_multiple` are configuration set once
+        # here. `_model` is also configuration, but it is completed in two steps rather than one —
+        # `prepare()` rebinds it to the cast module — so "set at construction" is not true of it
+        # and the audit says why it still does not bite: nothing reads it but `_synthesise`, there
+        # is no accessor, and re-casting an already-cast module is a no-op, so it cannot carry one
+        # stream's identity into another.
+        self._stats = None
         self._multiple = pad_multiple(scale)
 
     # ---- torch, imported where it is used ----------------------------------------------------
@@ -274,7 +286,16 @@ class Interpolator:
         is non-decreasing in k — so a single forward pass over the source suffices and nothing is
         buffered beyond the pair in hand.
         """
+        # **Invalidated on ENTRY, never on success** (contract §5d). A field set on the way out
+        # is readable at its old value for the whole of the next call, and for ever if that call
+        # fails — so a refused plan left the last good clip's `n_out` reading as current, with
+        # every visible signal correct and the number belonging to a different clip. This line is
+        # before `build_plan` precisely because `build_plan` can refuse: clearing on entry removes
+        # the class, clearing on success removes only the cases that succeed.
+        self._stats = None
+
         plan, stats = build_plan(n_in, src_fps, dst_fps, tol=tol)
+
         # **Published by the CALL, not by the iteration, which is why this function is not itself
         # a generator.** A generator body does not execute until the first `next()`, and the line
         # after its final `yield` does not execute until the caller drives it to `StopIteration`.
@@ -323,5 +344,19 @@ class Interpolator:
 
     @property
     def stats(self):
-        """The stats from the last `stream` call, available once it has been consumed."""
-        return getattr(self, "_stats", None)
+        """The stats from the last `stream` call, or None if that call refused or none has run.
+
+        `self._stats` rather than `getattr(self, "_stats", None)`: the default form quietly
+        answered for an attribute that might not exist, which is the same silence §5d is about.
+        The attribute is declared in `__init__` and cleared on every entry, so None here means
+        exactly one thing — no plan was built by the most recent call.
+
+        **It describes the last CALL, which may not be the generator in your hand.** Frame state
+        is per-call and cannot cross streams; this number lives on the instance and therefore is
+        last-writer-wins. Open a second `stream()` while a first generator is still undrained and
+        this reads the second one's plan while the first yields the first one's frames — §5d's own
+        shape, in the one place the rule cannot reach, because the signature publishes a per-call
+        result through a shared object. **Read it immediately after the call that made it**, or
+        hold one `Interpolator` per stream.
+        """
+        return self._stats
