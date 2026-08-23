@@ -30,6 +30,22 @@ _CHANNELS = 3
 #: duration bound is +-2 output frames and this is its counterpart on the input side.
 SURPLUS_TOLERANCE_FRAMES = 2
 
+#: **Route C's own encode settings, passed as an override the production path never sends**
+#: (contract §8c). The 8K run was reaped in x264 at ~46 GiB while this side held one frame and a
+#: cached pair: the pipe is backpressure and it was working — what filled memory was the
+#: encoder's own working set, one frame in flight per encoding thread plus `medium`'s 40-frame
+#: lookahead plus references, dozens of 50 MiB frames at once on a 24-core host. At 4K the same
+#: arithmetic fits, which is why five 4K runs showed nothing.
+#:
+#: `sliced-threads=1` is the large one: threads split ONE frame rather than each taking their
+#: own, which cuts frames-in-flight from dozens to one at a modest speed cost. `threads` caps the
+#: frame-level parallelism that multiplies the set. `rc-lookahead` shortens the window.
+#:
+#: **Every value here is an ordering hint and not a prediction.** The gate modelled x264 at ~4 GiB
+#: against an observed 40-plus, so nothing in this line is trustworthy until a run reports
+#: `encoder_peak_rss_gb` — which is why the writer now measures it.
+FRUGAL_X264 = "sliced-threads=1:threads=4:rc-lookahead=10"
+
 
 def source_frame_count(source):
     """How many frames the plan is sized from, and why it is not read from the container.
@@ -147,10 +163,33 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
             master_path, width, height, float(target_fps), identity,
             audio_source=audio_source, audio_codec=source.get("audio_codec"),
             audio_limit_s=source.get("video_duration_s"),
-            crf=crf if crf is not None else encoder.DEFAULT_CRF)
-        with writer_cm as writer:
-            for frame in stream:
-                writer.write(_to_rgb24(frame))
+            crf=crf if crf is not None else encoder.DEFAULT_CRF,
+            x264_params=FRUGAL_X264)
+        # **The peak is read on the FAILURE path too, and that is the path it exists for.** It
+        # was read only after the `with` — so an encoder reaped by the kernel, which is the exact
+        # event this instrumentation was added for, propagated past the read and took the sampled
+        # maximum with it. A second fifty-minute run would have had its ceiling inferred from a
+        # kill again, which is what the measurement was meant to end. The number now rides on the
+        # refusal's own message, where the diagnostics bundle and the run-record both carry it.
+        try:
+            with writer_cm as writer:
+                for frame in stream:
+                    writer.write(_to_rgb24(frame))
+        except WorkerError as exc:
+            peak = writer_cm.encoder_peak_rss_gb
+            if peak is None:
+                raise
+            raise WorkerError(
+                exc.code,
+                "{} — ffmpeg reached {} GiB RSS before it stopped, over {} frame(s) written "
+                "with x264-params {!r}".format(
+                    exc.message, peak, writer_cm.frames_written, FRUGAL_X264),
+                remedy=exc.remedy, shortfall=exc.shortfall) from exc
+        finally:
+            # Said out loud whichever way the encode ended, because a log line survives a bundle
+            # that was never written.
+            print("[encode] ffmpeg peak RSS {} GiB over {} frame(s)".format(
+                writer_cm.encoder_peak_rss_gb, writer_cm.frames_written), flush=True)
         # **The other half of the derived count.** `stream()` refuses a source shorter than the
         # plan; this refuses one longer. A container whose duration and rate imply fewer frames
         # than it holds would otherwise deliver a silently truncated retime.
@@ -176,7 +215,11 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
         # makes "no GPU here" and "nobody thought to ask" reach a ledger row identically — as an
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
-        return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset))
+        return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
+                    # ffmpeg's own high-water mark, beside the GPU's. The 8K ceiling was in the
+                    # encoder rather than the model, and neither number alone would have said so.
+                    encoder_peak_rss_gb=writer.encoder_peak_rss_gb,
+                    x264_params=FRUGAL_X264)
     finally:
         if capture is not None:
             capture.release()
