@@ -453,8 +453,15 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # An estimate of the frame count, for planning and the ETA **only**. Every frame count this
     # worker reports comes from the decode.
     estimated_frames = None
-    if source["duration_s"] and source["fps"]:
-        estimated_frames = int(round(source["duration_s"] * source["fps"]))
+    # **`measured_fps`, not `fps`, and the difference is three frames on a spliced source.**
+    # `measured_fps` is frames over duration, so multiplying it back returns the count by
+    # construction; the declared rate returns what the file WOULD hold if it were CFR at that
+    # rate. This number feeds the schedule simulation, the chunk arithmetic and
+    # `refuse_frames_no_deadline_admits`, and an over-estimate refuses work that would have
+    # succeeded. The declared rate is what the contract's tables and route C's plan read.
+    measured = source.get("measured_fps") or source["fps"]
+    if source["duration_s"] and measured:
+        estimated_frames = int(round(source["duration_s"] * measured))
     progress = progress_module.Progress(job=job, estimated_frames=estimated_frames)
 
     # **An exact canvas changes what the model is asked for, not just what is delivered.** The
