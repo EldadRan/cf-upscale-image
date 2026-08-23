@@ -121,6 +121,30 @@ def build_identity():
     }
 
 
+def identity_tags(request, width, height):
+    """The tags muxed into the delivered file. **The model is named only if the image has one.**
+
+    `build_identity()` reports `model: null` on a weightless build (contract §6b), and this is the
+    same claim one layer out — a delivered file asserting a checkpoint its image does not contain
+    is a falsehood about its own bytes.
+
+    **The key is OMITTED rather than nulled** (CF, 2026-08-23). A null in a container tag becomes
+    the string `"None"`, so nulling would have the file name a model called None — a worse
+    falsehood than the one §6b prevents, because it asserts an identity rather than declining to
+    state one. Absent means absent, which is the same rule as `snap_tolerance`'s missing default
+    and route C's unmeasured coefficients. The manifest carries "no model" as a fact, which is
+    something a tag key cannot do.
+    """
+    tags = {
+        "cf_request_id": request["request_id"],
+        "cf_worker_version": WORKER_VERSION,
+        "cf_output": "{}x{}".format(width, height),
+    }
+    if WEIGHTS_BAKED:
+        tags["cf_model_build"] = MODEL_BUILD
+    return tags
+
+
 #: Printed once per container, on the first job it handles. **Once, not per job**: it describes
 #: the machine rather than the work, and a line repeated on every request is a line people learn
 #: to skip.
@@ -1620,12 +1644,7 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
     try:
         width, height = exact_size or estimator.output_dimensions(
             source["width"], source["height"], plan["target_short_edge_px"])
-        identity = {
-            "cf_request_id": request["request_id"],
-            "cf_worker_version": WORKER_VERSION,
-            "cf_model_build": MODEL_BUILD,
-            "cf_output": "{}x{}".format(width, height),
-        }
+        identity = identity_tags(request, width, height)
         progress.begin_phase()
         # A budget large enough never to truncate: the generator stops when the decode is
         # exhausted, so this bounds the read from above while the decode determines it below.

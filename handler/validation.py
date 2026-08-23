@@ -30,6 +30,7 @@ known or not.
 """
 
 import encoder
+import envelope
 import planner
 from errors import (
     FIELD_NOT_SUPPORTED,
@@ -197,6 +198,18 @@ PARAMS_FIELDS = {
     # every window's quality for an even tail. Neither is imposed: the default favours the body,
     # balanced the tail, and which matters more is per-job judgment only the caller has.
     "schedule",
+    # ── release 3 ────────────────────────────────────────────────────────────────────────────
+    # **Validated in `envelope.py`, not here.** Release 2's surface is large and a release-3
+    # block folded into it would be indistinguishable from the fields that have always been
+    # there — and the one property protecting production is that a request carrying none of
+    # these behaves exactly as it did. Naming them here is what stops `_refuse_unknown` rejecting
+    # them by name; the rules that govern them live in one file that can be read end to end.
+    "upscale",
+    "interpolate",
+    # **`params.output` is the ENCODE, and the top-level `output` is the DESTINATION.** One word,
+    # two objects, and the collision is the contract's spelling (§5c) rather than a choice made
+    # here. Raised to the gate as a claim.
+    "output",
 }
 
 #: **Nothing is unconditionally required, and that is the point.** `target_short_edge_px` is
@@ -536,8 +549,17 @@ def validate(job_input):
 
     output_size = _validate_output_size(params.get("output_size"))
 
+    # **Release 3's surface, derived before the sizing rule because it can suspend it.**
+    # `upscale: false` is the explicit retime spelling, and a retime does not resize — so the
+    # requirement that a request say what size it wants is release 2's rule and stays exactly
+    # that. `envelope.derive` refuses the contradiction (a size beside `upscale: false`) and the
+    # emptiness (`upscale: false` with nothing to do) itself.
+    release_3 = envelope.derive(params)
+
     target = params.get("target_short_edge_px")
-    if target is None:
+    if target is None and not release_3["upscale"]:
+        pass
+    elif target is None:
         # One of the two has to arrive. Naming both in the message matters: a caller who omitted
         # the short edge because they *meant* to send `output_size` and mistyped it has already
         # been told about the typo by `_refuse_unknown`, and a caller who sent neither is being
@@ -641,6 +663,9 @@ def validate(job_input):
         "request_id": request_id,
         "source_url": _as_str(job_input["source_url"], "source_url"),
         "target_short_edge_px": target,
+        # The normalised release-3 config, one object rather than four loose keys, so a caller
+        # downstream cannot read `interpolate` without also having what decided it.
+        "release_3": release_3,
         "allow_oom_retry": allow_oom_retry,
         "keep_audio": keep_audio,
         "color_correction": color_correction,
