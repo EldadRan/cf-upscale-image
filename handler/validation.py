@@ -563,24 +563,22 @@ def validate(job_input):
     # return h264 without a word. That is the silent-reinterpretation class this whole section
     # exists to prevent, and a field that validates and then does nothing is worse than one
     # refused by name, because the caller has evidence it was understood.
-    if not release_3["upscale"]:
+    # `upscale: false` is served: `handle` branches to route C on it. `interpolate` BESIDE an
+    # upscale is not — that is route A or B, which need the A/B `route` field Phase 2 rules and a
+    # pipeline placement nothing has built.
+    if release_3["interpolate"] is not None and release_3["upscale"]:
         raise WorkerError(
             INVALID_FIELD_VALUE,
-            "'upscale: false' is contract-legal and this worker cannot serve it yet: the retime "
-            "path exists but no request reaches it (release-3 plan, Phase 1 step 4). Refused "
-            "rather than silently upscaled.")
+            "'interpolate' beside an upscale is route A or B and this worker serves neither yet; "
+            "only 'upscale: false' — interpolation alone — is wired. Refused rather than "
+            "silently upscaling without it.")
     if release_3["codec"] != envelope.DEFAULT_CODEC:
         raise WorkerError(
             INVALID_FIELD_VALUE,
             "'output.codec: {}' is contract-legal and this worker cannot serve it yet; only {!r} "
             "is implemented. Refused rather than silently encoded as {}.".format(
                 release_3["codec"], envelope.DEFAULT_CODEC, envelope.DEFAULT_CODEC))
-    if release_3["interpolate"] is not None:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "'interpolate' is contract-legal and this worker cannot serve it yet: the shim and "
-            "the retime path exist but no request reaches them. Refused rather than silently "
-            "delivering the source rate.")
+
 
     target = params.get("target_short_edge_px")
     if target is None and not release_3["upscale"]:

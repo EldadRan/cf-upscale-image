@@ -215,8 +215,26 @@ def handle(job_input, job=None):
     outcome = {"status": "internal", "error": None}
     with diagnostics.LogCapture() as captured:
         try:
-            response = _run(request, job, machine, warnings, attempts, workdir, progress,
-                            captured, started, trace)
+            # **Route C branches here, and `handle` keeps its name** (CF, 2026-08-23). The
+            # first shape proposed was `handle` -> `handle_org` with a new `handle` for the
+            # test; `handler()` below calls `handle` by name, so a test holding that name
+            # becomes the production entry point of the next FULL image built from `main` —
+            # same tag, same everything, wrong function, and nothing today would show it
+            # because low is on the route-C image while medium and high are elsewhere.
+            #
+            # **The production path is untouched rather than preserved under another name.**
+            # This is one `if` above it: an interpolate-only request goes to route C and
+            # returns; everything else falls through to exactly what was there before.
+            #
+            # **And it returns its retime stats, which is the whole response** (CF). Route C
+            # is a test until the samples are seen, so it gets no `configuration`, no
+            # rationale and no manifest equivalence — the production response shape is
+            # deferred rather than dropped, and nobody can rule it before the samples exist.
+            if not request["release_3"]["upscale"]:
+                response = _retime(request, machine, warnings, workdir, progress, started)
+            else:
+                response = _run(request, job, machine, warnings, attempts, workdir, progress,
+                                captured, started, trace)
             outcome["status"] = "refused" if response.get("cf_error") else "ok"
             outcome["error"] = response.get("cf_error")
             return response
@@ -247,6 +265,64 @@ def handle(job_input, job=None):
             _write_run_record(outcome, request, machine, attempts, warnings, progress,
                               trace, job, started)
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _retime(request, machine, warnings, workdir, progress, started):
+    """Route C end to end: fetch, decode, interpolate, encode, upload. **No model of ours.**
+
+    Deliberately not a second `_run` and not a copy of its master-to-upload half. It calls the
+    same `storage` helpers and nothing else — a test that starts absorbing the pipeline is what
+    scope review exists to stop, and every guarantee `_run` carries is about model memory
+    (contract §6), so borrowing its shape would borrow answers to questions route C does not ask.
+    """
+    import interpolate as interpolate_module  # noqa: PLC0415 — GPU-box imports, like the rest
+    import rife  # noqa: PLC0415
+    import routec  # noqa: PLC0415
+
+    download = os.path.join(workdir, "source")
+    storage.fetch_source(request["source_url"], download)
+    extension = probe.detect_extension(download)
+    source_path = probe.named_with_extension(download, extension)
+    source = probe.probe_source(source_path)
+
+    config = request["release_3"]["interpolate"]
+    progress.phase("load", pct=3, force=True, note="interpolator")
+    interpolator = interpolate_module.Interpolator(
+        rife.Rife.load(), scale=1).prepare()
+
+    master = keys.master_name(False, source["width"], source["height"],
+                              name=request["output"].get("name"))
+    master_path = os.path.join(workdir, master)
+    progress.phase("interpolate", pct=10, force=True)
+    stats = routec.retime(
+        pipeline.load_cli(), source, source_path, master_path, interpolator,
+        target_fps=config["target_fps"], identity=identity_tags(
+            request, source["width"], source["height"]),
+        snap_tolerance=config["snap_tolerance"],
+        crf=request.get("crf"),
+        audio_source=source_path if request["keep_audio"] else None)
+
+    client = storage.client_for(request["output"])
+    master_key = storage.upload(client, request["output"], master, master_path,
+                                keys.content_type(master))
+    delivered = probe.probe_output(master_path)
+
+    # **The stats and what they were measured on, and nothing shaped like a plan.** A
+    # `configuration` block here would look, to anything reading the envelope, exactly like a
+    # planned upscale — and there is no plan, because there is no model to plan for.
+    return _decorate({
+        "status": "DELIVERED",
+        "route": "C",
+        "output": {"master": master_key},
+        "retime": dict(stats, target_fps=config["target_fps"],
+                       snap_tolerance=config["snap_tolerance"]),
+        "source": {"width": source["width"], "height": source["height"],
+                   "fps": source["fps"], "duration_s": source["duration_s"]},
+        "delivered": {"width": delivered["width"], "height": delivered["height"],
+                      "fps": delivered["fps"], "duration_s": delivered["duration_s"],
+                      "frames": probe.written_frame_count(master_path)},
+        "build": build_identity(),
+    }, machine, [], warnings, progress, started)
 
 
 def _write_run_record_stub(request, machine, rationale, source, job, started):
