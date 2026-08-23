@@ -174,6 +174,16 @@ class Interpolator:
     round-tripped through pad/synthesise/crop, which would spend compute to make a real frame
     slightly less real. That is the KPI the whole plan is shaped around.
 
+    **This object publishes no state.** `stream()` hands its stats back beside its generator, so
+    nothing per-call lives here and two concurrent streams share nothing but configuration. That
+    is §5d(a), and it is the shape `retime_oracle.build_plan` has always had.
+
+    The one field that could be argued against that claim is `_model`, which `prepare()` rebinds
+    rather than `__init__` setting once. It is still configuration and the exemption is written
+    down here so a future §5d audit does not have to re-derive it: nothing reads it but
+    `_synthesise`, there is no accessor, and casting an already-cast module is a no-op — so it
+    cannot carry one stream's identity into another.
+
     **So the stream is not uniform in device or dtype, deliberately.** A synthesis comes back on
     `device` in `dtype`; a copy comes back exactly as the caller handed it in. Casting copies for
     tidiness would push real frames through an fp16 round trip to make them match the
@@ -185,18 +195,6 @@ class Interpolator:
         self._model = model
         self._device = device
         self._dtype = dtype
-        # **The only thing this object publishes**, and it is declared FIRST so the attribute
-        # exists even if construction fails below it — `pad_multiple` raises on a non-positive
-        # scale, and an instance that survived that (a subclass catching it) would otherwise have
-        # a `stats` property with nothing behind it.
-        #
-        # Audited against §5d: `_device`, `_dtype` and `_multiple` are configuration set once
-        # here. `_model` is also configuration, but it is completed in two steps rather than one —
-        # `prepare()` rebinds it to the cast module — so "set at construction" is not true of it
-        # and the audit says why it still does not bite: nothing reads it but `_synthesise`, there
-        # is no accessor, and re-casting an already-cast module is a no-op, so it cannot carry one
-        # stream's identity into another.
-        self._stats = None
         self._multiple = pad_multiple(scale)
 
     # ---- torch, imported where it is used ----------------------------------------------------
@@ -276,35 +274,32 @@ class Interpolator:
         return self._crop(out, cache["geometry"]).clone()
 
     def stream(self, frames, n_in, src_fps, dst_fps, tol=0.0):
-        """Consume `frames` in order and yield the retimed stream.
+        """Return `(frames_out, stats)` — a generator of the retimed stream, and its plan's stats.
+
+        **The stats travel WITH the result and nothing is published on this object** (contract
+        §5d(a)). They used to be an attribute, which made them last-writer-wins: a second
+        `stream()` opened while a first generator was still undrained left `stats` reading the
+        second plan while the first yielded the first clip's frames — every visible signal
+        correct, the number belonging to a different clip. Invalidating on entry could not fix
+        that; it only made the wrong number newer. **`retime_oracle.build_plan` has returned
+        `(plan, stats)` since it was written**, so this is the shim adopting the shape the
+        contract's executable form always had, not a new design.
+
+        The consequence worth stating: this object now publishes nothing at all. Two interleaved
+        calls cannot confuse their results because there is no shared place for a result to sit,
+        and there is nothing to invalidate on entry because there is nothing to go stale.
 
         `n_in` is the source's frame count and comes from the container, not from counting the
         iterator: the plan is sized before the first frame is read, and a stream cannot be
-        measured without consuming it.
+        measured without consuming it. The stats are complete on return — the count is knowable
+        before a frame is read, so a caller may size its loop from them without consuming anything.
 
         **One frame of lookahead, and the plan's `i` never goes backwards** — `pos = k * src/dst`
         is non-decreasing in k — so a single forward pass over the source suffices and nothing is
         buffered beyond the pair in hand.
         """
-        # **Invalidated on ENTRY, never on success** (contract §5d). A field set on the way out
-        # is readable at its old value for the whole of the next call, and for ever if that call
-        # fails — so a refused plan left the last good clip's `n_out` reading as current, with
-        # every visible signal correct and the number belonging to a different clip. This line is
-        # before `build_plan` precisely because `build_plan` can refuse: clearing on entry removes
-        # the class, clearing on success removes only the cases that succeed.
-        self._stats = None
-
         plan, stats = build_plan(n_in, src_fps, dst_fps, tol=tol)
-
-        # **Published by the CALL, not by the iteration, which is why this function is not itself
-        # a generator.** A generator body does not execute until the first `next()`, and the line
-        # after its final `yield` does not execute until the caller drives it to `StopIteration`.
-        # Assigning inside the body therefore left `stats` reading `None` — or, on a reused
-        # instance, the PREVIOUS clip's numbers — for a caller that sized its loop from
-        # `target_count`, which is the natural thing to do since the count is knowable in advance.
-        # The plan is complete on this line; there is nothing to wait for.
-        self._stats = stats
-        return self._emit(plan, frames, n_in)
+        return self._emit(plan, frames, n_in), stats
 
     def _emit(self, plan, frames, n_in):
         """The generator half of `stream`. Its state is per-call and none of it lives on self."""
@@ -341,22 +336,3 @@ class Interpolator:
                 _, i = entry
                 advance_to(i)
                 yield held[i]
-
-    @property
-    def stats(self):
-        """The stats from the last `stream` call, or None if that call refused or none has run.
-
-        `self._stats` rather than `getattr(self, "_stats", None)`: the default form quietly
-        answered for an attribute that might not exist, which is the same silence §5d is about.
-        The attribute is declared in `__init__` and cleared on every entry, so None here means
-        exactly one thing — no plan was built by the most recent call.
-
-        **It describes the last CALL, which may not be the generator in your hand.** Frame state
-        is per-call and cannot cross streams; this number lives on the instance and therefore is
-        last-writer-wins. Open a second `stream()` while a first generator is still undrained and
-        this reads the second one's plan while the first yields the first one's frames — §5d's own
-        shape, in the one place the rule cannot reach, because the signature publishes a per-call
-        result through a shared object. **Read it immediately after the call that made it**, or
-        hold one `Interpolator` per stream.
-        """
-        return self._stats
