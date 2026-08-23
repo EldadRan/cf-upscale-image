@@ -48,13 +48,17 @@ class Rife:
     full image SeedVR2's. This casts the module and lets `Interpolator._cast` cast the inputs.
     """
 
-    def __init__(self, model, device, dtype):
+    def __init__(self, model, device, dtype, scale=DEFAULT_SCALE):
         self._model = model
         self._device = device
         self._dtype = dtype
+        #: **Carried here so the model call and the shim's padding cannot disagree.** The shim
+        #: pads to a multiple of `max(128, 128/scale)`; `inference` builds its pyramid as
+        #: `[16/scale, 8/scale, …]`. One value set in two places is two places to be wrong.
+        self._scale = scale
 
     @classmethod
-    def load(cls, directory=None, device="cuda", dtype=None):
+    def load(cls, directory=None, device="cuda", dtype=None, scale=DEFAULT_SCALE):
         """Construct the vendored model and load the baked weights.
 
         `sys.path` gains the baked directory rather than the file's own, because the vendored
@@ -86,7 +90,7 @@ class Rife:
         # what a single-process load needs and what the reference script passes.
         model.load_model(train_log, -1)
         model.eval()
-        return cls(model, device, dtype).to(device=device, dtype=dtype)
+        return cls(model, device, dtype, scale).to(device=device, dtype=dtype)
 
     # ---- the interface `interpolate.Interpolator` uses ----------------------------------------
 
@@ -107,10 +111,11 @@ class Rife:
         self._model.eval()
         return self
 
-    def __call__(self, frame_a, frame_b, timestep, scale=DEFAULT_SCALE):
+    def __call__(self, frame_a, frame_b, timestep, scale=None):
         """One synthesis. `frame_a`/`frame_b` are padded, cast and on the device already.
 
         The shim owns padding, cropping, dtype and the timestep; this owns the model call and
         nothing else. Keeping the split there is what lets the plan be tested with no GPU.
         """
-        return self._model.inference(frame_a, frame_b, timestep, scale)
+        return self._model.inference(frame_a, frame_b, timestep,
+                                     self._scale if scale is None else scale)

@@ -114,7 +114,8 @@ def frames_from(capture, cli, expect=None):
 
 
 def retime(cli, source, source_path, master_path, interpolator, target_fps, identity,
-           snap_tolerance=None, crf=None, audio_source=None, progress=None):
+           snap_tolerance=None, crf=None, audio_source=None, progress=None,
+           variant="direct", scale=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -123,7 +124,7 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
     arithmetic while the request records that nobody chose.
     """
     import encoder  # noqa: PLC0415 — imported here so this module stays importable without one
-    import interpolate  # noqa: PLC0415
+    import variants  # noqa: PLC0415
 
     from pipeline import open_source  # noqa: PLC0415
 
@@ -131,7 +132,13 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
     try:
         width, height = shape["width"], shape["height"]
         n_in = source_frame_count(source)
-        stream = interpolator.stream(
+        # **Peak VRAM measured rather than reported from a panel.** Route C has no plan, so
+        # nothing else on this path produces one — and §8b's `--scale` axis exists to falsify
+        # `w_scaling: FLAT`, which IS this reading. Reset before and read after, so the number is
+        # this job's high-water mark rather than the process's history.
+        peak_reset = _reset_peak()
+        stream, stats = variants.run(
+            variant, interpolator,
             _tensors(frames_from(capture, cli, expect=(height, width))),
             n_in=n_in, src_fps=shape["fps"], dst_fps=target_fps,
             tol=snap_tolerance or 0.0)
@@ -142,7 +149,7 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
             audio_limit_s=source.get("video_duration_s"),
             crf=crf if crf is not None else encoder.DEFAULT_CRF)
         with writer_cm as writer:
-            for frame in stream.frames:
+            for frame in stream:
                 writer.write(_to_rgb24(frame))
         # **The other half of the derived count.** `stream()` refuses a source shorter than the
         # plan; this refuses one longer. A container whose duration and rate imply fewer frames
@@ -165,10 +172,42 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
                 "is past the {}-frame tolerance for rounding, so the retime would have been "
                 "truncated. The container's own numbers disagree with its content."
                 .format(surplus, n_in, SURPLUS_TOLERANCE_FRAMES))
-        return stream.stats
+        stats = dict(stats, scale=scale)
+        peak = _read_peak(peak_reset)
+        if peak is not None:
+            stats["peak_vram_gb"] = peak
+        return stats
     finally:
         if capture is not None:
             capture.release()
+
+
+def _reset_peak():
+    """Zero CUDA's high-water mark, returning whether it could be. `False` on CPU or no torch."""
+    try:
+        import torch  # noqa: PLC0415
+        if not torch.cuda.is_available():
+            return False
+        torch.cuda.reset_peak_memory_stats()
+        return True
+    except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
+        return False
+
+
+def _read_peak(was_reset):
+    """The job's peak allocation in GiB, or **None where nothing measured it**.
+
+    None rather than zero, and rather than a figure from a telemetry panel: a panel reading is
+    not something a ledger row can cite, and a fabricated number is indistinguishable from a
+    measurement — which is the rule four other places in this release already follow.
+    """
+    if not was_reset:
+        return None
+    try:
+        import torch  # noqa: PLC0415
+        return round(torch.cuda.max_memory_allocated() / (1024 ** 3), 2)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _tensors(frames):

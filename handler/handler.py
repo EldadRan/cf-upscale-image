@@ -287,8 +287,13 @@ def _retime(request, machine, warnings, workdir, progress, started):
 
     config = request["release_3"]["interpolate"]
     progress.phase("load", pct=3, force=True, note="interpolator")
+    # **`scale` is RIFE's flow-pyramid resolution and it reaches two places.** The interpolator
+    # pads to a multiple derived from it, and the model call runs motion estimation at it — so a
+    # scale set in one and not the other would pad for a geometry the model never sees. One
+    # value, both consumers.
+    scale = request.get("force_scale") or rife.DEFAULT_SCALE
     interpolator = interpolate_module.Interpolator(
-        rife.Rife.load(), scale=1).prepare()
+        rife.Rife.load(scale=scale), scale=scale).prepare()
 
     master = keys.master_name(False, source["width"], source["height"],
                               name=request["output"].get("name"))
@@ -300,7 +305,8 @@ def _retime(request, machine, warnings, workdir, progress, started):
             request, source["width"], source["height"]),
         snap_tolerance=config["snap_tolerance"],
         crf=request.get("crf"),
-        audio_source=source_path if request["keep_audio"] else None)
+        audio_source=source_path if request["keep_audio"] else None,
+        variant=request.get("force_variant") or "direct", scale=scale)
 
     client = storage.client_for(request["output"])
     master_key = storage.upload(client, request["output"], master, master_path,

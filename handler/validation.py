@@ -83,6 +83,13 @@ TOP_LEVEL_FIELDS = {
     # its first rows. CF never sends this; if it ever appears in a CF request that is a mistake
     # worth catching, so it is validated rather than ignored.
     "force_rung",
+    # **Route C's two test axes, top-level like every other testing switch.** §8b's variants and
+    # the `--scale` reading are a benchmark's parameters, not the product's: the contract's
+    # `interpolate` block is what a caller sends and these are what the wave sends. Keeping them
+    # out of `params` is what stops a test axis becoming a promise — the same reason `force_rung`
+    # lives here rather than beside `tile_quality`.
+    "force_variant",
+    "force_scale",
     # **The same calibration facility, one level finer.** `batch_size` is *frames per model
     # batch* — the model's temporal window, and on CF's account the dominant quality lever for
     # video: a bigger batch sees more of the motion at once. It only ever moved as part of a rung,
@@ -290,6 +297,32 @@ OUTPUT_FIELDS_OPTIONAL = ("session_token", "name")
 # accepted, is refused; a name outside it is metadata at the top level and ignored.
 KNOWN_FIELD_NAMES = set(TOP_LEVEL_FIELDS) | set(PARAMS_FIELDS) | set(DERIVE_FIELDS) \
     | set(OUTPUT_FIELDS_REQUIRED) | set(OUTPUT_FIELDS_OPTIONAL)
+
+
+def _variant_name(value):
+    """`None`, or one of §8b's four variant codes. Anything else is refused by name."""
+    if value is None:
+        return None
+    names = ("direct", "cas", "casdec", "pull")
+    if value not in names:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "force_variant must be one of {}, got {!r}".format(", ".join(names), value))
+    return value
+
+
+def _positive_float_or_none(value, field):
+    """A positive number, or None. **`scale` is RIFE's flow-pyramid resolution**, not an upscale
+    factor: 1.0 is full resolution and 0.5 runs motion estimation at half, which finds large
+    motion a full-resolution pass misses. There is no sensible default other than the model's, so
+    absent stays absent."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise WorkerError(
+            INVALID_FIELD_VALUE, "field '{}' must be a positive number, got {!r}".format(
+                field, value))
+    return float(value)
 
 
 def _rung_name(value):
@@ -703,6 +736,8 @@ def validate(job_input):
         "run_record": run_record,
         "debug": bool(job_input.get("debug")),
         "force_rung": _rung_name(job_input.get("force_rung")),
+        "force_variant": _variant_name(job_input.get("force_variant")),
+        "force_scale": _positive_float_or_none(job_input.get("force_scale"), "force_scale"),
         # RunPod's own ceiling is 7 days. No lower bound beyond positive: a caller who sends a
         # deadline this worker cannot meet gets a refusal with the arithmetic, which is more
         # useful than an argument about whether the number was reasonable.
