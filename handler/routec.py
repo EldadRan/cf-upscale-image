@@ -156,7 +156,13 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
         stream, stats = variants.run(
             variant, interpolator,
             _tensors(frames_from(capture, cli, expect=(height, width))),
-            n_in=n_in, src_fps=shape["fps"], dst_fps=target_fps,
+            # **The declared cadence, from the same object `n_in` was derived from.** These two
+            # lines used to disagree: `source_frame_count` reads `source["fps"]` — the container's
+            # `r_frame_rate` — while this read cv2's `CAP_PROP_FPS`, which is `avg_frame_rate`. A
+            # count derived at one rate, divided against another, nine lines apart. On a 23.976
+            # source the plan came out 18/455/2 where the contract's arithmetic says 16/458/1, and
+            # the response reported the rate the plan had not used.
+            n_in=n_in, src_fps=source["fps"], dst_fps=target_fps,
             tol=snap_tolerance or 0.0)
 
         writer_cm = encoder.MasterWriter(
