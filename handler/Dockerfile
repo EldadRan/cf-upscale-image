@@ -32,29 +32,6 @@ ARG SEEDVR2_COMMIT=4490bd1f482e026674543386bb2a4d176da245b9
 # value as `routing.provider_model`, per endpoint.
 ARG SEEDVR2_MODEL=seedvr2_ema_7b_fp16.safetensors
 
-# **The route-C image is this image without the weights** (contract §6b). Route C never loads
-# SeedVR2, so a build that omits the checkpoint is not a stripped worker — it is the correct one
-# for that route, and it does not pay a cold start for ~15 GiB it will never read.
-#
-# **It gates SeedVR2 and NOT RIFE** (CF, 2026-08-23). Route C is the image with no upscaler and
-# it is precisely the image that must interpolate, so the interpolator is baked on every variant
-# and the flag decides only whether a checkpoint rides with it. The shell no longer branches: the
-# script is always invoked and reads this value itself, because the two fetches and their hash
-# assertions already live there and a second decision point in shell is a second place to be
-# wrong about which model is which.
-#
-# **`0` or `1`, and anything else fails the build.** An earlier draft baked on a mistyped value
-# — fail-safe in isolation, but two ENV flags below derive from this one arg, and a value that is
-# neither cannot set both honestly. A typo that stops a build costs minutes; a typo that ships an
-# image whose flags disagree about its own bytes costs a campaign. Default 1, and the default
-# path is the shell that ran before this arg existed: with the weights baked the RUN's contents
-# are what they were.
-# **The layer's DIGEST necessarily changes**
-# — the instruction text is part of a layer's identity, so `if` here is a new layer even when it
-# does exactly what the old one did. Contents identical, digest not; the two are different claims
-# and only the first was ever available.
-ARG BAKE_WEIGHTS=1
-
 # A pinned static ffmpeg, not the distribution's. Ubuntu 22.04 ships 4.4, this repo is developed
 # against 9.x, and the gap is not cosmetic: `-vsync` was removed in 9.x while `-fps_mode` arrived
 # in 5.0, so a command written for one is invalid on the other (docs/decisions.md 3.3). Pinning
@@ -112,7 +89,6 @@ ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 ENV SEEDVR2_DIR=/app/SeedVR2 \
     SEEDVR2_MODEL_DIR=/app/models/SEEDVR2 \
     SEEDVR2_MODEL=${SEEDVR2_MODEL} \
-    RIFE_MODEL_DIR=/app/models/RIFE \
     PYTHONUNBUFFERED=1
 
 # ── system packages ─────────────────────────────────────────────────────────────────────────
@@ -215,17 +191,12 @@ print('release seams OK: colour pyramid patchable, bfloat16 handoff removed, wei
 # This is the only place the real cost of the weights is visible: every earlier disk figure in
 # docs/decisions.md 3.5 is about the base, and no build had reached this line when the size
 # projections there were written.
-COPY bake_weights.py RIFE-LICENSES.txt ./
+COPY bake_weights.py ./
 RUN set -eux; \
-    case "$BAKE_WEIGHTS" in 0|1) ;; \
-      *) echo "BAKE_WEIGHTS must be 0 or 1, got '$BAKE_WEIGHTS'" >&2; exit 2 ;; \
-    esac; \
     echo "--- disk before the bake ---"; df -h /; \
-    mkdir -p "$SEEDVR2_MODEL_DIR" "$RIFE_MODEL_DIR"; \
-    BAKE_WEIGHTS="$BAKE_WEIGHTS" python3 bake_weights.py; \
-    install -m644 RIFE-LICENSES.txt "$RIFE_MODEL_DIR/LICENSE.txt"; \
+    python3 bake_weights.py; \
     echo "--- disk after the bake ---"; df -h /; \
-    du -sh "$SEEDVR2_MODEL_DIR" "$RIFE_MODEL_DIR"
+    du -sh "$SEEDVR2_MODEL_DIR"
 
 # **The weights are in the image, so nothing re-proves it at runtime** (F-2026-08-19-31). The
 # vendored `download_weight()` validates an existing model file against a size+mtime cache and,
@@ -240,14 +211,7 @@ RUN set -eux; \
 # bake is ever made conditional, this must move with it: an image that claims baked weights it
 # does not have would skip the validation of a file that really is missing — which the patch's
 # surviving `os.path.exists` guard then catches, but the honest place to be right is here.
-#
-# **Made conditional 2026-08-22 with the bake itself, exactly as the paragraph above required.**
-# `CF_WEIGHTS_BAKED` rides here rather than in the ENV block near the top of the file for two
-# reasons: this is where the fact becomes true, and an ENV up there would put `BAKE_WEIGHTS` above
-# the system packages, the ffmpeg fetch, the vendor copy and the pip install — so building the
-# route-C variant would invalidate all of them and pay a cold build for a one-byte difference.
-ENV SEEDVR2_WEIGHTS_BAKED=${BAKE_WEIGHTS} \
-    CF_WEIGHTS_BAKED=${BAKE_WEIGHTS}
+ENV SEEDVR2_WEIGHTS_BAKED=1
 
 # ── build identity ──────────────────────────────────────────────────────────────────────────
 # **An image that cannot say what it is makes every measurement taken on it an assertion.** The

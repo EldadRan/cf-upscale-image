@@ -25,16 +25,6 @@ on:
   # one session.
   pull_request:
   workflow_dispatch:
-    inputs:
-      # **Which image this dispatch builds.** `full` is the worker as it has always been; `routec`
-      # is the same tree with the SeedVR2 checkpoint left out (contract §6b) — route C never loads
-      # it, so that image is the correct worker for that route rather than a reduced one. Default
-      # `full`, so a dispatch that says nothing builds what a dispatch has always built.
-      variant:
-        description: "full = weights baked; routec = weightless route-C worker"
-        type: choice
-        default: full
-        options: [full, routec]
 
 # **One build per ref at a time, and the newest wins.** Two pushes in quick succession otherwise
 # run two publishes concurrently, racing to push the same `:latest` tag — the loser can land last
@@ -296,34 +286,10 @@ jobs:
       # the push with `repository name must be lowercase`.
       - name: Compute the image name
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           # Stamped here rather than in the Dockerfile: a `date` inside a RUN would be a new
           # value on every layer rebuild and would invalidate everything below it.
           echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-
-          # **The variant decides the tag, the reference the worker reports, and whether the
-          # weights are baked — all three from one input, so they cannot disagree.** A default of
-          # `full` on a `pull_request` run matters: that event carries no inputs at all, and the
-          # gate must keep behaving as it did.
-          if [ "${{ github.event.inputs.variant }}" = "routec" ]; then
-            REF="$IMAGE:sha-${GITHUB_SHA}-routec"
-            TAGS="$REF"
-            echo "BAKE_WEIGHTS=0" >> "$GITHUB_ENV"
-          else
-            REF="$IMAGE:sha-${GITHUB_SHA}"
-            TAGS="$(printf '%s\n%s' "$IMAGE:latest" "$REF")"
-            echo "BAKE_WEIGHTS=1" >> "$GITHUB_ENV"
-          fi
-          echo "IMAGE_REF=$REF" >> "$GITHUB_ENV"
-          # **Heredoc form, because TAGS can be two lines.** `NAME=value` in `$GITHUB_ENV` is
-          # parsed one line at a time, so a second tag would arrive as a line with no `=` and
-          # fail the step. The delimiter is what makes a multi-line value legal.
-          {
-            echo "TAGS<<__TAGS__"
-            echo "$TAGS"
-            echo "__TAGS__"
-          } >> "$GITHUB_ENV"
 
       - uses: docker/build-push-action@v7
         id: build
@@ -331,11 +297,9 @@ jobs:
           context: ./handler
           push: true
           platforms: linux/amd64
-          # **One commit can produce two images and one tag must not name both** (§6b). The
-          # route-C build takes a suffixed tag and **never `:latest`** — latest is the full
-          # worker's, and moving it to a weightless image would repoint every consumer that
-          # tracks it at a build with no checkpoint.
-          tags: ${{ env.TAGS }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
           # **What the image needs in order to identify itself in its own bundles.** Ten
           # calibration runs were banked against an image that reported `"image": null`, so the
           # only evidence they shared a build was that nobody remembered changing one. The
@@ -344,15 +308,10 @@ jobs:
           #
           # Below the weights layer in the Dockerfile, so these change every build and cost one
           # small layer rather than a 17 GB re-download.
-          #
-          # `IMAGE_REF` is the tag this build is actually pushed under, suffix and all, because a
-          # worker that reports the unsuffixed tag would name the image beside it rather than
-          # itself. `BAKE_WEIGHTS` is what makes the two builds differ at all.
           build-args: |
-            IMAGE_REF=${{ env.IMAGE_REF }}
+            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
-            BAKE_WEIGHTS=${{ env.BAKE_WEIGHTS }}
           # **Registry cache, never type=gha.** The weights layer is ~17 GB and GitHub's Actions
           # cache budget is 10 GB per repository, so `type=gha` cannot hold it — it fails to help
           # while evicting whatever else was there. The media worker uses type=gha and is right
@@ -378,13 +337,9 @@ jobs:
 
       # **Pin the endpoint to this, never to `:latest`.** `:latest` moves, and an endpoint on it
       # cannot tell you what it is running — neither can RunPod.
-      #
-      # `IMAGE_REF` rather than the sha tag spelled out again: one commit can produce a full and a
-      # route-C image, and a summary naming the unsuffixed tag beside the route-C digest would
-      # publish a reference this run never pushed — tying one image's name to another's bytes.
       - name: The tag to pin
         run: |
-          echo "Pin the endpoint to: ${IMAGE_REF}"
+          echo "Pin the endpoint to: ${IMAGE}:sha-${GITHUB_SHA}"
           echo "Record it in docs/deployment.md — RunPod's API will not tell anyone what an endpoint is."
 
       # **The half of the image's identity the image cannot hold.** A digest exists only once the
@@ -400,7 +355,7 @@ jobs:
             echo
             echo '| field | value |'
             echo '|---|---|'
-            echo "| reference | \`${IMAGE_REF}\` |"
+            echo "| reference | \`${IMAGE}:sha-${GITHUB_SHA}\` |"
             echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
             echo "| commit | \`${GITHUB_SHA}\` |"
             echo "| built (UTC) | ${BUILD_UTC} |"

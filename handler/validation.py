@@ -30,7 +30,6 @@ known or not.
 """
 
 import encoder
-import envelope
 import planner
 from errors import (
     FIELD_NOT_SUPPORTED,
@@ -83,13 +82,6 @@ TOP_LEVEL_FIELDS = {
     # its first rows. CF never sends this; if it ever appears in a CF request that is a mistake
     # worth catching, so it is validated rather than ignored.
     "force_rung",
-    # **Route C's two test axes, top-level like every other testing switch.** §8b's variants and
-    # the `--scale` reading are a benchmark's parameters, not the product's: the contract's
-    # `interpolate` block is what a caller sends and these are what the wave sends. Keeping them
-    # out of `params` is what stops a test axis becoming a promise — the same reason `force_rung`
-    # lives here rather than beside `tile_quality`.
-    "force_variant",
-    "force_scale",
     # **The same calibration facility, one level finer.** `batch_size` is *frames per model
     # batch* — the model's temporal window, and on CF's account the dominant quality lever for
     # video: a bigger batch sees more of the motion at once. It only ever moved as part of a rung,
@@ -205,18 +197,6 @@ PARAMS_FIELDS = {
     # every window's quality for an even tail. Neither is imposed: the default favours the body,
     # balanced the tail, and which matters more is per-job judgment only the caller has.
     "schedule",
-    # ── release 3 ────────────────────────────────────────────────────────────────────────────
-    # **Validated in `envelope.py`, not here.** Release 2's surface is large and a release-3
-    # block folded into it would be indistinguishable from the fields that have always been
-    # there — and the one property protecting production is that a request carrying none of
-    # these behaves exactly as it did. Naming them here is what stops `_refuse_unknown` rejecting
-    # them by name; the rules that govern them live in one file that can be read end to end.
-    "upscale",
-    "interpolate",
-    # **`params.output` is the ENCODE, and the top-level `output` is the DESTINATION.** One word,
-    # two objects, and the collision is the contract's spelling (§5c) rather than a choice made
-    # here. Raised to the gate as a claim.
-    "output",
 }
 
 #: **Nothing is unconditionally required, and that is the point.** `target_short_edge_px` is
@@ -297,32 +277,6 @@ OUTPUT_FIELDS_OPTIONAL = ("session_token", "name")
 # accepted, is refused; a name outside it is metadata at the top level and ignored.
 KNOWN_FIELD_NAMES = set(TOP_LEVEL_FIELDS) | set(PARAMS_FIELDS) | set(DERIVE_FIELDS) \
     | set(OUTPUT_FIELDS_REQUIRED) | set(OUTPUT_FIELDS_OPTIONAL)
-
-
-def _variant_name(value):
-    """`None`, or one of §8b's four variant codes. Anything else is refused by name."""
-    if value is None:
-        return None
-    names = ("direct", "cas", "casdec", "pull")
-    if value not in names:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "force_variant must be one of {}, got {!r}".format(", ".join(names), value))
-    return value
-
-
-def _positive_float_or_none(value, field):
-    """A positive number, or None. **`scale` is RIFE's flow-pyramid resolution**, not an upscale
-    factor: 1.0 is full resolution and 0.5 runs motion estimation at half, which finds large
-    motion a full-resolution pass misses. There is no sensible default other than the model's, so
-    absent stays absent."""
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise WorkerError(
-            INVALID_FIELD_VALUE, "field '{}' must be a positive number, got {!r}".format(
-                field, value))
-    return float(value)
 
 
 def _rung_name(value):
@@ -582,41 +536,8 @@ def validate(job_input):
 
     output_size = _validate_output_size(params.get("output_size"))
 
-    # **Release 3's surface, derived before the sizing rule because it can suspend it.**
-    # `upscale: false` is the explicit retime spelling, and a retime does not resize — so the
-    # requirement that a request say what size it wants is release 2's rule and stays exactly
-    # that. `envelope.derive` refuses the contradiction (a size beside `upscale: false`) and the
-    # emptiness (`upscale: false` with nothing to do) itself.
-    release_3 = envelope.derive(params)
-
-    # **What the contract accepts and this worker cannot yet serve is REFUSED, not ignored.**
-    # `envelope.derive` is §5c complete and correct; the paths behind two of its answers are not
-    # wired. Accepting them would deliver the opposite of what was asked — an `upscale: false`
-    # request would be planned as an upscale and die on a null size, and an `h265` request would
-    # return h264 without a word. That is the silent-reinterpretation class this whole section
-    # exists to prevent, and a field that validates and then does nothing is worse than one
-    # refused by name, because the caller has evidence it was understood.
-    # `upscale: false` is served: `handle` branches to route C on it. `interpolate` BESIDE an
-    # upscale is not — that is route A or B, which need the A/B `route` field Phase 2 rules and a
-    # pipeline placement nothing has built.
-    if release_3["interpolate"] is not None and release_3["upscale"]:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "'interpolate' beside an upscale is route A or B and this worker serves neither yet; "
-            "only 'upscale: false' — interpolation alone — is wired. Refused rather than "
-            "silently upscaling without it.")
-    if release_3["codec"] != envelope.DEFAULT_CODEC:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "'output.codec: {}' is contract-legal and this worker cannot serve it yet; only {!r} "
-            "is implemented. Refused rather than silently encoded as {}.".format(
-                release_3["codec"], envelope.DEFAULT_CODEC, envelope.DEFAULT_CODEC))
-
-
     target = params.get("target_short_edge_px")
-    if target is None and not release_3["upscale"]:
-        pass
-    elif target is None:
+    if target is None:
         # One of the two has to arrive. Naming both in the message matters: a caller who omitted
         # the short edge because they *meant* to send `output_size` and mistyped it has already
         # been told about the typo by `_refuse_unknown`, and a caller who sent neither is being
@@ -720,9 +641,6 @@ def validate(job_input):
         "request_id": request_id,
         "source_url": _as_str(job_input["source_url"], "source_url"),
         "target_short_edge_px": target,
-        # The normalised release-3 config, one object rather than four loose keys, so a caller
-        # downstream cannot read `interpolate` without also having what decided it.
-        "release_3": release_3,
         "allow_oom_retry": allow_oom_retry,
         "keep_audio": keep_audio,
         "color_correction": color_correction,
@@ -736,8 +654,6 @@ def validate(job_input):
         "run_record": run_record,
         "debug": bool(job_input.get("debug")),
         "force_rung": _rung_name(job_input.get("force_rung")),
-        "force_variant": _variant_name(job_input.get("force_variant")),
-        "force_scale": _positive_float_or_none(job_input.get("force_scale"), "force_scale"),
         # RunPod's own ceiling is 7 days. No lower bound beyond positive: a caller who sends a
         # deadline this worker cannot meet gets a refusal with the arithmetic, which is more
         # useful than an argument about whether the number was reasonable.

@@ -191,38 +191,6 @@ def _xml_escape(text):
                 .replace('"', "&quot;"))
 
 
-def _peak_rss_gb(pid):
-    """The largest resident set this process reached, in GiB, or None where it cannot be read.
-
-    **`/proc/<pid>/status`'s `VmHWM`, sampled while the process is alive.** `getrusage`'s
-    `RUSAGE_CHILDREN` would be the easy answer and is the wrong one: it reports the maximum across
-    every child this worker has ever reaped, so an ffprobe from a previous phase and the encode
-    would be indistinguishable — a plausible number about a different process, which is the class
-    this project keeps finding. `VmHWM` is that process's own high-water mark and it disappears
-    when the process does, which is why it is sampled rather than read at the end.
-
-    None on anything that is not Linux, which is honest: a figure that is absent says nothing and
-    a figure that is zero says the encode used no memory.
-
-    **It under-reads on a clip shorter than the encoder's buffering window, and there it under-
-    reads totally.** The last sample is taken when the last `write()` returns; nothing samples
-    while x264 drains its lookahead and flushes. On a long encode that phase is memory-
-    non-increasing — frames are released and none admitted — so the shortfall is near zero. On a
-    fixture of a few dozen frames the whole encode happens after the final write, and the number
-    describes the buffering footprint rather than the encode. **A reassuringly low peak from a
-    small fixture means nothing**, which matters because a small fixture is what somebody
-    reaches for when checking that the measurement works.
-    """
-    try:
-        with open("/proc/{}/status".format(pid), encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("VmHWM:"):
-                    return round(int(line.split()[1]) / (1024 ** 2), 2)
-    except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
-        return None
-    return None
-
-
 class MasterWriter:
     """A one-pass ffmpeg encode fed frame by frame.
 
@@ -232,18 +200,12 @@ class MasterWriter:
 
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
-                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, x264_params=None):
+                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET):
         self.path = path
         self.width = width
         self.height = height
         self.fps = fps
         self.frames_written = 0
-        #: **ffmpeg's own high-water mark, not ours.** The 8K run died at ~46 GiB in x264's
-        #: working set while this side held one frame and a cached pair — and nothing reported
-        #: it, so the ceiling had to be inferred from a kernel kill. A test path built to find a
-        #: memory ceiling that does not report memory has to be run twice to learn anything, and
-        #: each run is fifty minutes of A40. None where it cannot be measured.
-        self.encoder_peak_rss_gb = None
         self._proc = None
         self._identity = dict(identity or {})
         self._audio_source = audio_source
@@ -256,12 +218,6 @@ class MasterWriter:
         self.verified_frames = None
         self._crf = crf
         self._preset = preset
-        #: **An override, and the production path never passes it** (contract §8c). Route C is a
-        #: test path and says so at the call site rather than in a threshold: a resolution gate —
-        #: "frugal above 12 megapixels" — would leave the upscale path's bytes depending on a
-        #: number somebody has to keep right, and `codec_default_unmoved` would be protecting a
-        #: boundary rather than a behaviour. An argument nobody passes cannot move anything.
-        self._x264_params = x264_params
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -301,10 +257,6 @@ class MasterWriter:
 
         command += ["-map", "0:v:0", "-c:v", "libx264",
                     "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
-        if self._x264_params:
-            # `-x264-params` rather than more `-preset` flags: the preset stays the caller's and
-            # these are the specific knobs §8c names, so a reader can see which of the two moved.
-            command += ["-x264-params", self._x264_params]
 
         if carry_audio:
             # `?` makes the mapping optional, so a source whose audio stream vanished between the
@@ -375,13 +327,6 @@ class MasterWriter:
         except BrokenPipeError:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))
         self.frames_written += 1
-        # **Sampled here because this is where the loop already blocks.** `write` returns when
-        # the pipe accepts the frame, which is exactly when the encoder is working — so the
-        # samples land across the whole encode without a thread, and the maximum survives the
-        # process that produced it. One `/proc` read per frame is noise against a 50 MiB write.
-        peak = _peak_rss_gb(self._proc.pid)
-        if peak is not None and peak > (self.encoder_peak_rss_gb or 0.0):
-            self.encoder_peak_rss_gb = peak
 
     def _died(self, why):
         stderr = b""

@@ -13,10 +13,3 @@ __pycache__/
 # so that `git add -A` cannot publish one irreversibly.
 .env
 .venv/
-
-# **Serena's project state and symbol cache.** Written into the repository root as
-# `.serena/project.yml`, `.serena/project.local.yml` and a cache tree, by a tool run against
-# this checkout rather than by anything that builds the image. Ignored because `pin_witness`
-# reads a clean tree as part of certifying a pinned image, and an untracked directory turns
-# that check red for a reason unrelated to the image.
-.serena/

@@ -70,12 +70,6 @@ WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 #: it as `routing.provider_model`, per endpoint.
 MODEL_BUILD = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
 
-#: **Whether this image actually carries the checkpoint `SEEDVR2_MODEL` names** (contract §6b).
-#: The route-C image is built with `--build-arg BAKE_WEIGHTS=0` and loads SeedVR2 on no path, so
-#: it must not report a model it does not contain. Absent — a local run, an older image — is read
-#: as baked, because every image that existed before this flag did carry its weights.
-WEIGHTS_BAKED = os.environ.get("CF_WEIGHTS_BAKED", "1") != "0"
-
 
 def build_identity():
     """What code produced this result, in a form that survives the run.
@@ -103,46 +97,14 @@ def build_identity():
         "commit": os.environ.get("BUILD_COMMIT"),
         "built_utc": os.environ.get("BUILD_UTC"),
         # The pinned vendored source, which is half of what any VRAM figure is a measurement of.
-        # **Reported by the route-C image too, and truthfully**: that image drops the weights, not
-        # the vendored tree, which it still carries and still does not load.
         "seedvr2_commit": os.environ.get("SEEDVR2_COMMIT"),
         "worker_version": WORKER_VERSION,
-        # **Null when this image does not carry the checkpoint** (contract §6b). A weightless
-        # build naming a model would be a falsehood about its own bytes, and every bundle,
-        # manifest and ledger row carries this field. `weights_baked` rides beside it because a
-        # bare null is ambiguous — a local build nulls most of these too, and "no weights in this
-        # image" and "this build could not identify itself" must not read alike.
-        "model": MODEL_BUILD if WEIGHTS_BAKED else None,
-        "weights_baked": WEIGHTS_BAKED,
+        "model": MODEL_BUILD,
         # **Which constants planned the run, beside which build carried them.** CF compares this
         # against the version its own embedded predicate reports and alerts when the two drift
         # apart, which is the ratified use rather than a nicety.
         "registry_version": planner.REGISTRY_VERSION,
     }
-
-
-def identity_tags(request, width, height):
-    """The tags muxed into the delivered file. **The model is named only if the image has one.**
-
-    `build_identity()` reports `model: null` on a weightless build (contract §6b), and this is the
-    same claim one layer out — a delivered file asserting a checkpoint its image does not contain
-    is a falsehood about its own bytes.
-
-    **The key is OMITTED rather than nulled** (CF, 2026-08-23). A null in a container tag becomes
-    the string `"None"`, so nulling would have the file name a model called None — a worse
-    falsehood than the one §6b prevents, because it asserts an identity rather than declining to
-    state one. Absent means absent, which is the same rule as `snap_tolerance`'s missing default
-    and route C's unmeasured coefficients. The manifest carries "no model" as a fact, which is
-    something a tag key cannot do.
-    """
-    tags = {
-        "cf_request_id": request["request_id"],
-        "cf_worker_version": WORKER_VERSION,
-        "cf_output": "{}x{}".format(width, height),
-    }
-    if WEIGHTS_BAKED:
-        tags["cf_model_build"] = MODEL_BUILD
-    return tags
 
 
 #: Printed once per container, on the first job it handles. **Once, not per job**: it describes
@@ -215,26 +177,8 @@ def handle(job_input, job=None):
     outcome = {"status": "internal", "error": None}
     with diagnostics.LogCapture() as captured:
         try:
-            # **Route C branches here, and `handle` keeps its name** (CF, 2026-08-23). The
-            # first shape proposed was `handle` -> `handle_org` with a new `handle` for the
-            # test; `handler()` below calls `handle` by name, so a test holding that name
-            # becomes the production entry point of the next FULL image built from `main` —
-            # same tag, same everything, wrong function, and nothing today would show it
-            # because low is on the route-C image while medium and high are elsewhere.
-            #
-            # **The production path is untouched rather than preserved under another name.**
-            # This is one `if` above it: an interpolate-only request goes to route C and
-            # returns; everything else falls through to exactly what was there before.
-            #
-            # **And it returns its retime stats, which is the whole response** (CF). Route C
-            # is a test until the samples are seen, so it gets no `configuration`, no
-            # rationale and no manifest equivalence — the production response shape is
-            # deferred rather than dropped, and nobody can rule it before the samples exist.
-            if not request["release_3"]["upscale"]:
-                response = _retime(request, machine, warnings, workdir, progress, started)
-            else:
-                response = _run(request, job, machine, warnings, attempts, workdir, progress,
-                                captured, started, trace)
+            response = _run(request, job, machine, warnings, attempts, workdir, progress,
+                            captured, started, trace)
             outcome["status"] = "refused" if response.get("cf_error") else "ok"
             outcome["error"] = response.get("cf_error")
             return response
@@ -265,88 +209,6 @@ def handle(job_input, job=None):
             _write_run_record(outcome, request, machine, attempts, warnings, progress,
                               trace, job, started)
             shutil.rmtree(workdir, ignore_errors=True)
-
-
-def _retime(request, machine, warnings, workdir, progress, started):
-    """Route C end to end: fetch, decode, interpolate, encode, upload. **No model of ours.**
-
-    Deliberately not a second `_run` and not a copy of its master-to-upload half. It calls the
-    same `storage` helpers and nothing else — a test that starts absorbing the pipeline is what
-    scope review exists to stop, and every guarantee `_run` carries is about model memory
-    (contract §6), so borrowing its shape would borrow answers to questions route C does not ask.
-    """
-    import interpolate as interpolate_module  # noqa: PLC0415 — GPU-box imports, like the rest
-    import rife  # noqa: PLC0415
-    import routec  # noqa: PLC0415
-
-    download = os.path.join(workdir, "source")
-    storage.fetch_source(request["source_url"], download)
-    extension = probe.detect_extension(download)
-    source_path = probe.named_with_extension(download, extension)
-    source = probe.probe_source(source_path)
-
-    config = request["release_3"]["interpolate"]
-    progress.phase("load", pct=3, force=True, note="interpolator")
-    # **`scale` is RIFE's flow-pyramid resolution and it reaches two places.** The interpolator
-    # pads to a multiple derived from it, and the model call runs motion estimation at it — so a
-    # scale set in one and not the other would pad for a geometry the model never sees. One
-    # value, both consumers.
-    scale = request.get("force_scale") or rife.DEFAULT_SCALE
-    interpolator = interpolate_module.Interpolator(
-        rife.Rife.load(scale=scale), scale=scale).prepare()
-
-    master = keys.master_name(False, source["width"], source["height"],
-                              name=request["output"].get("name"))
-    master_path = os.path.join(workdir, master)
-    progress.phase("interpolate", pct=10, force=True)
-    stats = routec.retime(
-        pipeline.load_cli(), source, source_path, master_path, interpolator,
-        target_fps=config["target_fps"], identity=identity_tags(
-            request, source["width"], source["height"]),
-        snap_tolerance=config["snap_tolerance"],
-        crf=request.get("crf"),
-        audio_source=source_path if request["keep_audio"] else None,
-        variant=request.get("force_variant") or "direct", scale=scale)
-
-    client = storage.client_for(request["output"])
-    master_key = storage.upload(client, request["output"], master, master_path,
-                                keys.content_type(master))
-
-    # **The same `output` shape the upscale path returns, and that is a correction rather than a
-    # choice.** Route C first returned `{"master": key}` — a shape nobody reads. `run_one` takes
-    # `output.width`, `output.height` and `output.bytes` off this object and banks them in the
-    # ledger row, so the first route-C job on hardware delivered a correct file and reported
-    # `output NonexNone 0 bytes` with every measured field null. The response-shape question CF
-    # deferred is about `configuration` and the rationale; this is not that. This is the existing
-    # output contract, which route C has no reason to differ from and every reason to satisfy —
-    # the variant runs are the ones whose numbers matter, and a wave that banks nulls is a wave
-    # measured by hand.
-    delivered = probe.probe_output(master_path)
-    output_entry = dict(delivered)
-    output_entry.update({
-        "key": master_key,
-        "bytes": os.path.getsize(master_path),
-        "content_type": keys.content_type(master),
-        "faststart": probe.is_faststart(master_path),
-        "channels": 3,
-        # Measured on the far side of the encode, which is the only frame count worth reading
-        # from a container — and on this path it is also the one the witness compares.
-        "frames": probe.written_frame_count(master_path),
-    })
-
-    # **The stats and what they were measured on, and nothing shaped like a plan.** A
-    # `configuration` block here would look, to anything reading the envelope, exactly like a
-    # planned upscale — and there is no plan, because there is no model to plan for.
-    return _decorate({
-        "status": "DELIVERED",
-        "route": "C",
-        "output": output_entry,
-        "retime": dict(stats, target_fps=config["target_fps"],
-                       snap_tolerance=config["snap_tolerance"]),
-        "source": {"width": source["width"], "height": source["height"],
-                   "fps": source["fps"], "duration_s": source["duration_s"]},
-        "build": build_identity(),
-    }, machine, [], warnings, progress, started)
 
 
 def _write_run_record_stub(request, machine, rationale, source, job, started):
@@ -459,15 +321,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # An estimate of the frame count, for planning and the ETA **only**. Every frame count this
     # worker reports comes from the decode.
     estimated_frames = None
-    # **`measured_fps`, not `fps`, and the difference is three frames on a spliced source.**
-    # `measured_fps` is frames over duration, so multiplying it back returns the count by
-    # construction; the declared rate returns what the file WOULD hold if it were CFR at that
-    # rate. This number feeds the schedule simulation, the chunk arithmetic and
-    # `refuse_frames_no_deadline_admits`, and an over-estimate refuses work that would have
-    # succeeded. The declared rate is what the contract's tables and route C's plan read.
-    measured = source.get("measured_fps") or source["fps"]
-    if source["duration_s"] and measured:
-        estimated_frames = int(round(source["duration_s"] * measured))
+    if source["duration_s"] and source["fps"]:
+        estimated_frames = int(round(source["duration_s"] * source["fps"]))
     progress = progress_module.Progress(job=job, estimated_frames=estimated_frames)
 
     # **An exact canvas changes what the model is asked for, not just what is delivered.** The
@@ -1751,7 +1606,12 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
     try:
         width, height = exact_size or estimator.output_dimensions(
             source["width"], source["height"], plan["target_short_edge_px"])
-        identity = identity_tags(request, width, height)
+        identity = {
+            "cf_request_id": request["request_id"],
+            "cf_worker_version": WORKER_VERSION,
+            "cf_model_build": MODEL_BUILD,
+            "cf_output": "{}x{}".format(width, height),
+        }
         progress.begin_phase()
         # A budget large enough never to truncate: the generator stops when the decode is
         # exhausted, so this bounds the read from above while the decode determines it below.

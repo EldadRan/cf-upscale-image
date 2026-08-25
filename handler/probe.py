@@ -218,23 +218,7 @@ def probe_source(path):
     return {
         "width": int(width),
         "height": int(height),
-        # **Two rates, because one field was being asked two questions.** `fps` is the DECLARED
-        # cadence — `r_frame_rate`, the container's own base rate, exact as `30000/1001`. It is
-        # what the contract's tables are stated against: §2b's nominal-fps premise, the
-        # real-frame shares, the snap-tolerance ladder. Planning a 29.97 source at 29.869 moved
-        # `t=0.05`'s predicted real share from 13.3% to 9.1%.
-        #
-        # `measured_fps` is `avg_frame_rate`, which is **frames divided by duration** — a
-        # measurement, not a cadence. Multiplying it back by the duration returns the frame count
-        # by construction, which is why `estimated_frames` reads it and must keep reading it: on
-        # a 30 fps clip spliced with a 15 fps one they are 30.000 and 27.632, and the declared
-        # rate over-estimates by three frames on 35. An over-estimate refuses work that would
-        # have succeeded.
-        #
-        # **They differ on anything spliced or variable and agree on everything else**, which is
-        # why one field survived this long and why the fixtures cannot catch it.
-        "fps": _rate(video.get("r_frame_rate")) or _rate(video.get("avg_frame_rate")),
-        "measured_fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
+        "fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
         "duration_s": float(duration) if duration else None,
         # The *video stream's* own duration, not the container's. The container's is the longest
         # stream, so on a source whose audio outruns its picture it reports the audio -- exactly
@@ -313,12 +297,7 @@ def probe_output(path):
         "width": int(video["width"]),
         "height": int(video["height"]),
         "duration_s": float(duration) if duration else None,
-        # Split the same way as `probe_source`, and split at the same time: one call site changed
-        # and the other left is the shape this project keeps finding. Here the declared rate also
-        # reads back what this worker's own encoder was told to write, where an average over a
-        # short clip is the one number guaranteed to disagree with it.
-        "fps": _rate(video.get("r_frame_rate")) or _rate(video.get("avg_frame_rate")),
-        "measured_fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
+        "fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
         "codec": video.get("codec_name"),
     }
