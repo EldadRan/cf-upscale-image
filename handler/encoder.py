@@ -419,16 +419,31 @@ class MasterWriter:
 
         `VmHWM` is monotone for the child's life and disappears with the process, so the sampling
         has to happen *before* the reap — which is why this polls rather than reading once after
-        `wait()`. A sample is taken after the loop as well: `poll()` can observe the exit before
-        the last iteration's read, and the peak is monotone so a redundant read costs nothing and
-        a missed one costs the measurement.
+        `wait()`.
+
+        **SAMPLE FIRST, THEN POLL, AND NOTHING AFTER THE LOOP.** `Popen.poll()` performs the
+        `waitpid(WNOHANG)` itself, so the instant it observes the exit the child is REAPED and
+        `/proc/<pid>` is gone. A sample taken after the loop could therefore never return a
+        reading — it would take `_peak_rss_gb`'s `except` path on every run — and worse, if the
+        kernel had recycled the pid it would adopt an unrelated process's `VmHWM`. That is
+        precisely the "plausible number about a different process" this file rejects `getrusage`
+        for, arrived at by another route. An earlier version of this method had that trailing
+        sample and a docstring explaining why it was needed; it was unreachable in the good case
+        and wrong in the bad one.
+
+        **What that costs, stated rather than reassured away:** the last interval before exit is
+        unsampled, bounded by `DRAIN_SAMPLE_S`. It cannot be closed from this side — the process
+        must be alive to be read, and the only event that says it has finished is the one that
+        reaps it. Ordering the loop this way makes the gap at most one interval instead of
+        leaving it unbounded.
         """
         if self._proc is None:
             return
-        while self._proc.poll() is None:
+        while True:
             self._sample_peak()
+            if self._proc.poll() is not None:
+                return
             time.sleep(self.DRAIN_SAMPLE_S)
-        self._sample_peak()
 
     def _died(self, why):
         stderr = b""

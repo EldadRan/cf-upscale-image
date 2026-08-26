@@ -172,12 +172,19 @@ jobs:
           echo "--- flags and encoders the encode path needs ---"
           ffmpeg -hide_banner -encoders > /tmp/encoders.txt
           ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
-          # **libx265 belongs in this list and was missing from it.** The gate below asserts all
-          # three; this drift reporter asserted two, so the two encoder lists in this file would
-          # have gone stale differently — and the one that stays quiet is the one that reports
-          # rather than fails. `codec` became request-carried on 2026-08-26, which is when a
-          # missing x265 in ffmpeg master stopped being a curiosity and became a shipped refusal.
-          grep -E 'libwebp|libx264|libx265' /tmp/encoders.txt || echo "MISSING an encoder"
+          # **One grep per encoder, because the alternation could not report a single absence.**
+          # This read `grep -E 'libwebp|libx264' ... || echo "MISSING an encoder"`, and `grep`
+          # exits 0 when ANY branch matches — so the message fired only if EVERY encoder was
+          # gone, which is the one case nobody needs a canary for. Adding `libx265` to the
+          # alternation, as the first version of this commit did, made it strictly worse: three
+          # ways to satisfy the exit code instead of two. **A check whose exercise avoids the
+          # case it exists for.** The gate at :134-136 above had the right shape all along —
+          # one assertion per encoder — and this is that shape in a reporter that must not fail
+          # the job. `codec` became request-carried on 2026-08-26, which is when a missing x265
+          # in ffmpeg master stopped being a curiosity and became a shipped refusal.
+          for enc in libwebp libx264 libx265; do
+            grep -q "$enc" /tmp/encoders.txt || echo "MISSING an encoder: $enc"
+          done
           grep -q use_metadata_tags /tmp/mp4muxer.txt \
             && echo "use_metadata_tags: present" || echo "use_metadata_tags: GONE — identity tags would silently vanish"
           # `-vsync` is already removed in 9.x and `-fps_mode` did not exist before 5.0. Neither

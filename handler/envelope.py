@@ -25,7 +25,7 @@ in the file whose job is to describe this worker. `validation.py`'s `_refuse_unk
 already turns a misrouted retime away with no list and no code, because **the separation is what
 makes those names unknown.**
 """
-from errors import INVALID_FIELD_VALUE, WorkerError
+from errors import INVALID_FIELD_VALUE, MISSING_REQUIRED_FIELD, WorkerError
 
 import encoder
 
@@ -64,10 +64,19 @@ def derive(params):
 
     # ---- sizing --------------------------------------------------------------------------
     # Release-2 behaviour, restated only because the codec work must not weaken it.
+    #
+    # **`MISSING_REQUIRED_FIELD`, and the message is `validation.py`'s WORD FOR WORD.** Running
+    # `derive` ahead of `validation`'s own sizing branch made that branch unreachable, so this
+    # line inherited its job — and a shorter message under a different code is a CONTRACT-VISIBLE
+    # change for any caller branching on `cf_error.code`. The wave that introduced it was about
+    # codecs and said nothing about refusal codes, which is exactly how a wire contract moves
+    # without anyone deciding to move it.
     if not has_size:
         raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "a request must say what size it wants: 'target_short_edge_px' or 'output_size'.",
+            MISSING_REQUIRED_FIELD,
+            "a request must say what size it wants: either 'target_short_edge_px' (one edge, "
+            "aspect preserved) or 'output_size' as {'width': W, 'height': H} (an exact "
+            "canvas). Neither was given in 'params'.",
         )
 
     # ---- codec ---------------------------------------------------------------------------

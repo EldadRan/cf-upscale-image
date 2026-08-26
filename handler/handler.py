@@ -302,6 +302,39 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # with alpha is warned about below rather than silently flattened.
     keep_alpha = bool(source["has_alpha"]) and still
 
+    # **The codec is resolved HERE, not at the writer, and the two defects that forces are worth
+    # naming.** `envelope.derive` validates the request at the door, but `"source"` names a codec
+    # only the probed file can supply — so resolution has to wait for the probe and must not wait
+    # any longer than that.
+    #
+    # Resolved at the writer instead, a source this worker cannot encode was refused only after
+    # the cold start, the download, `build_args` and `open_source` had all been paid for, and it
+    # arrived at the attempt loop as a bare `WorkerError` that classified as `outcome: "error"` —
+    # the crash bucket the comment there says a deliberate refusal must never land in. Worse,
+    # `--plan-only` returned a cheerful plan for a request that could not run.
+    #
+    # **And a still cannot honour either knob.** Its master is a lossless image written by
+    # `StillWriter`, which takes no codec and no preset; accepting them and encoding a PNG anyway
+    # is the silent-reinterpretation class `envelope.py` refuses `"Medium"` for, one whole request
+    # shape up. A request that says h265 and receives a PNG has been answered, not served.
+    # **Only `codec` and `preset` — NOT `crf`.** `crf` has been accepted and ignored on a still
+    # since long before this wave, and refusing it now would be a contract change for callers who
+    # send one today, made as a side effect of a codec wave. The two fields this wave introduced
+    # are the two it may refuse; the third keeps the behaviour it has always had, and that
+    # asymmetry is deliberate rather than an oversight.
+    asked_for_encode = (request.get("codec", envelope.DEFAULT_CODEC) != envelope.DEFAULT_CODEC
+                        or request.get("preset", encoder.DEFAULT_PRESET)
+                        != encoder.DEFAULT_PRESET)
+    if still and asked_for_encode:
+        raise WorkerError(
+            errors.INVALID_FIELD_VALUE,
+            "'codec' and 'preset' are the master ENCODE's settings and this source is a still, "
+            "whose master is a lossless image written with no encoder at all. A request naming "
+            "them for an image has been answered rather than served. Omit them, or send a video.",
+        )
+    resolved_codec = envelope.resolve_codec(
+        request.get("codec", envelope.DEFAULT_CODEC), source.get("codec")) if not still else None
+
     # **`proxy` is refused on a still rather than produced badly.** A proxy is a duration-bounded,
     # long-edge-capped *video* for scrubbing; over one frame it is a worse copy of the master with
     # a name that promises something else. Returning one would be the failure this worker exists
@@ -698,6 +731,10 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
                                  rationale, machine, attempts, progress, estimated_frames,
                                  still=still, keep_alpha=keep_alpha, exact_size=exact_size,
                                  warnings=warnings, load_strip=load_strip,
+                                 # Resolved once in this function, right after the probe, and
+                                 # passed down rather than recomputed — `"source"` needs the
+                                 # probed codec and the writer is two frames further in.
+                                 codec=resolved_codec,
                                  # The stopwatch the retry loop's stop is measured against — the
                                  # same one the deadline refusal uses, started at handler entry.
                                  started=started)
@@ -878,7 +915,7 @@ def _job_shape_for(source, plan, estimated_frames, exact_size=None):
 def _upscale_with_retry(cli, request, source, source_path, master_path, plan, rationale,
                         machine, attempts, progress, estimated_frames, still=False,
                         keep_alpha=False, exact_size=None, warnings=None, started=None,
-                        load_strip=None):
+                        load_strip=None, codec=None):
     """Run the model, stepping down the ladder until a rung fits or the floor is reached.
 
     A job that OOMs has already spent everything: the source is fetched and on local disk, the
@@ -932,11 +969,15 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
         # Per attempt, not per job: a retry must not inherit the peak of the attempt that OOMed.
         estimator.reset_peak_vram()
         try:
+            # **Per attempt, not per job.** A fresh holder each time round the ladder, so a
+            # failed rung's encoder peak can never be read onto a later rung's record.
+            encoder_out = {}
             outcome = _upscale_once(cli, request, source, source_path, master_path, plan,
                                     progress, estimated_frames, still=still,
                                     keep_alpha=keep_alpha, exact_size=exact_size,
                                     warnings=warnings if warnings is not None else [],
-                                    load_strip=load_strip)
+                                    load_strip=load_strip, codec=codec,
+                                    encoder_out=encoder_out)
             # **The only place a successful run's cost is recorded.** `diagnose_oom` reads the
             # peak on failure, which tells you a rung does not fit; nothing recorded what a rung
             # actually costs, so the calibration table could never fill and every job ran the
@@ -992,6 +1033,15 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             return outcome
         except Exception as exc:  # noqa: BLE001 — classified immediately below
             record["seconds"] = round(time.time() - attempt_started, 1)
+            # **Banked here, above the OOM test, so EVERY failure carries it.** `__exit__` drains
+            # and finishes sampling before the exception leaves the writer, so the number is final
+            # by this line whatever killed the attempt. These are the runs the instrument was
+            # restored for — its own docstring cites an 8K run that "died at ~46 GiB inside x264's
+            # working set" with the ceiling "inferred from a kernel kill". That run is a FAILURE,
+            # and banking the peak only where the attempt succeeded would have left it exactly as
+            # unreadable as it was before.
+            record["encoder_peak_rss_gb"] = getattr(
+                (encoder_out or {}).get("writer"), "encoder_peak_rss_gb", None)
             if not estimator.is_oom(exc):
                 # **A deliberate refusal is not an error, and the corpus has to be able to tell.**
                 # The host guard stops a doomed run on purpose; recording that as `error` would
@@ -1604,7 +1654,7 @@ class _Ratchet:
 
 def _upscale_once(cli, request, source, source_path, master_path, plan, progress,
                   estimated_frames, still=False, keep_alpha=False, exact_size=None,
-                  warnings=None, load_strip=None):
+                  warnings=None, load_strip=None, codec=None, encoder_out=None):
     args = pipeline.build_args(cli, plan, source_path, MODEL_BUILD,
                                request["color_correction"], debug=request["debug"])
     capture, shape = pipeline.open_source(cli, source_path, keep_alpha=keep_alpha)
@@ -1649,6 +1699,13 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # with it: the host-tail time and memory terms were measured at crf 12, and the
             # single-core encode drain lengthens as crf drops, so a CRF experiment reads the
             # `[host]` tail banner like any other probe.
+            # **Handed to the caller as soon as it exists, so a FAILED attempt can still be
+            # asked what the encoder cost.** `__exit__` drains and finishes sampling on the
+            # exception path exactly as it does on the success path — but this function raises
+            # before its `return`, so without this the number is measured and thrown away. The
+            # instrument's own docstring cites "the 8K run died at ~46 GiB inside x264's working
+            # set... the ceiling had to be inferred from a kernel kill": that run is a FAILURE,
+            # and it was the only one that still recorded nothing.
             writer_cm = encoder.MasterWriter(master_path, width, height, shape["fps"] or 30.0,
                                              identity, audio_source=audio_source,
                                              audio_codec=source.get("audio_codec"),
@@ -1656,14 +1713,20 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              crf=request.get("crf", encoder.DEFAULT_CRF),
                                              preset=request.get("preset",
                                                                 encoder.DEFAULT_PRESET),
-                                             # **`source` resolves HERE and not at the door.**
-                                             # The request surface is validated before the file is
-                                             # opened, so "the codec the source uses" is not
-                                             # answerable there; `probe` has run by now and
-                                             # `source["codec"]` is what it found.
-                                             codec=envelope.resolve_codec(
-                                                 request.get("codec", envelope.DEFAULT_CODEC),
-                                                 source.get("codec")))
+                                             # Already resolved in `handle`, right after the
+                                             # probe — see the comment there for why it cannot
+                                             # happen at the door and must not happen here.
+                                             # **`or DEFAULT_CODEC`, because `codec` is None on
+                                             # every path that does not resolve one.** A still
+                                             # never reaches this writer, so today the fallback
+                                             # cannot fire — but `CODEC_LIBRARIES[None]` is a
+                                             # KeyError raised inside `_start()`, mid-encode,
+                                             # with a delivered master's worth of work already
+                                             # spent. A default that cannot be reached costs
+                                             # nothing; the crash it prevents costs a job.
+                                             codec=codec or encoder.DEFAULT_CODEC)
+        if encoder_out is not None:
+            encoder_out["writer"] = writer_cm
         # **The policy the stream consults when a chunk runs out of memory.** Built here because
         # this is where the rung ladder, the request and the source path all exist; consumed
         # inside the stream, which knows how to resume and nothing about rungs.
