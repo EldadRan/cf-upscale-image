@@ -1713,12 +1713,27 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              crf=request.get("crf", encoder.DEFAULT_CRF),
                                              preset=request.get("preset",
                                                                 encoder.DEFAULT_PRESET),
-                                             # **Default False here as well as in `derive`.** Two
-                                             # defaults for one field is a copy — but the copy is
-                                             # `False`, and the failure it guards is a request
-                                             # that somehow reached the writer without passing
-                                             # the surface. The safe value is the one that
-                                             # changes nothing.
+                                             # **A LITERAL `False`, ON PURPOSE. Do not replace
+                                             # it with `envelope.HEAD_KEYFRAMES_DEFAULT`, and
+                                             # that is exactly what a later tidy-up will reach
+                                             # for**, because `crf` and `preset` two lines above
+                                             # import their defaults and this does not.
+                                             #
+                                             # The copy guards a request that reached the writer
+                                             # without passing the surface — **and the guard
+                                             # works only because the literal is NOT the
+                                             # constant.** Import it, and the day the configured
+                                             # default moves to `True` this line silently arms
+                                             # the flag on precisely the requests that skipped
+                                             # validation. **The SAFE value and the CONFIGURED
+                                             # value are different things here, and this is a
+                                             # copy of the safe one.**
+                                             #
+                                             # `crf` and `preset` are not the same case: their
+                                             # defaults are values rather than switches, so a
+                                             # bypass carrying `DEFAULT_CRF` delivers what
+                                             # production delivers. `head_keyframes` is the only
+                                             # field in this call where the two can diverge.
                                              head_keyframes=request.get(
                                                  "head_keyframes", False),
                                              # Already resolved in `handle`, right after the
