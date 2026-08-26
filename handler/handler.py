@@ -1755,7 +1755,6 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              keyframes=request.get("keyframes", "default"),
                                              keyframe_frames=request.get("keyframe_frames"),
                                              keyframe_seconds=request.get("keyframe_seconds"),
-                                             duration_s=source.get("video_duration_s"),
                                              # Already resolved in `handle`, right after the
                                              # probe — see the comment there for why it cannot
                                              # happen at the door and must not happen here.
