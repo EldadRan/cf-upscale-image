@@ -204,6 +204,13 @@ PARAMS_FIELDS = {
     # **It does not trim anything.** The name says what the encode does; an earlier draft named
     # the caller's intent and was ruled out for it.
     "head_keyframes",
+    # **The keyframe ladder: a named set, never ffmpeg's expression.** The same reason `codec` is
+    # an enum rather than a raw `-c:v` string — an expression nobody has seen cannot be certified,
+    # priced or supported, and it is injection surface on a worker that runs a subprocess. Each
+    # rung is priced at roughly 1-3% of master size per added keyframe.
+    "keyframes",
+    "keyframe_frames",
+    "keyframe_seconds",
     # **The encoding half of the request, and NOT the top-level `output`.** That one is the R2
     # destination — endpoint, bucket, prefix, credentials. This one carries `codec` and nothing
     # else today. The collision of names is contract §5c's and is safe rather than tidy: the
@@ -665,6 +672,9 @@ def validate(job_input):
         "crf": codec_config["crf"],
         "preset": codec_config["preset"],
         "head_keyframes": codec_config["head_keyframes"],
+        "keyframes": codec_config["keyframes"],
+        "keyframe_frames": codec_config["keyframe_frames"],
+        "keyframe_seconds": codec_config["keyframe_seconds"],
         # Banked so a row can say whether the request could have moved production's output at all,
         # without a reader having to compare three values against three defaults themselves.
         "release_2_equivalent": codec_config["release_2_equivalent"],

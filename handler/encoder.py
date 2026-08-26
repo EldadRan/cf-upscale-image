@@ -249,7 +249,8 @@ class MasterWriter:
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=DEFAULT_CODEC,
-                 head_keyframes=False):
+                 head_keyframes=False, keyframes="default", keyframe_frames=None,
+                 keyframe_seconds=None, duration_s=None):
         self.path = path
         self.width = width
         self.height = height
@@ -281,6 +282,14 @@ class MasterWriter:
         #: gate this wave had to pass is that a request naming none of the knobs still produces
         #: byte-for-byte what production produces today.
         self._head_keyframes = head_keyframes
+        self._keyframes = keyframes or "default"
+        #: Sorted at the door. Kept as given so the end-of-encode check can name the offending
+        #: index back to the caller in the terms they sent it.
+        self._keyframe_frames = list(keyframe_frames or ())
+        self._keyframe_seconds = keyframe_seconds
+        #: The source's duration, for the OUTCOME cap under `seconds`. The door can only count a
+        #: list; how many keyframes an interval produces is a fact about the clip.
+        self._duration_s = duration_s
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -334,8 +343,7 @@ class MasterWriter:
         # **The price is per ADDED I-frame, not per rule**, which is why this is off by default:
         # +0.52% on a clip that already had six keyframes, +11.53% on one that had a single
         # keyframe like ours. A twenty-fold spread from the same flag.
-        if self._head_keyframes:
-            command += ["-force_key_frames", "expr:lt(n,5)"]
+        command += self._keyframe_flags()
 
         if carry_audio:
             # `?` makes the mapping optional, so a source whose audio stream vanished between the
@@ -407,6 +415,66 @@ class MasterWriter:
         except BrokenPipeError:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))
         self.frames_written += 1
+
+    def _keyframe_flags(self):
+        """The keyframe arguments for this request, or none at all.
+
+        **`default` emits NOTHING, which is what makes `codec_default_unmoved` hold.** Not an
+        empty expression, not a flag with a neutral value — no argument, so the command is
+        character-for-character what production sends today.
+        """
+        # **`all` is `-g 1`, and this is a deliberate reversal of my own earlier argument.** I
+        # argued against `-g` for `head_keyframes` because a whole-clip GOP MAXIMUM is a different
+        # and far more expensive property than five keyframes at the head. For `all` that IS the
+        # property being asked for — every frame a keyframe is a GOP of one — so the flag that was
+        # wrong there is the right one here. `-g 1` is also what produced the 121-on-121
+        # measurement the ladder is priced from.
+        if self._keyframes == "all":
+            return ["-g", "1"]
+
+        terms = []
+        if self._head_keyframes:
+            # Frame-indexed and rate-independent: `lt(n,5)` means the first five FRAMES whatever
+            # the master's rate turns out to be. A wall-clock list would mean different frames at
+            # a different rate.
+            terms.append("lt(n,5)")
+        if self._keyframes == "frames":
+            terms += ["eq(n,{})".format(int(f)) for f in self._keyframe_frames]
+        elif self._keyframes == "seconds":
+            # **`gte(t,n_forced*N)` rather than converting seconds to frame numbers here, and the
+            # difference is that this cannot use the wrong rate.** The gate's rule was "convert
+            # with the MASTER's rate, not the declared one" — §2c, and a declared rate on a
+            # spliced source puts cut points at times the file does not have. This does no
+            # conversion at all: `t` is the OUTPUT's own presentation time, which is frame index
+            # over the rate this writer was constructed with. **The rate cannot be wrong because
+            # no rate is read.** `n_forced` is ffmpeg's count of keyframes already forced, so the
+            # interval walks the whole clip without anyone needing its length in advance.
+            terms.append("gte(t,n_forced*{:.6f})".format(float(self._keyframe_seconds)))
+
+        if not terms:
+            return []
+        # `+` is arithmetic on booleans in ffmpeg's expression language: any term true makes the
+        # sum non-zero, which is the OR this needs.
+        return ["-force_key_frames", "expr:" + "+".join(terms)]
+
+    def unplaced_keyframes(self):
+        """Requested frame numbers the encode never reached, or an empty list.
+
+        **The truth about how many frames a clip has exists HERE and nowhere earlier.**
+        `probe_source` returns no frame count at all, and `nb_frames` is a header claim this
+        project has already ruled against trusting — `delivery_witness`: *"the header is a claim;
+        the packets are the file."* A door check built on `duration x rate` would be the
+        nearly-right quantity this ledger collects, and it would be wrong on exactly the spliced
+        and variable-rate sources the feature is used on: **it would reject VALID requests on the
+        files least able to afford a re-run.**
+
+        `frames_written` is counted by this writer, one increment per accepted frame. Only
+        `frames` mode can name a frame that does not exist; `seconds` walks the clip's own
+        timeline and `all` and `default` name nothing.
+        """
+        if self._keyframes != "frames":
+            return []
+        return [f for f in self._keyframe_frames if f >= self.frames_written]
 
     def _sample_peak(self):
         """One `/proc` read against the encoder, keeping the maximum.

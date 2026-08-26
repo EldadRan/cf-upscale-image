@@ -37,6 +37,15 @@ DEFAULT_CODEC = "h264"
 
 CRF_MIN, CRF_MAX = 0, 51
 
+#: The keyframe ladder. Each rung is priced — roughly 1-3% of master size per added keyframe, no
+#: cliff — and `default` is the shipped behaviour: one keyframe, whatever the encoder chooses.
+KEYFRAME_MODES = ("default", "all", "frames", "seconds")
+DEFAULT_KEYFRAMES = "default"
+
+#: **A cap on the OUTCOME, not on the request.** A hundred cut points is already most of the way
+#: to all-intra on a short clip, and past it a caller wants `all` and its price rather than a list.
+MAX_KEYFRAMES = 100
+
 #: The same nine names in x264 and x265, and **not the same quality at the same number** — the
 #: scales are offset by several points. That is why h265's shipped default CRF is a ruling rather
 #: than something a measurement discovers, and why two codecs never share a table keyed on CRF.
@@ -148,11 +157,82 @@ def derive(params):
             "anything here.".format(head_keyframes),
         )
 
+    # ---- keyframes -------------------------------------------------------------------------
+    # **A NAMED LADDER, not ffmpeg's expression.** The same reason `codec` is an enum rather than
+    # a raw `-c:v` string: an expression nobody has seen cannot be certified, priced or supported,
+    # and it is injection surface on a worker that runs a subprocess.
+    mode = p.get("keyframes", DEFAULT_KEYFRAMES)
+    if mode not in KEYFRAME_MODES:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "'keyframes' must be one of {}; got {!r}".format(KEYFRAME_MODES, mode))
+
+    # **A companion field outside its mode is an ORPHAN and is refused.** A request carrying
+    # `keyframe_frames` under `keyframes: "seconds"` has two answers in it, and honouring one is
+    # the silent-reinterpretation class — the same reason release 2 refused `target_fps` with no
+    # `interpolate`.
+    frames = p.get("keyframe_frames")
+    seconds = p.get("keyframe_seconds")
+    if mode != "frames" and frames is not None:
+        raise WorkerError(INVALID_FIELD_VALUE,
+                          "'keyframe_frames' has no meaning under keyframes: {!r}".format(mode))
+    if mode != "seconds" and seconds is not None:
+        raise WorkerError(INVALID_FIELD_VALUE,
+                          "'keyframe_seconds' has no meaning under keyframes: {!r}".format(mode))
+
+    if mode == "frames":
+        if not isinstance(frames, (list, tuple)) or not frames:
+            raise WorkerError(INVALID_FIELD_VALUE,
+                              "keyframes: 'frames' needs 'keyframe_frames', a non-empty list of "
+                              "frame numbers")
+        if len(frames) > MAX_KEYFRAMES:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "'keyframe_frames' holds {} entries; the limit is {}. A list this long is "
+                "all-intra at all-intra's price — ask for keyframes: 'all' if that is what you "
+                "want.".format(len(frames), MAX_KEYFRAMES))
+        for entry in frames:
+            # `bool` first: `True == 1`, so a bool passes an int check and would name frame 1.
+            # Same trap as `crf`, same answer.
+            if isinstance(entry, bool) or not isinstance(entry, int) or entry < 0:
+                raise WorkerError(
+                    INVALID_FIELD_VALUE,
+                    "'keyframe_frames' takes whole frame numbers from 0; got {!r}".format(entry))
+        # **Duplicates refused rather than collapsed** (CF): a repeat is more likely a mistake in
+        # the input than a request, and accepting it delivers a file the caller did not ask for
+        # while reporting success. **Order is NOT checked** — a set of cut points has no order, so
+        # sorting one is not a reinterpretation, unlike lowering `preset="Medium"`.
+        if len(set(frames)) != len(frames):
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "'keyframe_frames' repeats a frame number; every entry names one cut point and a "
+                "repeat is more likely a mistake than a request")
+        frames = sorted(frames)
+
+    if mode == "seconds":
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "keyframes: 'seconds' needs 'keyframe_seconds', a positive number of seconds "
+                "between keyframes")
+
+    # **TWO RULES THIS DOOR CANNOT CHECK, and they are the worker's** — both need the probe or the
+    # encode, and both are implemented in `encoder.py` rather than here:
+    #   - a frame number beyond the clip's last frame. The true count exists only once the encode
+    #     has run: `probe_source` returns none, and `nb_frames` is a header claim this project has
+    #     already ruled against trusting (`delivery_witness`: "the header is a claim; the packets
+    #     are the file"). Detected at the end of the encode against `frames_written`.
+    #   - a `keyframe_seconds` short enough to force more than MAX_KEYFRAMES across the duration.
+    #     The cap is on the OUTCOME; this door can only see the list half of it.
+
     return {
         "codec": codec,
         "crf": crf,
         "preset": preset,
         "head_keyframes": head_keyframes,
+        "keyframes": mode,
+        "keyframe_frames": frames if mode == "frames" else None,
+        "keyframe_seconds": seconds if mode == "seconds" else None,
         # **True only when every knob is where release 2 left it.** One boolean answering "could
         # this request have changed production's output" — so `crf 8`, a better picture, breaks it
         # exactly as `h265` does. The field is about movement, not about quality.
@@ -162,8 +242,37 @@ def derive(params):
         "release_2_equivalent": (codec == DEFAULT_CODEC
                                  and crf == encoder.DEFAULT_CRF
                                  and preset == encoder.DEFAULT_PRESET
-                                 and head_keyframes is False),
+                                 and head_keyframes is False
+                                 and mode == DEFAULT_KEYFRAMES),
     }
+
+
+def check_keyframe_cap(config, duration_s):
+    """The OUTCOME cap under `seconds`, which the request surface cannot see.
+
+    `derive` counts a list; it cannot count what an INTERVAL produces, because that is a fact
+    about the clip rather than the request. One keyframe every 0.1 s is four on a short clip and
+    six hundred on a minute — the same request, two different files.
+
+    **Checked right after the probe and before any expensive work**, so a request that cannot be
+    served does not pay for a download, a decode and a plan first. Refuses rather than clamps, per
+    CF: a caller who asked for an interval this dense has most likely made an input error, and
+    quietly delivering a hundred keyframes instead of six hundred is the file they did not ask for
+    reported as a success.
+    """
+    if config.get("keyframes") != "seconds" or not duration_s:
+        return
+    interval = float(config["keyframe_seconds"])
+    # One at t=0 and one at every interval boundary the clip actually reaches.
+    count = int(float(duration_s) // interval) + 1
+    if count > MAX_KEYFRAMES:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "keyframe_seconds {} over {:.3f}s of source would force {} keyframes; the limit is "
+            "{}. That is all-intra at all-intra's price — ask for keyframes: 'all' if that is "
+            "what you want, or a longer interval.".format(
+                interval, float(duration_s), count, MAX_KEYFRAMES),
+        )
 
 
 def resolve_codec(codec, source_codec):

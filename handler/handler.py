@@ -332,6 +332,11 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             "whose master is a lossless image written with no encoder at all. A request naming "
             "them for an image has been answered rather than served. Omit them, or send a video.",
         )
+    # **The OUTCOME cap, here for the same reason `resolve_codec` is: it needs the probe and it
+    # must refuse before anything expensive is paid for.** `derive` can count a list; only the
+    # clip's duration says how many keyframes an INTERVAL produces.
+    envelope.check_keyframe_cap(request, source.get("duration_s")
+                                or source.get("video_duration_s"))
     resolved_codec = envelope.resolve_codec(
         request.get("codec", envelope.DEFAULT_CODEC), source.get("codec")) if not still else None
 
@@ -1048,7 +1053,7 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                 # put it in the same bucket as a crash, and the whole value of refusing while
                 # alive is that the record explains itself (F-2026-08-20-46).
                 record["outcome"] = (
-                    "refused" if getattr(exc, "code", None) == errors.HOST_CAPACITY_EXCEEDED
+                    "refused" if getattr(exc, "code", None) in errors.DELIBERATE_REFUSALS
                     else "error")
                 # **Phases are recorded on *any* failure, not only on an OOM.** These two lines
                 # were on the ok path and the OOM path and not here, so a run that died for a
@@ -1736,6 +1741,12 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              # field in this call where the two can diverge.
                                              head_keyframes=request.get(
                                                  "head_keyframes", False),
+                                             # Same literal-default reasoning as above: the safe
+                                             # value for each is the one that places no keyframe.
+                                             keyframes=request.get("keyframes", "default"),
+                                             keyframe_frames=request.get("keyframe_frames"),
+                                             keyframe_seconds=request.get("keyframe_seconds"),
+                                             duration_s=source.get("video_duration_s"),
                                              # Already resolved in `handle`, right after the
                                              # probe — see the comment there for why it cannot
                                              # happen at the door and must not happen here.
@@ -1909,6 +1920,35 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
     # — the model's grid is the model's business and the writers now adopt it — but it is the
     # difference between the size the caller asked for and the size they got, and a caller who
     # laid out a page against `target_short_edge_px` deserves to see it rather than discover it.
+    # ---- the keyframes the encode never reached -------------------------------------------
+    #
+    # **Detected here because here is where the truth is.** `probe_source` returns no frame count,
+    # and `nb_frames` is a header claim this project already refuses to trust. `frames_written` is
+    # counted by the writer, one per accepted frame, so a request naming frame 999 on a 121-frame
+    # clip is only knowable now.
+    #
+    # **REFUSE, AND THE MASTER GOES WITH IT — CF, 2026-08-26.** I framed this as destroying a
+    # correct master over a typo. CF's framing is the one that decides it: *"it might be that the
+    # user wanted frame 99 and we didn't give it to him, failed product."* A caller who typed 999
+    # for 99 takes delivery of a file that looks finished and discovers in an edit suite that it
+    # does not cut where they asked. **That is this project's own defect class shipped to a
+    # customer — a thing that looks correct and fails at the case it exists for.** A refusal costs
+    # a re-run; a wrong master costs the belief that cut points are where the request put them.
+    #
+    # **The message must be enough to fix the request in ONE attempt**, because it is the only
+    # thing a caller gets back for a whole job's spend. A bare "out of range" would make them
+    # bisect a list at 25 minutes of H200 per guess.
+    unplaced = (writer_cm.unplaced_keyframes()
+                if hasattr(writer_cm, "unplaced_keyframes") else [])
+    if unplaced:
+        raise WorkerError(
+            errors.INVALID_FIELD_VALUE,
+            "keyframes requested at frame {} but this clip encoded {} frames, so they could not "
+            "be placed. Frames are numbered from 0, so the last one is {}. Nothing was delivered: "
+            "a master whose cut points are not where the request put them is worse than no "
+            "master.".format(", ".join(str(f) for f in unplaced), written, max(written - 1, 0)),
+        )
+
     return {"decoded_in": written, "written_out": written,
             "pixels": getattr(pipeline.run, "last_pixel_stats", None),
             "predicted_size": (width, height),
@@ -1924,6 +1964,7 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # the writer after its context manager has exited, which is where the drain sampling
             # finishes; reading it earlier would return the fed part of the encode only.
             "encoder_peak_rss_gb": getattr(writer_cm, "encoder_peak_rss_gb", None),
+            "unplaced_keyframes": unplaced,
             "actual_size": getattr(pipeline.run, "last_output_size", None)}
 
 

@@ -166,3 +166,15 @@ RETRYABLE = (
     INTERNAL,
 )
 ALL_CODES = NEVER_RETRYABLE + RETRYABLE
+
+#: **Codes that mean the worker DECIDED, rather than the worker broke.** `handler.py` classifies an
+#: attempt's outcome with this: a deliberate refusal is recorded as `refused` and everything else
+#: as `error`, because the corpus has to be able to tell a judgement from a crash — the whole value
+#: of refusing while alive is that the record explains itself (F-2026-08-20-46).
+#:
+#: **`INVALID_FIELD_VALUE` is in here because of WHERE it can be raised, not what it means.** Every
+#: other one is raised at the door, before an attempt exists, and never reaches the classifier. The
+#: keyframe check is the exception: it can only run at the END of a successful encode, because the
+#: true frame count exists nowhere earlier — so it is a refusal on a run that did everything right,
+#: and recording that as a crash would put a caller's typo in the same bucket as a traceback.
+DELIBERATE_REFUSALS = (HOST_CAPACITY_EXCEEDED, INVALID_FIELD_VALUE)
