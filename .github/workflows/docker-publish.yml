@@ -172,7 +172,12 @@ jobs:
           echo "--- flags and encoders the encode path needs ---"
           ffmpeg -hide_banner -encoders > /tmp/encoders.txt
           ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
-          grep -E 'libwebp|libx264' /tmp/encoders.txt || echo "MISSING an encoder"
+          # **libx265 belongs in this list and was missing from it.** The gate below asserts all
+          # three; this drift reporter asserted two, so the two encoder lists in this file would
+          # have gone stale differently — and the one that stays quiet is the one that reports
+          # rather than fails. `codec` became request-carried on 2026-08-26, which is when a
+          # missing x265 in ffmpeg master stopped being a curiosity and became a shipped refusal.
+          grep -E 'libwebp|libx264|libx265' /tmp/encoders.txt || echo "MISSING an encoder"
           grep -q use_metadata_tags /tmp/mp4muxer.txt \
             && echo "use_metadata_tags: present" || echo "use_metadata_tags: GONE — identity tags would silently vanish"
           # `-vsync` is already removed in 9.x and `-fps_mode` did not exist before 5.0. Neither

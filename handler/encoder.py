@@ -21,6 +21,7 @@ carried an edit list, which cannot arise here.
 
 import os
 import subprocess
+import time
 
 import probe
 
@@ -36,6 +37,53 @@ MP4_NATIVE_AUDIO = ("aac", "mp3", "alac", "ac3", "eac3")
 #: something rather than against a number invented here.
 DEFAULT_CRF = 12
 DEFAULT_PRESET = "medium"
+DEFAULT_CODEC = "h264"
+
+#: **What each codec name becomes on the command line.** `envelope.py` owns which names are legal
+#: and resolves `"source"` against the probed source before anything reaches here — this map is
+#: deliberately total over what it accepts, so an unresolved name raises a KeyError in the worker
+#: rather than encoding something nobody asked for.
+CODEC_LIBRARIES = {"h264": "libx264", "h265": "libx265"}
+
+
+def _peak_rss_gb(pid):
+    """The largest resident set this process reached, in GiB, or None where it cannot be read.
+
+    **`/proc/<pid>/status`'s `VmHWM`, sampled while the process is alive.** `getrusage`'s
+    `RUSAGE_CHILDREN` would be the easy answer and is the wrong one: it reports the maximum across
+    every child this worker has ever reaped, so an ffprobe from a previous phase and the encode
+    would be indistinguishable — a plausible number about a different process, which is the class
+    this project keeps finding. `VmHWM` is that process's own high-water mark and it disappears
+    when the process does, which is why it is sampled rather than read at the end.
+
+    **This is a DIFFERENT PROCESS from `phasewatch.host_rss_gb`, not a different sampling
+    strategy.** That one reads `/proc/self` — the worker, model included — and so can never answer
+    "what did the encoder cost". This one reads the ffmpeg child.
+
+    None on anything that is not Linux, which is honest: a figure that is absent says nothing and
+    a figure that is zero says the encode used no memory.
+
+    **RESTORED 2026-08-26 with the drain closed.** The original stopped sampling when the last
+    `write()` returned and reassured that the shortfall was near zero *because x264's flush is
+    memory-non-increasing*. That argument was written when x264 was the only encoder, and this
+    instrument now decides an x265 question — where the lookahead and reference structure are not
+    x264's and the flush is exactly where a heavier encoder could still be climbing. It would have
+    under-read in the direction that makes h265 look affordable. `MasterWriter.__exit__` now keeps
+    sampling across the drain, so the peak covers the whole encode rather than the fed part of it.
+
+    **It still under-reads totally on a clip shorter than the encoder's buffering window**, where
+    the entire encode happens after the final write and the drain poll is the only thing that sees
+    anything. **A reassuringly low peak from a small fixture means nothing** — which matters
+    because a small fixture is what somebody reaches for when checking that the measurement works.
+    """
+    try:
+        with open("/proc/{}/status".format(pid), encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmHWM:"):
+                    return round(int(line.split()[1]) / (1024 ** 2), 2)
+    except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
+        return None
+    return None
 
 
 def _identity_tags(identity):
@@ -200,12 +248,18 @@ class MasterWriter:
 
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
-                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET):
+                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=DEFAULT_CODEC):
         self.path = path
         self.width = width
         self.height = height
         self.fps = fps
         self.frames_written = 0
+        #: **ffmpeg's own high-water mark, not this worker's.** The 8K run died at ~46 GiB inside
+        #: x264's working set while this side held one frame and a cached pair — and nothing
+        #: reported it, so the ceiling had to be inferred from a kernel kill. A path built to find
+        #: a memory ceiling that does not report memory has to be run twice to learn anything, and
+        #: each run is fifty minutes of A40. None where it cannot be measured.
+        self.encoder_peak_rss_gb = None
         self._proc = None
         self._identity = dict(identity or {})
         self._audio_source = audio_source
@@ -218,6 +272,7 @@ class MasterWriter:
         self.verified_frames = None
         self._crf = crf
         self._preset = preset
+        self._codec = codec
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -255,7 +310,10 @@ class MasterWriter:
                 command += ["-t", "{:.6f}".format(float(self._audio_limit_s))]
             command += ["-i", audio_source]
 
-        command += ["-map", "0:v:0", "-c:v", "libx264",
+        # **The codec the request asked for.** This was the literal `"libx264"` until 2026-08-26;
+        # `envelope.py` validates the name and resolves `"source"` against the probed source, so
+        # what arrives here is always one this map holds.
+        command += ["-map", "0:v:0", "-c:v", CODEC_LIBRARIES[self._codec],
                     "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
 
         if carry_audio:
@@ -324,9 +382,53 @@ class MasterWriter:
             raise WorkerError(INTERNAL, self._died("ffmpeg exited before the frames did"))
         try:
             self._proc.stdin.write(frame_bytes)
+            self._sample_peak()
         except BrokenPipeError:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))
         self.frames_written += 1
+
+    def _sample_peak(self):
+        """One `/proc` read against the encoder, keeping the maximum.
+
+        **Called where the loop already blocks.** `stdin.write` returns when the pipe accepts the
+        frame, which is exactly when the encoder is working — so the samples land across the whole
+        encode without a thread, and one `/proc` read per frame is noise against a 50 MiB write.
+        """
+        if self._proc is None:
+            return
+        peak = _peak_rss_gb(self._proc.pid)
+        if peak is not None and peak > (self.encoder_peak_rss_gb or 0.0):
+            self.encoder_peak_rss_gb = peak
+
+    #: How often the drain is sampled, in seconds. **Small enough to catch a rising flush, large
+    #: enough that the poll costs nothing** — one `/proc` read per interval against an encode
+    #: measured in minutes at 8K.
+    DRAIN_SAMPLE_S = 0.2
+
+    def _drain(self):
+        """Wait for ffmpeg to finish, sampling its memory the whole way down.
+
+        **This is the half the original instrument did not have, and it decides an x265 question.**
+        The last `write()` returns when the last frame is *accepted*, not when it is encoded: the
+        encoder then drains its lookahead and flushes, and nothing sampled that phase. The original
+        docstring reassured that the shortfall was near zero because x264's flush is
+        memory-non-increasing — an argument about the codec it was written for, and this wave
+        exists to measure the other one, whose lookahead and reference structure are not x264's.
+        **It would have under-read exactly where a heavier encoder is heaviest, in the direction
+        that makes h265 look affordable.**
+
+        `VmHWM` is monotone for the child's life and disappears with the process, so the sampling
+        has to happen *before* the reap — which is why this polls rather than reading once after
+        `wait()`. A sample is taken after the loop as well: `poll()` can observe the exit before
+        the last iteration's read, and the peak is monotone so a redundant read costs nothing and
+        a missed one costs the measurement.
+        """
+        if self._proc is None:
+            return
+        while self._proc.poll() is None:
+            self._sample_peak()
+            time.sleep(self.DRAIN_SAMPLE_S)
+        self._sample_peak()
 
     def _died(self, why):
         stderr = b""
@@ -345,6 +447,9 @@ class MasterWriter:
             self._proc.stdin.close()
         except Exception:  # noqa: BLE001
             pass
+        # **Sampled across the drain, then reaped.** `_drain` returns only once the process has
+        # exited, so the `wait()` below is what collects the status rather than what waits.
+        self._drain()
         self._proc.wait()
         # An exception on the way in owns the failure; do not replace it with one about ffmpeg,
         # which most likely died *because* of it. The original diagnosis is the useful one —

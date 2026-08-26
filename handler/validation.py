@@ -30,6 +30,7 @@ known or not.
 """
 
 import encoder
+import envelope
 import planner
 from errors import (
     FIELD_NOT_SUPPORTED,
@@ -180,10 +181,25 @@ PARAMS_FIELDS = {
     # **The master's constant-rate factor** (CF, 2026-08-18, pulled forward from the parked
     # encoder track). Default 12, which is what `encoder.py` has silently baked since the first
     # commit — so the default is today's behaviour named rather than changed. Applies to the
-    # master's encode only: codec, preset, pixel format and the derives' own settings stay with
-    # the encoder track. Recorded in the manifest and the ledger, because a master's CRF is part
-    # of what that master *is*.
+    # master's encode only; the derives' own settings stay with the encoder track. Recorded in
+    # the manifest and the ledger, because a master's CRF is part of what that master *is*.
+    #
+    # **This comment used to say codec and preset stayed with the encoder track too. From
+    # 2026-08-26 both are request-carried and `envelope.py` derives all three**, so the sentence
+    # was true when written and false in the direction that misleads — a reader would have
+    # concluded the request could not reach them.
     "crf",
+    # **A SPEED label, not a quality one** (CF, 2026-08-25). At a fixed crf a slower preset buys
+    # roughly the same quality in a smaller file for more time; it gains efficiency, not picture.
+    # It moves encoder MEMORY where crf barely does — lookahead, reference frames, threading —
+    # which is why the codec measurement holds it fixed at `medium` rather than walking it.
+    "preset",
+    # **The encoding half of the request, and NOT the top-level `output`.** That one is the R2
+    # destination — endpoint, bucket, prefix, credentials. This one carries `codec` and nothing
+    # else today. The collision of names is contract §5c's and is safe rather than tidy: the
+    # top-level object refuses unknown keys, so a `codec` posted into the wrong `output` is a
+    # loud refusal instead of a setting that silently does nothing.
+    "output",
     # **The decode-seam lever** (CF, 2026-08-18). `default` takes the formula's own pick, the
     # coarsest grid under the decode time knee; `high` waives the knee and buys the coarsest grid
     # memory alone allows — 4K 2x1 at ~2.3x decode time, 8K 3x2 at ~3.7x. Nothing in between is
@@ -232,11 +248,6 @@ DEFAULT_KEEP_AUDIO = True
 # worker's choice, because inheriting it would carry a decision nobody made for video.
 COLOR_CORRECTIONS = ("lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none")
 DEFAULT_COLOR_CORRECTION = "lab"
-
-#: x264's own range, and the whole of it. 0 is lossless and 51 is unwatchable; both are legal
-#: things to ask an encoder for, and a worker inventing a narrower band would refuse work that
-#: would have succeeded. The default is `encoder.DEFAULT_CRF`, imported rather than repeated.
-CRF_MIN, CRF_MAX = 0, 51
 
 #: The two decode-seam settings, and deliberately only two.
 TILE_QUALITIES = ("default", "high")
@@ -534,6 +545,12 @@ def validate(job_input):
     # implementing it must be loud rather than silent.
     _refuse_unknown(params, PARAMS_FIELDS, "in 'params'")
 
+    # **The codec surface, derived before anything else reads `params`.** `envelope.derive` is the
+    # contract executable — `fable/envelope_oracle.py` is its specification and
+    # `tests/envelope_conformance.py` runs the oracle's own cases against this very call. It owns
+    # `codec`, `crf` and `preset`; nothing else in this file derives them.
+    codec_config = envelope.derive(params)
+
     output_size = _validate_output_size(params.get("output_size"))
 
     target = params.get("target_short_edge_px")
@@ -581,19 +598,6 @@ def validate(job_input):
                 color_correction, ", ".join(COLOR_CORRECTIONS)),
         )
 
-    crf = params.get("crf")
-    if crf is None:
-        crf = encoder.DEFAULT_CRF
-    else:
-        crf = _as_int(crf, "crf")
-        if not CRF_MIN <= crf <= CRF_MAX:
-            raise WorkerError(
-                INVALID_FIELD_VALUE,
-                "field 'crf' must be within x264's range {}-{}, got {}. Lower is better quality "
-                "and a larger file; {} is this worker's default and what every measurement in "
-                "its calibration was taken at.".format(
-                    CRF_MIN, CRF_MAX, crf, encoder.DEFAULT_CRF),
-            )
 
     tile_quality = params.get("tile_quality")
     tile_quality = DEFAULT_TILE_QUALITY if tile_quality is None else _as_str(
@@ -644,7 +648,15 @@ def validate(job_input):
         "allow_oom_retry": allow_oom_retry,
         "keep_audio": keep_audio,
         "color_correction": color_correction,
-        "crf": crf,
+        # **All three from `envelope.derive`, never re-derived here.** One home for the codec
+        # surface: a second reading of `params.crf` in this file is how the conformance suite and
+        # the request path would drift apart while both looked right.
+        "codec": codec_config["codec"],
+        "crf": codec_config["crf"],
+        "preset": codec_config["preset"],
+        # Banked so a row can say whether the request could have moved production's output at all,
+        # without a reader having to compare three values against three defaults themselves.
+        "release_2_equivalent": codec_config["release_2_equivalent"],
         "tile_quality": tile_quality,
         "schedule": schedule,
         "derive": derive,

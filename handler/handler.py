@@ -46,6 +46,7 @@ if __name__ == "__main__" and len(sys.argv) > 2 and sys.argv[1] == "--dry-run-wa
 import derives
 import diagnostics
 import encoder
+import envelope
 import errors
 import estimator
 import hardware
@@ -948,6 +949,10 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                            # subtracting the tail is what makes two runs of the same job
                            # comparable (F-2026-08-20-44).
                            "tail_seconds": outcome.get("tail_seconds"),
+                           # Banked per attempt so a codec measurement can be read off the ledger
+                           # rather than off a log, and so an OOM ladder's rows each carry the
+                           # encoder cost of the rung that produced them.
+                           "encoder_peak_rss_gb": outcome.get("encoder_peak_rss_gb"),
                            "output_short_edge_px": request["target_short_edge_px"]})
             # **Four numbers where there was one.** The peak counter is read and reset at every
             # phase boundary, so a single run now says what encode, the sampler, decode and
@@ -1648,7 +1653,17 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              identity, audio_source=audio_source,
                                              audio_codec=source.get("audio_codec"),
                                              audio_limit_s=source.get("video_duration_s"),
-                                             crf=request.get("crf", encoder.DEFAULT_CRF))
+                                             crf=request.get("crf", encoder.DEFAULT_CRF),
+                                             preset=request.get("preset",
+                                                                encoder.DEFAULT_PRESET),
+                                             # **`source` resolves HERE and not at the door.**
+                                             # The request surface is validated before the file is
+                                             # opened, so "the codec the source uses" is not
+                                             # answerable there; `probe` has run by now and
+                                             # `source["codec"]` is what it found.
+                                             codec=envelope.resolve_codec(
+                                                 request.get("codec", envelope.DEFAULT_CODEC),
+                                                 source.get("codec")))
         # **The policy the stream consults when a chunk runs out of memory.** Built here because
         # this is where the rung ladder, the request and the source path all exist; consumed
         # inside the stream, which knows how to resume and nothing about rungs.
@@ -1816,6 +1831,13 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # whole job silently includes it, and the B200 pair's whole 17.9-to-21.7 s/frame
             # spread was this number differing by 863 s between two otherwise identical runs.
             "tail_seconds": tail_seconds,
+            # **The encoder's own high-water mark, carried out for the same reason `tail_seconds`
+            # is: it is measured here and banked two functions away.** `phasewatch` reads
+            # `/proc/self`, which is this worker with the model resident, so it can never say what
+            # the ENCODER cost — a different process, not a different sampling strategy. Read off
+            # the writer after its context manager has exited, which is where the drain sampling
+            # finishes; reading it earlier would return the fed part of the encode only.
+            "encoder_peak_rss_gb": getattr(writer_cm, "encoder_peak_rss_gb", None),
             "actual_size": getattr(pipeline.run, "last_output_size", None)}
 
 
