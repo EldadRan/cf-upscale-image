@@ -125,16 +125,44 @@ def derive(params):
             "memory where crf barely does.".format(preset, ", ".join(PRESETS)),
         )
 
+    # ---- head_keyframes --------------------------------------------------------------------
+    # **A strict boolean: `True` or `False` and nothing else.** `"false"` must REFUSE rather than
+    # evaluate true, which is what a truthiness test would do to it — a caller who wrote the word
+    # false and got the behaviour they were switching OFF is the silent-reinterpretation class,
+    # and this is the field where it costs a re-encoded master. `1` and `0` are refused for the
+    # same reason `crf` refuses a bool: the types are not interchangeable just because Python
+    # will compare them.
+    #
+    # **What it does, so the name is never read as what it is FOR.** It makes the first five
+    # frames keyframes (`-force_key_frames expr:lt(n,5)` in `encoder.py`), so that trimming a
+    # frame or two off the START downstream does not force a whole re-encode. **This worker does
+    # not trim anything** — an earlier draft was called `trim_head`, which named the caller's
+    # intent, and a master delivered with all its frames under that name would have been answered
+    # rather than served.
+    head_keyframes = p.get("head_keyframes", False)
+    if not isinstance(head_keyframes, bool):
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'head_keyframes' must be true or false, got {!r}. It makes the first frames "
+            "keyframes so a downstream head trim does not force a re-encode; it does not trim "
+            "anything here.".format(head_keyframes),
+        )
+
     return {
         "codec": codec,
         "crf": crf,
         "preset": preset,
+        "head_keyframes": head_keyframes,
         # **True only when every knob is where release 2 left it.** One boolean answering "could
         # this request have changed production's output" — so `crf 8`, a better picture, breaks it
         # exactly as `h265` does. The field is about movement, not about quality.
+        # **`head_keyframes` counts, and it is the reason the flag is safe.** It changes the
+        # master's bytes when set, so a request naming it has moved production's output and must
+        # not report otherwise. Default off is what makes `codec_default_unmoved` hold.
         "release_2_equivalent": (codec == DEFAULT_CODEC
                                  and crf == encoder.DEFAULT_CRF
-                                 and preset == encoder.DEFAULT_PRESET),
+                                 and preset == encoder.DEFAULT_PRESET
+                                 and head_keyframes is False),
     }
 
 
@@ -182,5 +210,6 @@ def default_off_identity(release_2_params):
     assert cfg["codec"] == DEFAULT_CODEC, "an omitted codec must deliver h264"
     assert cfg["crf"] == encoder.DEFAULT_CRF, "an omitted crf must deliver 12"
     assert cfg["preset"] == encoder.DEFAULT_PRESET, "an omitted preset must deliver medium"
+    assert cfg["head_keyframes"] is False, "an omitted head_keyframes must deliver off"
     assert cfg["release_2_equivalent"] is True
     return True

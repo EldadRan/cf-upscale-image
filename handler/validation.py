@@ -194,6 +194,16 @@ PARAMS_FIELDS = {
     # It moves encoder MEMORY where crf barely does — lookahead, reference frames, threading —
     # which is why the codec measurement holds it fixed at `medium` rather than walking it.
     "preset",
+    # **Keyframes near the START of the master, so a downstream head trim is cheap.** Our masters
+    # carry ONE keyframe — `encoder.py` sets no GOP flag, so x264 and x265 run their 250-frame
+    # default and model output rarely trips a scene cut — which makes trimming even one frame off
+    # the front a full re-encode. Off by default because the cost is per ADDED I-frame and our
+    # masters are the expensive case: measured +11.5% on a smooth clip against +0.5% on one that
+    # already had scene cuts.
+    #
+    # **It does not trim anything.** The name says what the encode does; an earlier draft named
+    # the caller's intent and was ruled out for it.
+    "head_keyframes",
     # **The encoding half of the request, and NOT the top-level `output`.** That one is the R2
     # destination — endpoint, bucket, prefix, credentials. This one carries `codec` and nothing
     # else today. The collision of names is contract §5c's and is safe rather than tidy: the
@@ -654,6 +664,7 @@ def validate(job_input):
         "codec": codec_config["codec"],
         "crf": codec_config["crf"],
         "preset": codec_config["preset"],
+        "head_keyframes": codec_config["head_keyframes"],
         # Banked so a row can say whether the request could have moved production's output at all,
         # without a reader having to compare three values against three defaults themselves.
         "release_2_equivalent": codec_config["release_2_equivalent"],

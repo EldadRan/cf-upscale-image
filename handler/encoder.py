@@ -248,7 +248,8 @@ class MasterWriter:
 
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
-                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=DEFAULT_CODEC):
+                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=DEFAULT_CODEC,
+                 head_keyframes=False):
         self.path = path
         self.width = width
         self.height = height
@@ -273,6 +274,13 @@ class MasterWriter:
         self._crf = crf
         self._preset = preset
         self._codec = codec
+        #: **Off unless the request asked.** There is no module-level default that can turn this
+        #: on and no path to it from anywhere else in the worker: it is a parameter, threaded from
+        #: the derived config, and the flag below is emitted only inside `if self._head_keyframes`.
+        #: `codec_default_unmoved` therefore holds by CONSTRUCTION rather than by a value — the
+        #: gate this wave had to pass is that a request naming none of the knobs still produces
+        #: byte-for-byte what production produces today.
+        self._head_keyframes = head_keyframes
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -315,6 +323,19 @@ class MasterWriter:
         # what arrives here is always one this map holds.
         command += ["-map", "0:v:0", "-c:v", CODEC_LIBRARIES[self._codec],
                     "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+        # **Five keyframes at the head, and nothing else changes.** `expr:lt(n,5)` makes frames
+        # 0-4 I-frames; the encoder's own scene-cut keyframes survive beside them. Without it a
+        # master carries a single keyframe at 0 — no GOP flag is set anywhere in this file, so
+        # x264 and x265 run their 250-frame default and model output rarely trips a scene cut —
+        # and trimming one frame off the FRONT downstream costs a full re-encode. Trimming the
+        # END was never affected and needs nothing.
+        #
+        # **The price is per ADDED I-frame, not per rule**, which is why this is off by default:
+        # +0.52% on a clip that already had six keyframes, +11.53% on one that had a single
+        # keyframe like ours. A twenty-fold spread from the same flag.
+        if self._head_keyframes:
+            command += ["-force_key_frames", "expr:lt(n,5)"]
 
         if carry_audio:
             # `?` makes the mapping optional, so a source whose audio stream vanished between the

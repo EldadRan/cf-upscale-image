@@ -1713,6 +1713,14 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              crf=request.get("crf", encoder.DEFAULT_CRF),
                                              preset=request.get("preset",
                                                                 encoder.DEFAULT_PRESET),
+                                             # **Default False here as well as in `derive`.** Two
+                                             # defaults for one field is a copy — but the copy is
+                                             # `False`, and the failure it guards is a request
+                                             # that somehow reached the writer without passing
+                                             # the surface. The safe value is the one that
+                                             # changes nothing.
+                                             head_keyframes=request.get(
+                                                 "head_keyframes", False),
                                              # Already resolved in `handle`, right after the
                                              # probe — see the comment there for why it cannot
                                              # happen at the door and must not happen here.
