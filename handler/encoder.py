@@ -250,7 +250,7 @@ class MasterWriter:
                  audio_source=None, audio_codec=None, audio_limit_s=None,
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=DEFAULT_CODEC,
                  head_keyframes=False, keyframes="default", keyframe_frames=None,
-                 keyframe_seconds=None, duration_s=None):
+                 keyframe_seconds=None):
         self.path = path
         self.width = width
         self.height = height
@@ -287,9 +287,6 @@ class MasterWriter:
         #: index back to the caller in the terms they sent it.
         self._keyframe_frames = list(keyframe_frames or ())
         self._keyframe_seconds = keyframe_seconds
-        #: The source's duration, for the OUTCOME cap under `seconds`. The door can only count a
-        #: list; how many keyframes an interval produces is a fact about the clip.
-        self._duration_s = duration_s
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -441,15 +438,29 @@ class MasterWriter:
         if self._keyframes == "frames":
             terms += ["eq(n,{})".format(int(f)) for f in self._keyframe_frames]
         elif self._keyframes == "seconds":
-            # **`gte(t,n_forced*N)` rather than converting seconds to frame numbers here, and the
-            # difference is that this cannot use the wrong rate.** The gate's rule was "convert
-            # with the MASTER's rate, not the declared one" — §2c, and a declared rate on a
-            # spliced source puts cut points at times the file does not have. This does no
-            # conversion at all: `t` is the OUTPUT's own presentation time, which is frame index
-            # over the rate this writer was constructed with. **The rate cannot be wrong because
-            # no rate is read.** `n_forced` is ffmpeg's count of keyframes already forced, so the
-            # interval walks the whole clip without anyone needing its length in advance.
-            terms.append("gte(t,n_forced*{:.6f})".format(float(self._keyframe_seconds)))
+            # **FRAME-PERIODIC, converted with THIS WRITER'S OWN RATE — and the first version of
+            # this line was `gte(t,n_forced*N)`, which is wrong under composition.**
+            #
+            # `n_forced` is ffmpeg's count of keyframes the expression has ALREADY forced, the
+            # head's five included. Composed with `head_keyframes` the interval's first threshold
+            # became `5*N` instead of `N`. Witnessed on real ffmpeg, 30 s at 25 fps, N=2:
+            #
+            #     lt(n,5)+gte(t,n_forced*2)  ->  0 .04 .08 .12 .16  10  12 ... 28
+            #                                                       ^^ a 9.84 s hole
+            #     lt(n,5)+eq(mod(n,50),0)    ->  0 .04 .08 .12 .16   2   4 ... 28
+            #
+            # Nothing raised, the master was delivered, and every count stayed plausible. **The
+            # head term and an `n_forced` term cannot share an expression**, because one changes
+            # the other's schedule.
+            #
+            # So the conversion the gate asked for in the first place is the right answer, and my
+            # argument for avoiding it was clever in isolation and broken in composition. It is
+            # safe HERE and only here: `self.fps` is the rate this master is written at, §2c's
+            # measured value, passed at the one call site `rate_cases.py` pins by expression.
+            # Converting anywhere else would read that field a second time; converting here
+            # cannot use a rate the master was not written at.
+            period = max(1, int(round(float(self._keyframe_seconds) * float(self.fps))))
+            terms.append("eq(mod(n,{}),0)".format(period))
 
         if not terms:
             return []

@@ -322,21 +322,30 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # send one today, made as a side effect of a codec wave. The two fields this wave introduced
     # are the two it may refuse; the third keeps the behaviour it has always had, and that
     # asymmetry is deliberate rather than an oversight.
+    # **Every knob that only a video encode can honour.** `keyframes` and `head_keyframes` join
+    # `codec` and `preset` here: `StillWriter` takes none of the four, so a still that named one
+    # would be answered with a PNG that honours nothing — and the end-of-encode keyframe refusal
+    # cannot catch it either, because a `StillWriter` has no `unplaced_keyframes` to ask.
     asked_for_encode = (request.get("codec", envelope.DEFAULT_CODEC) != envelope.DEFAULT_CODEC
                         or request.get("preset", encoder.DEFAULT_PRESET)
-                        != encoder.DEFAULT_PRESET)
+                        != encoder.DEFAULT_PRESET
+                        or request.get("keyframes", envelope.DEFAULT_KEYFRAMES)
+                        != envelope.DEFAULT_KEYFRAMES
+                        or bool(request.get("head_keyframes")))
     if still and asked_for_encode:
         raise WorkerError(
             errors.INVALID_FIELD_VALUE,
-            "'codec' and 'preset' are the master ENCODE's settings and this source is a still, "
+            "'codec', 'preset', 'keyframes' and 'head_keyframes' are the master ENCODE's "
+            "settings and this source is a still, "
             "whose master is a lossless image written with no encoder at all. A request naming "
             "them for an image has been answered rather than served. Omit them, or send a video.",
         )
     # **The OUTCOME cap, here for the same reason `resolve_codec` is: it needs the probe and it
     # must refuse before anything expensive is paid for.** `derive` can count a list; only the
     # clip's duration says how many keyframes an INTERVAL produces.
-    envelope.check_keyframe_cap(request, source.get("duration_s")
-                                or source.get("video_duration_s"))
+    envelope.check_keyframe_cap(request,
+                                source.get("duration_s") or source.get("video_duration_s"),
+                                source.get("fps"))
     resolved_codec = envelope.resolve_codec(
         request.get("codec", envelope.DEFAULT_CODEC), source.get("codec")) if not still else None
 
@@ -1941,12 +1950,22 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
     unplaced = (writer_cm.unplaced_keyframes()
                 if hasattr(writer_cm, "unplaced_keyframes") else [])
     if unplaced:
+        # **Reported from the SAME counter the refusal was decided by.** The check compares against
+        # `writer_cm.frames_written`; formatting the message from `written` — `pipeline.run`'s
+        # return — would tell a caller the last legal index against a quantity the decision never
+        # used. They are expected to agree, and the message is the only thing a caller gets back
+        # for a whole job's spend, so it is not the place to find out they do not.
+        encoded = writer_cm.frames_written
+        # **No "last legal index" when there is none.** `max(encoded - 1, 0)` would tell a caller
+        # that index 0 is legal on a clip that encoded nothing at all.
+        last = ("frames are numbered from 0, so the last one is {}".format(encoded - 1)
+                if encoded else "this clip encoded nothing, so no frame number is legal")
         raise WorkerError(
             errors.INVALID_FIELD_VALUE,
             "keyframes requested at frame {} but this clip encoded {} frames, so they could not "
-            "be placed. Frames are numbered from 0, so the last one is {}. Nothing was delivered: "
-            "a master whose cut points are not where the request put them is worse than no "
-            "master.".format(", ".join(str(f) for f in unplaced), written, max(written - 1, 0)),
+            "be placed — {}. Nothing was delivered: a master whose cut points are not where the "
+            "request put them is worse than no master.".format(
+                ", ".join(str(f) for f in unplaced), encoded, last),
         )
 
     return {"decoded_in": written, "written_out": written,
@@ -1964,7 +1983,6 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # the writer after its context manager has exited, which is where the drain sampling
             # finishes; reading it earlier would return the fed part of the encode only.
             "encoder_peak_rss_gb": getattr(writer_cm, "encoder_peak_rss_gb", None),
-            "unplaced_keyframes": unplaced,
             "actual_size": getattr(pipeline.run, "last_output_size", None)}
 
 

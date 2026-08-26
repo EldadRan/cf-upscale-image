@@ -247,31 +247,51 @@ def derive(params):
     }
 
 
-def check_keyframe_cap(config, duration_s):
+def check_keyframe_cap(config, duration_s, fps):
     """The OUTCOME cap under `seconds`, which the request surface cannot see.
 
-    `derive` counts a list; it cannot count what an INTERVAL produces, because that is a fact
-    about the clip rather than the request. One keyframe every 0.1 s is four on a short clip and
-    six hundred on a minute — the same request, two different files.
+    `derive` counts a list; it cannot count what an INTERVAL produces, because that is a fact about
+    the clip rather than the request. One keyframe every 0.1 s is four on a short clip and six
+    hundred on a minute — the same request, two different files.
 
-    **Checked right after the probe and before any expensive work**, so a request that cannot be
-    served does not pay for a download, a decode and a plan first. Refuses rather than clamps, per
-    CF: a caller who asked for an interval this dense has most likely made an input error, and
-    quietly delivering a hundred keyframes instead of six hundred is the file they did not ask for
-    reported as a success.
+    **Counted in FRAMES, with the same arithmetic `MasterWriter` uses to place them.** The writer
+    emits `eq(mod(n,K),0)` with `K = round(interval * fps)`, so the cap counts `ceil(frames / K)`.
+    Counting in seconds instead was off by one at exact multiples — a 100 s clip at one per second
+    computed 101 and refused a request that places exactly 100. **A cap and a placement that
+    disagree can pass a request and then produce a different number of keyframes**, which is the
+    one thing this pair must never do.
+
+    **A source that declares no usable duration or rate is REFUSED rather than waved through.**
+    `handler.py:363`'s own guard — `if source["duration_s"] and source["fps"]` — is the file
+    admitting both can be falsy on a real video. Waved through, `keyframe_seconds: 0.001` on such a
+    source is all-intra at all-intra's price, delivered as a success: the cap would be exercised
+    only from the direction where the metadata is present and absent from the direction where it
+    is not. Refusing says which fact is missing, and CF's rule is refuse rather than guess.
     """
-    if config.get("keyframes") != "seconds" or not duration_s:
+    if config.get("keyframes") != "seconds":
         return
-    interval = float(config["keyframe_seconds"])
-    # One at t=0 and one at every interval boundary the clip actually reaches.
-    count = int(float(duration_s) // interval) + 1
+    interval = float(config.get("keyframe_seconds") or 0)
+    if interval <= 0:
+        return
+    if not duration_s or not fps:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "keyframes: 'seconds' needs the source's duration and frame rate to check the "
+            "{}-keyframe limit, and this source declares {}. Name the cut points with "
+            "keyframes: 'frames' instead, which needs neither.".format(
+                MAX_KEYFRAMES,
+                "no duration" if not duration_s else "no frame rate"),
+        )
+    period = max(1, int(round(interval * float(fps))))
+    frames = max(1, int(round(float(duration_s) * float(fps))))
+    count = -(-frames // period)          # ceil, and the placement's own arithmetic
     if count > MAX_KEYFRAMES:
         raise WorkerError(
             INVALID_FIELD_VALUE,
-            "keyframe_seconds {} over {:.3f}s of source would force {} keyframes; the limit is "
-            "{}. That is all-intra at all-intra's price — ask for keyframes: 'all' if that is "
+            "keyframe_seconds {} over {:.3f}s at {:.3f} fps would force {} keyframes; the limit "
+            "is {}. That is all-intra at all-intra's price — ask for keyframes: 'all' if that is "
             "what you want, or a longer interval.".format(
-                interval, float(duration_s), count, MAX_KEYFRAMES),
+                interval, float(duration_s), float(fps), count, MAX_KEYFRAMES),
         )
 
 
