@@ -210,11 +210,26 @@ def derive(params):
         frames = sorted(frames)
 
     if mode == "seconds":
-        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+        # **A WHOLE NUMBER OF SECONDS, 1 AND UP — CF, 2026-08-27. The ruling removes a case rather
+        # than handling one.** A float was accepted until then, and it admitted an interval
+        # shorter than a frame: `0.01` at 24 fps is 0.24 frames, rounding to a period of zero,
+        # which `MasterWriter` clamped to 1 and delivered EVERY FRAME KEYFRAMED — the most
+        # expensive file the encoder can make, from a request that was almost certainly a typo,
+        # reported as a success. **Measured, not reasoned: job ca9e7798 came back 90 of 90.**
+        #
+        # **And the clamp was never the whole of it.** `0.1` at 24 fps rounds to period 2 and
+        # keyframes every OTHER frame — near all-intra at a price nobody quoted, and nowhere near
+        # the degenerate value that reached `max(1, ...)`. The floor closes the whole sub-second
+        # band rather than the one value that was tested.
+        #
+        # `bool` first: `True == 1` in Python and would silently mean one second.
+        if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 1:
             raise WorkerError(
                 INVALID_FIELD_VALUE,
-                "keyframes: 'seconds' needs 'keyframe_seconds', a positive number of seconds "
-                "between keyframes")
+                "keyframes: 'seconds' needs 'keyframe_seconds' as a whole number of seconds from "
+                "1; got {!r}. A sub-second interval is all-intra at all-intra's price — "
+                "keyframes: 'all' is how to ask for every frame, in words, having read what it "
+                "costs.".format(seconds))
 
     # **TWO RULES THIS DOOR CANNOT CHECK, and they are the worker's** — both need the probe or the
     # encode, and both are implemented in `encoder.py` rather than here:
@@ -282,8 +297,31 @@ def check_keyframe_cap(config, duration_s, fps):
                 MAX_KEYFRAMES,
                 "no duration" if not duration_s else "no frame rate"),
         )
+    # `max(1, ...)` is now UNREACHABLE through the door — `derive` refuses anything below one
+    # whole second, so the smallest period this can compute is `round(1 * fps)`. **Left in
+    # deliberately**, exactly like the literal `False` at the writer: it guards a value that can
+    # no longer arrive, and removing a guard because the current door excludes its case is how the
+    # next door change becomes expensive.
     period = max(1, int(round(interval * float(fps))))
     frames = max(1, int(round(float(duration_s) * float(fps))))
+
+    # **AN INTERVAL AT LEAST AS LONG AS THE CLIP PLACES ONE KEYFRAME — WHICH IS WHAT `default`
+    # PLACES.** 44 s on an 8 s file, or 8 s on an 8 s file, both put a single keyframe at frame 0
+    # and nothing else. A caller who asked for a cut every 44 s and received none has a file they
+    # believe is cuttable and is not: **the same failed product as an out-of-range frame, from the
+    # other direction, and costing nothing to detect.**
+    #
+    # `period >= frames` is exact rather than a judgement about what "too long" means, and it
+    # settles the boundary without a second rule — an interval EQUAL to the duration also places
+    # one, and refuses for the same reason.
+    if period >= frames:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "keyframe_seconds {} over {:.3f}s at {:.3f} fps would place a single keyframe at "
+            "frame 0, which is what keyframes: 'default' already does. Ask for an interval "
+            "shorter than the clip, or omit the field.".format(
+                interval, float(duration_s), float(fps)))
+
     count = -(-frames // period)          # ceil, and the placement's own arithmetic
     if count > MAX_KEYFRAMES:
         raise WorkerError(
