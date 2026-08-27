@@ -200,7 +200,7 @@ RUN set -eux; \
 
 # **The weights are in the image, so nothing re-proves it at runtime** (F-2026-08-19-31). The
 # vendored `download_weight()` validates an existing model file against a size+mtime cache and,
-# on a miss, reads all 16.4 GiB of it through SHA256 — and our cache is never seeded, because the
+# on a miss, reads all 15.35 GB of it through SHA256 — and our cache is never seeded, because the
 # bake above goes through `hf_hub_download` on purpose. Every fresh worker therefore paid that
 # read on its first job: seconds on a materialized NVMe host, **6m06s and 12m29s measured** on
 # hosts that stream layers lazily, in silence, before any frame was touched. `vendor_patch.py`

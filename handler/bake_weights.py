@@ -73,7 +73,17 @@ dit_file = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
 os.makedirs(model_dir, exist_ok=True)
 
 total = 0.0
-for filename in (dit_file, VAE_FILE):
+# **De-duplicated, because `--build-arg SEEDVR2_MODEL=ema_vae_fp16.safetensors` makes these one
+# file.** `dit_file` is whatever the build-arg names and `VAE_FILE` is a constant, so the two can
+# be the same string — and the tuple then iterated it twice. `hf_hub_download` short-circuits on
+# the second pass, so nothing was fetched twice and nothing failed: **only `total` was wrong, too
+# large by one file, in the number CF reads for cold-start and container-disk cost.** It failed in
+# the direction that does not announce itself.
+#
+# Written out rather than `dict.fromkeys((dit_file, VAE_FILE))`, which is shorter and hides why a
+# collision is possible at all. The reader needs to see the cause, not just the guard.
+files = (dit_file,) if dit_file == VAE_FILE else (dit_file, VAE_FILE)
+for filename in files:
     path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir,
                            revision=REVISION)
     size = os.path.getsize(path)
