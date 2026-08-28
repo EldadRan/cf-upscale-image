@@ -37,21 +37,33 @@ import planner
 MANIFEST_VERSION = 1
 
 
-def build(request, result, hardware, attempts, worker_version, model_build, job=None,
-          build_identity=None):
+def build(request, result, hardware, attempts, job=None, build_identity=None):
     """The manifest body. Carries what the response envelope carries, plus the identity a
     recovered request needs to know what it is looking at."""
     body = {
         "manifest_version": MANIFEST_VERSION,
         "request_id": request["request_id"],
-        "worker_version": worker_version,
-        "model_build": model_build,
+        # **The date CF partitioned this job's prefix by** (storage.md §1, CF 2026-08-28).
+        # Recorded because the manifest is the recovery path and the prefix is not recoverable
+        # from the artefacts themselves: a file that has left its directory carries its id in
+        # the name and nothing about which day's partition it came from.
+        "request_date": request.get("request_date"),
+        # **`worker_version` and `model_build` came OUT of the top level here** (CF, 2026-08-28).
+        # They were never removed from the record — `build` below carries both, as
+        # `build.worker_version` and `build.model`, and it always did. What they were at the top
+        # level was a second copy of a fact with a home, which is the shape that rots: two
+        # places to update and only one that anybody does.
+        #
         # **Which image produced this, beside the two fields that only half-answered it.**
-        # `worker_version` and `model_build` say what code and what checkpoint, and both were
-        # already here; neither says which build, and a VRAM measurement is a measurement of a
-        # build. Recorded here rather than in the response envelope because the envelope is CF's
-        # contract and a field CF can see is a field CF may come to depend on — this is identity
-        # for whoever reads the artefacts later, which is exactly what a manifest is for.
+        # `worker_version` and `model_build` say what code and what checkpoint; neither says
+        # which build, and a VRAM measurement is a measurement of a build. Recorded here rather
+        # than in the response envelope because the envelope is CF's contract and a field CF can
+        # see is a field CF may come to depend on — this is identity for whoever reads the
+        # artefacts later, which is exactly what a manifest is for.
+        #
+        # **They stay in the embedded identity tags and in the diagnostics records** (storage.md
+        # §6): `cf_worker_version` and `cf_model_build` are stamped inside every delivered master
+        # and are the only provenance that outlives the 90-day buckets, weak as they are.
         "build": build_identity or {},
         # **The constants that planned this run, beside the build that carried them.** A
         # measurement is only meaningful against the numbers that produced it, and CF compares

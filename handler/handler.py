@@ -742,7 +742,10 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # id per job and wants the file called by it. The stem is theirs, the extension is ours, and
     # an absent field lands on `master.mp4` / `master.png` exactly as before — so this line is a
     # no-op for every request written before the field existed.
-    master = keys.master_name(still, out_w, out_h, name=request["output"].get("name"))
+    # **`output.name` is retired** (storage.md §4, CF 2026-08-28). It let a caller choose the
+    # master's stem, for a need `request_id` now serves better and serves for every artefact
+    # rather than for one.
+    master = keys.master_name(request["request_id"], still, out_w, out_h)
     master_path = os.path.join(workdir, master)
     result = _upscale_with_retry(cli, request, source, source_path, master_path, plan,
                                  rationale, machine, attempts, progress, estimated_frames,
@@ -803,6 +806,7 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         try:
             entries = derives.build(request["derive"], master_path, source_path, workdir,
                                     frame_count=result["written_out"], scale=scale,
+                                    request_id=request["request_id"],
                                     warn=warnings.append)
         except Exception as exc:  # noqa: BLE001 — a derive must never lose a written master
             # **A failed derive leaves the master intact and recoverable**, so it is reported
@@ -875,15 +879,18 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         },
         "warnings": warnings,
     }
-    manifest_body = manifest_module.build(request, body, machine, attempts,
-                                          WORKER_VERSION, MODEL_BUILD, job=job,
+    # **`WORKER_VERSION` and `MODEL_BUILD` are no longer passed** (CF, 2026-08-28): they came out
+    # of the manifest's top level, and `build_identity()` already carries both. Passing them here
+    # would be handing the function a fact it has a better source for.
+    manifest_body = manifest_module.build(request, body, machine, attempts, job=job,
                                           build_identity=build_identity())
-    manifest_path = os.path.join(workdir, keys.MANIFEST)
+    manifest_name = keys.manifest_name(request["request_id"])
+    manifest_path = os.path.join(workdir, manifest_name)
     with open(manifest_path, "w") as handle:
         handle.write(manifest_module.serialise(manifest_body))
-    manifest_key = storage.upload(client, request["output"], keys.MANIFEST, manifest_path,
-                                  keys.content_type(keys.MANIFEST))
-    artefacts.append(keys.MANIFEST)
+    manifest_key = storage.upload(client, request["output"], manifest_name, manifest_path,
+                                  keys.content_type(manifest_name))
+    artefacts.append(manifest_name)
 
     # A job that retried is worth a diagnostics bundle even though it succeeded: it holds both
     # the estimate that was wrong and the configuration that worked.

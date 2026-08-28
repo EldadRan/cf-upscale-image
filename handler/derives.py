@@ -36,7 +36,8 @@ def poster_frame_index(at_fraction, frame_count):
     return int(round(at_fraction * max(0, frame_count - 1)))
 
 
-def build(spec, master_path, source_path, workdir, frame_count, scale, warn=None):
+def build(spec, master_path, source_path, workdir, frame_count, scale, request_id,
+          warn=None):
     """Produce every requested role. Returns a list of entries, one per artefact written.
 
     Each entry carries the local `path` and the fields CF's `derived[]` needs; the caller
@@ -59,11 +60,12 @@ def build(spec, master_path, source_path, workdir, frame_count, scale, warn=None
         role = item["role"]
         try:
             if role == "poster":
-                entries.append(_poster(item, master_path, workdir, frame_count))
+                entries.append(_poster(item, master_path, workdir, frame_count, request_id))
             elif role == "proxy":
-                entries.append(_proxy(item, master_path, workdir))
+                entries.append(_proxy(item, master_path, workdir, request_id))
             elif role == "crop":
                 entries.extend(_crops(item, master_path, source_path, workdir, frame_count, scale,
+                                      request_id,
                                       warn=warn))
         except Exception as exc:  # noqa: BLE001 — the master outranks every derive, see above
             if warn is not None:
@@ -72,7 +74,7 @@ def build(spec, master_path, source_path, workdir, frame_count, scale, warn=None
     return entries
 
 
-def _poster(item, master_path, workdir, frame_count):
+def _poster(item, master_path, workdir, frame_count, request_id):
     """The display role. **Lossy WebP, and that is CF's requirement rather than a choice here.**
 
     Handoff §4 names it: "poster — round(at_fraction x (frame_count - 1)) of the file this call
@@ -90,7 +92,7 @@ def _poster(item, master_path, workdir, frame_count):
     far. The still master is ours to decide; this is not. Contrast `_crops`, where CF required the
     opposite for a stated reason.
     """
-    name = keys.DERIVE["poster"]
+    name = keys.for_role(request_id, "poster")
     path = os.path.join(workdir, name)
     index = poster_frame_index(item.get("at_fraction", 0.25), frame_count)
     encoder.extract_poster(master_path, path, index, fps=None)
@@ -102,8 +104,8 @@ def _poster(item, master_path, workdir, frame_count):
     }
 
 
-def _proxy(item, master_path, workdir):
-    name = keys.DERIVE["proxy"]
+def _proxy(item, master_path, workdir, request_id):
+    name = keys.for_role(request_id, "proxy")
     path = os.path.join(workdir, name)
     encoder.encode_proxy(master_path, path, max_duration_s=item.get("max_duration_s"))
     return {
@@ -113,7 +115,8 @@ def _proxy(item, master_path, workdir):
     }
 
 
-def _crops(item, master_path, source_path, workdir, frame_count, scale, warn=None):
+def _crops(item, master_path, source_path, workdir, frame_count, scale, request_id,
+           warn=None):
     """The evidence role. One file per crop, source beside output, lossless.
 
     **Lossless because CF required it, and for a reason worth keeping** (2026-08-15): "poster is a
@@ -159,7 +162,7 @@ def _crops(item, master_path, source_path, workdir, frame_count, scale, warn=Non
     entries = []
     for ordinal, region in enumerate(regions):
         pair, coordinates = crops.render_pair(source_rgb, output_rgb, region, scale)
-        name = keys.crop_name(ordinal)
+        name = keys.crop_name(request_id, ordinal)
         path = os.path.join(workdir, name)
         crops.write_lossless_webp(pair, path)
         entries.append({

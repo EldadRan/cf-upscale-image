@@ -143,38 +143,17 @@ def host_total_gb():
 
 
 def cpu_count():
-    """Cores this container may actually use.
+    """Cores this container may actually use. **Delegates to `hardware.cpu_count`.**
 
-    **`sched_getaffinity`, not `cpu_count`.** The second reports the machine's cores and the
-    first reports the ones this process is allowed on, and a container pinned to a fraction of a
-    large host is exactly the case worth knowing about: the phase-4 tail runs at one core's worth
-    while thirty sit idle, and the first question that investigation has to answer is how many
-    cores there were to be idle. Printed at boot so every log carries the answer without anyone
-    having to have thought to ask.
+    The reasoning and the reading both moved there on 2026-08-28, when `hardware.read()` began
+    reporting the core counts per JOB rather than per attempt: `hardware` is the module this one
+    already imports lazily to keep the cycle absent, so it is the only one of the two that can
+    hold the single copy. This name stays because the boot banner and the per-attempt block both
+    call it, and a second spelling of one number is how the pair drifts.
     """
-    counts = []
-    try:
-        import os as _os
-        counts.append(len(_os.sched_getaffinity(0)))
-    except Exception:  # noqa: BLE001
-        try:
-            import os as _os
-            counts.append(_os.cpu_count())
-        except Exception:  # noqa: BLE001
-            pass
-    # **And the quota, which affinity cannot see** (F-2026-08-19-37). A container pinned by mask
-    # is visible to `sched_getaffinity`; one throttled by `cpu.max` sees every CPU in its mask and
-    # is simply stopped when its slice is spent. Independent mechanisms, so the usable figure is
-    # the smaller — and this worker is allocated 24 vCPUs of a 128-core host.
-    try:
-        import hardware  # noqa: PLC0415 — stdlib-only
-        quota = hardware.cpu_quota()
-        if quota:
-            counts.append(int(max(1, quota)))
-    except Exception:  # noqa: BLE001
-        pass
-    counts = [c for c in counts if c]
-    return min(counts) if counts else None
+    import hardware  # noqa: PLC0415 — stdlib-only; the one choke point for this number
+
+    return hardware.cpu_count()
 
 
 #: The environment variable the image bakes its commit into. Named here rather than spelled into
@@ -248,20 +227,11 @@ def _is_a_refusal(exc):
 
 
 def _affinity_cores():
-    """Cores in this process's mask, before any quota is applied. Reported beside the quota
-    because they answer different questions and this project has already been bitten by
-    conflating them (F-2026-08-19-37)."""
-    try:
-        import os as _os  # noqa: PLC0415
+    """Cores in this process's mask. **Delegates to `hardware._affinity_cores`** — see
+    `cpu_count` above for why the pair lives there now."""
+    import hardware  # noqa: PLC0415 — stdlib-only
 
-        return len(_os.sched_getaffinity(0))
-    except Exception:  # noqa: BLE001
-        try:
-            import os as _os  # noqa: PLC0415
-
-            return _os.cpu_count()
-        except Exception:  # noqa: BLE001
-            return None
+    return hardware._affinity_cores()
 
 
 def cpu_configuration():

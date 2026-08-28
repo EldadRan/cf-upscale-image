@@ -389,6 +389,171 @@ def read(workdir="/"):
         "host_memory_breakdown_gb": {k: _round(v)
                                      for k, v in sorted(memory_breakdown_gb().items())} or None,
         "free_disk_gb": _round(_free_disk_gb(workdir)),
+        # **MOVED UP from the attempt's `cpu` block** (CF, 2026-08-28). Both are per-JOB facts:
+        # the mask a process may run on and the cores visible to it do not change between
+        # attempts, so recording them per attempt put a constant in a varying record and left
+        # the snapshot -- which is what the manifest, the response and every bundle carry --
+        # unable to say how many cores the job had. `phasewatch` still reports them per attempt;
+        # this is the copy a reader finds first.
+        "usable_cores": cpu_count(),
+        "affinity_cores": _affinity_cores(),
+        # **WHICH cpu, not how many.** See `_cpu_model`.
+        "cpu_model": _cpu_model(),
+        # **The versions that actually ran**, rather than what the Dockerfile pinned: a wheel
+        # resolved at build time and a wheel imported at run time are not the same claim, and a
+        # measurement is a measurement of the stack that produced it.
+        "libraries": _library_versions(),
+        # The one-shot GPU telemetry. See `_gpu_topology` for why these and not current clocks.
+        "gpu_topology": _gpu_topology(),
+    }
+
+
+def _affinity_cores():
+    """Cores in this process's mask, before any quota is applied. `None` if unreadable.
+
+    Reported beside the quota because they answer different questions and this project has
+    already been bitten by conflating them (F-2026-08-19-37).
+
+    **Lives here rather than in `phasewatch`**, which is where it was written: `phasewatch`
+    imports this module lazily to keep the cycle absent, so the dependency only runs one way and
+    the lower-level module is the only one that can be the single home. `phasewatch` delegates.
+    """
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:  # noqa: BLE001
+        try:
+            return os.cpu_count()
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def cpu_count():
+    """Cores this container may actually use — the smaller of the mask and the quota.
+
+    **`sched_getaffinity`, not `cpu_count`.** The second reports the machine's cores and the
+    first reports the ones this process is allowed on, and a container pinned to a fraction of a
+    large host is exactly the case worth knowing about: the phase-4 tail runs at one core's worth
+    while thirty sit idle, and the first question that investigation has to answer is how many
+    cores there were to be idle.
+
+    **And the quota, which affinity cannot see** (F-2026-08-19-37). A container pinned by mask is
+    visible to `sched_getaffinity`; one throttled by `cpu.max` sees every CPU in its mask and is
+    simply stopped when its slice is spent. Independent mechanisms, so the usable figure is the
+    smaller.
+    """
+    counts = [_affinity_cores()]
+    try:
+        quota = cpu_quota()
+        if quota:
+            counts.append(int(max(1, quota)))
+    except Exception:  # noqa: BLE001
+        pass
+    counts = [c for c in counts if c]
+    return min(counts) if counts else None
+
+
+#: **The sentinel for "we looked and could not read it".** Distinct from `None`, which this
+#: module already uses for "the mechanism does not apply here" — an unquotaed container's
+#: `cpu_quota`, a machine with no cgroup. The gate's posture for telemetry was explicit: an
+#: absent value must be distinguishable from a value we looked for under the wrong name, and two
+#: nulls with different meanings are exactly the ambiguity that makes a corpus unanalysable.
+UNREADABLE = "unreadable"
+
+
+def _cpu_model(root="/"):
+    """The CPU's marketing name from `/proc/cpuinfo`, or `UNREADABLE`.
+
+    **Named rather than counted.** Cores are already recorded twice over; what no field carried
+    was WHICH cpu, and the two runs that differ 21.6 against 40.7 s/frame on one worker id are
+    the reason it matters -- a shared-tenancy neighbour is invisible, but a different host
+    generation is not.
+    """
+    try:
+        with open(os.path.join(root, "proc/cpuinfo")) as handle:
+            for line in handle:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip() or UNREADABLE
+    except Exception:  # noqa: BLE001 — telemetry must never fail a job
+        return UNREADABLE
+    return UNREADABLE
+
+
+def _library_versions():
+    """`{torch, numpy, opencv}` — each a version string, `None` if absent, `UNREADABLE` on error.
+
+    **Absent is a real state and is not an error.** Rung 1 runs in CI with no torch at all, so
+    `None` there is the honest answer; `UNREADABLE` means the import raised for some other
+    reason, which is a different fact and one somebody would want to see.
+    """
+    versions = {}
+    for key, module in (("torch", "torch"), ("numpy", "numpy"), ("opencv", "cv2")):
+        try:
+            versions[key] = __import__(module).__version__
+        except ImportError:
+            versions[key] = None
+        except Exception:  # noqa: BLE001
+            versions[key] = UNREADABLE
+    return versions
+
+
+def _smi(query):
+    """One `nvidia-smi --query-gpu` field for device 0, or `UNREADABLE`. **Never raises.**
+
+    **Shelled out rather than read through torch**, because none of these is exposed there:
+    torch reports what the allocator sees, and link topology and clock ceilings are properties
+    of the machine rather than of the process. Bounded by a short timeout so a wedged smi cannot
+    hold a job -- the whole block is telemetry and a job must not wait on it.
+    """
+    try:
+        import subprocess  # noqa: PLC0415
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=" + query, "--format=csv,noheader,nounits", "-i", "0"],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return UNREADABLE
+        value = (out.stdout or "").strip().splitlines()
+        return (value[0].strip() or UNREADABLE) if value else UNREADABLE
+    except Exception:  # noqa: BLE001 — no smi, no GPU, a timeout: all telemetry, none fatal
+        return UNREADABLE
+
+
+def _gpu_topology():
+    """**The one-shot half of the GPU telemetry** (CF, 2026-08-28): what is STABLE for the life
+    of the container -- link topology, clock ceilings, and which physical machine this is.
+
+    **Why these and not current clocks.** Two runs at 13,608,000 px, window 1, same tiling, same
+    worker id, same datacentre, same core count, same image measured 21.6 and 40.7 s/frame --
+    encode x2.41, decode x2.40, sampling x1.62, postprocess x0.83, with CPU work flat. The
+    bandwidth-bound phases were hit hardest, which points at shared-tenancy memory bandwidth or
+    PCIe link degradation rather than at the host CPU or thermals. A DEGRADED LINK SHOWS UP HERE:
+    a card negotiated at x8 gen3 when the machine offers x16 gen5 is visible in a single read.
+
+    **The volatile half is deliberately NOT here.** Current clocks and throttle reasons are
+    sampled at phase boundaries in a separate wave item, because a read at `hardware.read()` time
+    samples the machine before the model has touched it -- the moment least likely to show the
+    degradation this is hunting. Ruled by the gate, 2026-08-28, and folding it in here would
+    answer a different question from the one the two runs pose.
+
+    Every value is `UNREADABLE` rather than absent when the read fails, so a machine with no
+    `nvidia-smi` is distinguishable from a field nobody populated.
+    """
+    return {
+        # Current AND max, because the pair is the finding: either alone says nothing about
+        # whether the link is degraded.
+        "pcie_link_width_current": _smi("pcie.link.width.current"),
+        "pcie_link_width_max": _smi("pcie.link.width.max"),
+        "pcie_link_gen_current": _smi("pcie.link.gen.current"),
+        "pcie_link_gen_max": _smi("pcie.link.gen.max"),
+        # The ceilings, which are stable. What the card is CURRENTLY clocked at belongs to the
+        # sampled series and is not read here.
+        "clock_max_sm_mhz": _smi("clocks.max.sm"),
+        "clock_max_mem_mhz": _smi("clocks.max.memory"),
+        # **Beyond RUNPOD_POD_ID, which names the worker and not the machine.** Two runs on one
+        # worker id landed on hosts that behaved 1.9x apart; the GPU's own serial and UUID are
+        # the only identifiers here that follow the silicon.
+        "gpu_serial": _smi("serial"),
+        "gpu_uuid": _smi("uuid"),
+        "host_id": os.environ.get("RUNPOD_POD_HOSTNAME") or UNREADABLE,
     }
 
 

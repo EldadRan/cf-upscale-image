@@ -44,6 +44,10 @@ from errors import (
 # than a contract field.
 TOP_LEVEL_FIELDS = {
     "request_id",
+    # **Required, and top level rather than in `params`** (api.md §1/§3b, storage.md §2, CF
+    # 2026-08-28). It builds the storage prefix, which changes WHERE the output goes and not
+    # what it looks like — the same argument that puts `execution_timeout_ms` here.
+    "request_date",
     "source_url",
     "output",
     "diagnostics",
@@ -154,7 +158,7 @@ TOP_LEVEL_FIELDS = {
     "plan_only",
 }
 
-REQUIRED_TOP_LEVEL = ("request_id", "source_url", "output", "params")
+REQUIRED_TOP_LEVEL = ("request_id", "request_date", "source_url", "output", "params")
 
 #: **The calibration levers, which are ours and not CF's** (api.md section 5, CF 2026-08-28).
 #:
@@ -324,16 +328,116 @@ CROP_COUNT_MAX = 8
 DERIVE_FIELDS = {f for fs in DERIVE_FIELDS_BY_ROLE.values() for f in fs}
 
 OUTPUT_FIELDS_REQUIRED = ("endpoint", "bucket", "prefix", "access_key_id", "secret_access_key")
-#: `name` is the caller's stem for the master (F-2026-08-19-38) — optional, and absent is a
-#: supported state that delivers today's names byte-for-byte. It is validated only as a string
-#: here; what makes it safe to use as a key segment is `keys.sanitize_stem`, which is where the
-#: rule belongs because it is the module that owns what a name may be.
-OUTPUT_FIELDS_OPTIONAL = ("session_token", "name")
+#: **`name` is RETIRED** (storage.md §4, CF 2026-08-28). It was the caller's stem for the master
+#: (F-2026-08-19-38), for a need `request_id` now serves better and serves for every artefact
+#: rather than for one — every key is `<request_id>_<role>.<ext>`, so the identity travels with
+#: the file instead of living only in the prefix.
+#:
+#: **Retired means REFUSED BY NAME, not ignored.** It stays in `KNOWN_FIELD_NAMES` by virtue of
+#: this comment naming it nowhere — so it is now an unknown name inside `output`, and
+#: `_refuse_unknown` on that object refuses unknown names whether the contract knows them or not.
+#: A caller still sending it is told, rather than having their chosen stem silently dropped and
+#: getting a master under a name they did not pick.
+OUTPUT_FIELDS_OPTIONAL = ("session_token",)
 
 # Every field name the contract defines, anywhere. A name in here, offered somewhere it is not
 # accepted, is refused; a name outside it is metadata at the top level and ignored.
 KNOWN_FIELD_NAMES = set(TOP_LEVEL_FIELDS) | set(PARAMS_FIELDS) | set(DERIVE_FIELDS) \
     | set(OUTPUT_FIELDS_REQUIRED) | set(OUTPUT_FIELDS_OPTIONAL)
+
+
+#: **S3's "characters to avoid"** (api.md §3a). Handling is not consistent across applications
+#: and these files are served to browsers. `/` and `\\` are separate below because they form or
+#: escape a directory rather than merely being awkward.
+_AVOID = set('{}^%`]">[~<#|')
+
+#: **The maximum, in BYTES rather than characters.** R2's key limit is 1 024 bytes INCLUDING the
+#: prefix, and `YYYY/MM/DD/<request_id>/<request_id>_master.mp4` spends the id twice — so the
+#: ceiling here is generous against the real budget rather than against the raw limit.
+MAX_REQUEST_ID_BYTES = 256
+
+
+def _validated_request_id(value):
+    """`request_id`, checked because it becomes part of every key. **REFUSED, never sanitized.**
+
+    A cleaned id gives CF a key it did not choose, and CF must be able to predict every key from
+    the id alone — which is the whole reason `keys.py` exists. This is the opposite decision from
+    the retired `output.name`, and deliberately: a stem was optional and cosmetic, so subtracting
+    from it and carrying on was the right trade; an id is load-bearing and mangling it silently
+    produces an artefact nobody can find.
+
+    **A validity test, not a format test** (CF, 2026-08-28). Ids are UUIDv7 today, so none of this
+    fires; the check exists for the day something else mints them. A format check would have to be
+    amended every time CF changes generator; a validity check never does.
+
+    **Accepted: everything else, including S3's "needs special handling" group** — `& $ @ = ; : +
+    , ?` and space. Those are legal keys that need URL encoding, which the SDK does. Refusing
+    legal work over a handling note is the wrong trade.
+    """
+    request_id = _as_str(value, "request_id")
+    if not request_id.strip():
+        raise WorkerError(INVALID_FIELD_VALUE, "field 'request_id' must not be empty")
+
+    def refuse(why):
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'request_id' {} — it becomes part of every key this job writes, and is "
+            "refused rather than cleaned so that every key stays predictable from the id "
+            "alone".format(why))
+
+    # Ordered cheapest and most specific first, so the message names the actual problem rather
+    # than whichever rule happens to be checked first.
+    if "/" in request_id or "\\" in request_id:
+        refuse("contains a path separator, which would form or escape a directory")
+    for char in request_id:
+        if char < " " or char == "\x7f":
+            refuse("contains a control character, and a key nobody can print is a key nobody "
+                   "can ask about")
+        if ord(char) > 126:
+            refuse("contains a byte outside printable ASCII ({!r}), whose handling is not "
+                   "consistent across the applications these files are served to".format(char))
+        if char in _AVOID:
+            refuse("contains {!r}, one of S3's characters to avoid".format(char))
+    if request_id[0] in ". " or request_id[-1] in ". ":
+        refuse("begins or ends with a dot or a space — a leading dot is a hidden file, and a "
+               "trailing dot is stripped by S3's own console on download")
+    if len(request_id.encode("utf-8")) > MAX_REQUEST_ID_BYTES:
+        refuse("is longer than {} bytes".format(MAX_REQUEST_ID_BYTES))
+    return request_id
+
+
+def _validated_request_date(value):
+    """`request_date`, which builds the storage prefix. **Shape only — no range check.**
+
+    `YYYY-MM-DD` and nothing else: no timestamps, no `2026-8-5`. A date that parses is honoured
+    as sent; whether it is plausible is CF's business and not this worker's (api.md §3b).
+
+    **The date is CF's and it must be** (storage.md §2). A job submitted at 23:59 and started at
+    00:01 would otherwise land in the next day's directory, and CF — which knows only the submit
+    date — would look in the wrong place. The key has to be derivable by CF without asking
+    anyone, and a worker's clock is not something CF can derive.
+
+    **The worker does not build the prefix from it.** CF sends `output.prefix` already formed as
+    `YYYY/MM/DD/<request_id>/`; this field is required so that the value CF built it from is on
+    the record, and refused for shape so a malformed one is caught at the door rather than
+    inferred from a key later.
+    """
+    if value is None:
+        raise WorkerError(
+            MISSING_REQUIRED_FIELD,
+            "field 'request_date' is required at the top level of 'input'")
+    date = _as_str(value, "request_date")
+    if len(date) != 10 or date[4] != "-" or date[7] != "-" \
+            or not (date[:4].isdigit() and date[5:7].isdigit() and date[8:].isdigit()):
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'request_date' must be exactly YYYY-MM-DD, got {!r}".format(date))
+    month, day = int(date[5:7]), int(date[8:])
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'request_date' is not a calendar date: {!r}".format(date))
+    return date
 
 
 def _rung_name(value):
@@ -597,9 +701,8 @@ def validate(job_input):
     for field in REQUIRED_TOP_LEVEL:
         _require(job_input, field, "at the top level of 'input'")
 
-    request_id = _as_str(job_input["request_id"], "request_id")
-    if not request_id.strip():
-        raise WorkerError(INVALID_FIELD_VALUE, "field 'request_id' must not be empty")
+    request_id = _validated_request_id(job_input["request_id"])
+    request_date = _validated_request_date(job_input.get("request_date"))
 
     params = job_input["params"]
     if not isinstance(params, dict):
@@ -706,6 +809,7 @@ def validate(job_input):
     # threaded through every caller.
     return {
         "request_id": request_id,
+        "request_date": request_date,
         "source_url": _as_str(job_input["source_url"], "source_url"),
         "target_short_edge_px": target,
         "allow_oom_retry": allow_oom_retry,
