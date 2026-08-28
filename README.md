@@ -87,3 +87,17 @@ So what CI enforces is narrower than a green suite, and worth stating plainly: *
 checks the toolchain, not the worker.** A dispatched build proves the image assembles and that
 its ffmpeg has the capabilities the encode path needs. Whether the worker behaves is established
 before the dispatch, not by it.
+
+## First thing after a clone: install the hooks
+
+```
+git config core.hooksPath .githooks
+```
+
+**One command, once per checkout, and nothing works without it.** `core.hooksPath` is per-clone
+config — the hooks are tracked in `.githooks/`, but git does not look there until it is told to.
+**Until you run it this repository has no hooks at all**, and a push whose architecture graphs are
+stale will succeed silently.
+
+`.githooks/README.md` says what the hook does, what it deliberately does not do, and the one cost
+of pointing `core.hooksPath` away from `.git/hooks/`.

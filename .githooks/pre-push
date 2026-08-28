@@ -1,0 +1,87 @@
+#!/bin/sh
+# **Refuse a push of this image whose graph in cf-upscale-project is stale.**
+#
+# handler/ is graphed there, so a structural change pushed here without regenerating leaves the
+# view disagreeing with the code it claims to show. This reads the sibling repository and blocks;
+# it NEVER writes to it - a push here must not produce a commit there, or this checkout's
+# neighbour goes behind its own remote for a reason nobody looking at it would see.
+#
+# **NARROWED 2026-08-28: the check runs only when the PUSHED RANGE touches handler/.** It used to
+# run on every push, and the generator reads three trees from disk - so a workflow-only or
+# README-only push was refused over files in another repository that this push could not have
+# touched. The property: **a push touching neither the graphed code nor the graphs themselves
+# cannot make a published diagram lie**, which is the whole reason this hook exists.
+#
+# **THE QUESTION IS ABOUT THE RANGE, NOT THE WORKING TREE.** "Is the tree dirty" would pass a
+# stale-graph push from a clean tree and refuse a README push from a dirty one - inverted in both
+# directions. The paths come from `git diff` over the range each ref would publish.
+#
+# **handler/vendor/ IS EXCLUDED, because the generator excludes it** - it says so in the header it
+# writes into every diagram. A vendor bump cannot make a diagram lie, and refusing it would be this
+# hook enforcing a rule the generator does not have.
+#
+# **WHAT IS STILL TRUE.** When the range does touch handler/, the check reads the WORKING TREE on
+# both sides. An uncommitted edit in either still refuses; the narrowing removes only the case
+# where a push that touched neither is caught by it.
+#
+# **A MISSING SIBLING REFUSES RATHER THAN SKIPS, and that is the opposite of the other hook.**
+# This repository is the one whose changes go stale, so "cannot check" is the case where the
+# enforcement matters most - a silent exit 0 here would publish a handler/ change with the graphs
+# never checked, leaving one stderr line in an otherwise successful push. The sibling is found by
+# path convention, so a renamed or relocated checkout lands here; the message says what to do and
+# --no-verify is one flag away.
+#
+# **CF_UPSCALE_HANDLER is PINNED to this checkout, deliberately.** worker_path.py honours that
+# variable first, so an inherited one would have the hook certify a graph of a different worker -
+# most plausibly the frozen cf-upscale-worker, whose handler/ is still on disk and still looks
+# right. That is exactly the failure worker_path.py exists to prevent, re-entered through a hook.
+#
+# Untracked on purpose: .git/hooks/ is machine config, and nothing generated belongs in this
+# repository at all - every push here is a first publication.
+# Bypass for a genuine emergency: git push --no-verify
+set -e
+TOP="$(git rev-parse --show-toplevel)"
+SIB="$(cd "$TOP/.." && pwd)/cf-upscale-project"
+PY="$SIB/.venv/bin/python3"
+
+#: The one tree of this repository that is graphed, minus the vendored subtree the generator
+#: refuses to graph. Nothing else here reaches a diagram.
+GRAPHED='^handler/'
+NOT_GRAPHED='^handler/vendor/'
+
+# Deletions publish no code; see the sibling hook for the full note on what this filter is. A new
+# ref has no range to diff and is CHECKED, because the unknown case is where enforcement matters.
+need_check=0
+saw_line=0
+while read -r _lref lsha _rref rsha; do
+    saw_line=1
+    case "$lsha" in *[!0]*) ;; *) continue ;; esac
+    case "$rsha" in
+        *[!0]*)
+            if git diff --name-only "$rsha" "$lsha" \
+                | grep -E "$GRAPHED" | grep -qvE "$NOT_GRAPHED"; then
+                need_check=1
+            fi
+            ;;
+        *) need_check=1 ;;
+    esac
+done
+[ "$saw_line" = 1 ] && [ "$need_check" = 0 ] && exit 0
+
+if [ ! -x "$PY" ]; then
+    echo "" >&2
+    echo "pre-push REFUSED: cannot check the architecture graphs." >&2
+    echo "  looked for: $PY" >&2
+    echo "  handler/ is graphed in cf-upscale-project, and pushing without that check is how" >&2
+    echo "  the graph goes stale unnoticed. Clone it beside this repository and build its venv," >&2
+    echo "  or push with --no-verify and regenerate the graphs deliberately." >&2
+    exit 1
+fi
+
+CF_UPSCALE_HANDLER="$TOP/handler" \
+    "$PY" "$SIB/scripts/architecture_graph.py" --check || {
+    echo "" >&2
+    echo "pre-push REFUSED: handler/ changed but cf-upscale-project's architecture/ was not" >&2
+    echo "regenerated. Regenerate and commit THERE, then push here." >&2
+    exit 1
+}
