@@ -1452,6 +1452,14 @@ def _record_phases(record):
     if watch is None:
         record["phase_watch"] = {"installed": False, "why": "no watch on pipeline.run"}
         return
+    # **ABOVE the `peaks` early return, because the sampler is a different instrument.**
+    # `gpu_series` was written below it, so a run whose torch peak read failed at every boundary
+    # -- the documented first-GPU-run case -- discarded a full set of clock samples that had
+    # already been taken and already charged into `attempt_seconds`, and the record came out
+    # indistinguishable from a build that never sampled. That is the precise state the comment
+    # on this field says cannot happen, and "attached unconditionally" was false while it sat
+    # below a return governed by an unrelated reading.
+    record["gpu_series"] = watch.gpu_series()
     if not watch.peaks:
         # **Say why, rather than say nothing.** A run that produces no per-phase figures looks
         # identical to a run on an image that has no tap, and the first GPU run to carry this
@@ -1468,12 +1476,7 @@ def _record_phases(record):
     # with no per-phase times it had nowhere to be attributed and was read as host variance.
     if watch.durations:
         record["phase_seconds"] = dict(watch.durations)
-    # **The volatile GPU series, beside the peaks and the seconds it has to be read against**
-    # (item 10, CF 2026-08-28). Attached unconditionally once the watch produced peaks, because
-    # its own "sampled nothing, and here is why" is a reading: a card whose clocks could not be
-    # read for a whole run is a fact about that run, and an absent key would be indistinguishable
-    # from a build that never sampled.
-    record["gpu_series"] = watch.gpu_series()
+
 
 
 

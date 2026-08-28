@@ -123,7 +123,19 @@ def predict(gpu_name, frames, output_pixels, still=False):
     #
     # This does not make the model conservative — it makes the arithmetic stop taking away the
     # one property the model promises.
-    answer["estimate_seconds"] = math.floor(n * mpx * row["rate"] * 10.0) / 10.0
+    floored = math.floor(n * mpx * row["rate"] * 10.0) / 10.0
+    if floored <= 0.0:
+        # **Zero is not an answer this module is allowed to give.** Its own doctrine two
+        # paragraphs up is that a number it cannot honestly produce is ABSENT — "not zero, not a
+        # fallback" — and a floored `0.0` sitting beside a populated `r_card` and
+        # `kind: lower_bound` reads as "instant" rather than as "smaller than the resolution
+        # this is stated to". 2 frames of 320x240 on an H200 is 0.0625 s and floors to 0.0.
+        answer["absent_because"] = (
+            "the product floors below 0.1s, which this model cannot express as a bound; "
+            "absent rather than reported as zero")
+        answer["r_card"] = None
+        return answer
+    answer["estimate_seconds"] = floored
     # **Carried so a later reader can tell interpolation from extrapolation** without refitting.
     # Within a card at a fixed size the rate is extremely stable — four H200 8K runs span
     # 0.517-0.523 — and it rises systematically ACROSS sizes, so a job outside the measured span

@@ -137,10 +137,28 @@ def _shadow_estimate(machine, output, rationale, source):
 
         out = output or {}
         rat = rationale or {}
-        frames = out.get("frames_written") or (source or {}).get("estimated_frames")
-        pixels = rat.get("output_pixels")
-        if not pixels and out.get("width") and out.get("height"):
-            pixels = out["width"] * out["height"]
+        # **BOTH FROM THE SAME RUN, or neither.** The first version preferred DELIVERED frames
+        # and PLANNED pixels, with opposite precedence on the two inputs — so on any job where
+        # the two disagree it priced delivered frames at a plane the model did not produce.
+        # They do disagree, and the worker says so out loud: handler.py warns "the model
+        # produced WxH where WxH was computed from target_short_edge_px=N; the model rounds to
+        # its own grid and the output written is the model's size". A delivered plane LARGER
+        # than the planned one yields an estimate BELOW the true product, which breaks the one
+        # property this model promises — true >= estimate — through an input mismatch rather
+        # than through arithmetic.
+        #
+        # So: delivered frames with the delivered plane, else planned frames with the planned
+        # plane, and never one of each.
+        delivered_frames = out.get("frames_written")
+        delivered_pixels = ((out.get("width") or 0) * (out.get("height") or 0)) or None
+        # **`is not None`, not truthiness.** `frames_written: 0` is a run that opened an output
+        # and wrote nothing — a fact — and `or` read it as absent and silently substituted the
+        # PLANNED count, pricing an estimate off a number nothing delivered.
+        if delivered_frames is not None and delivered_pixels:
+            frames, pixels = delivered_frames, delivered_pixels
+        else:
+            frames = (source or {}).get("estimated_frames")
+            pixels = rat.get("output_pixels")
         return timemodel.predict(
             (machine or {}).get("gpu_name"), frames, pixels,
             still=bool((source or {}).get("still")))

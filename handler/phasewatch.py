@@ -43,9 +43,24 @@ PHASES = {
 #: The lever that phase's failure actually implicates. Not consulted here — this module only
 #: observes — but recorded beside the phase so the reader of a shortfall does not have to know the
 #: vendored architecture to act on it.
-#: Per-phase cap on kept samples. Phases close a handful of times a job — four is what the
-#: records show — so this is far above the real case and exists to bound the worst one.
+#: Per-phase cap on samples. **PHASES CLOSE ONCE PER CHUNK, not once per job**, which is the
+#: correction that produced this constant's real value: a record with 2 chunks carries 8 reads,
+#: so a 60-chunk clip closes 240 phases. The comment that stood here said "four is what the
+#: records show" and was reading single-chunk jobs.
+#:
+#: **Reaching the cap stops the SAMPLING, not merely the storing.** A cap that only dropped the
+#: value would go on paying for reads whose results are discarded — inside `attempt_seconds`,
+#: which is the numerator `r_card` is fitted from.
 MAX_SAMPLES_PER_PHASE = 12
+
+#: **The whole run's sampling budget, because the per-read breaker cannot see the total.** Each
+#: read can sit comfortably under `SAMPLE_BUDGET_S` and still add up: 240 boundaries at a healthy
+#: 0.1 s is 24 s inside the attempt, and `r_card` was fitted on records taken before this sampler
+#: existed, so the drift is one-directional and invisible without subtracting.
+#:
+#: 4 s is roughly 2.5% of the shortest delivered attempt in the corpus (161 s) and under 0.2% of
+#: the longest. The breaker firing is itself a recorded finding, not a silent degradation.
+SAMPLER_RUN_BUDGET_S = 4.0
 
 LEVERS = {
     "vae_encode": ("vae_encode_tiled", "vae_encode_tile_size"),
@@ -634,11 +649,22 @@ class PhaseWatch(object):
         """
         if self._sampler_off:
             return
+        # **Checked BEFORE the read, so a capped phase costs nothing.** The cap exists to bound
+        # the instrument's price, and a cap applied after the call would bound only the record.
+        series = self.gpu_state.setdefault(self.phase, [])
+        if len(series) >= MAX_SAMPLES_PER_PHASE:
+            self.samples_dropped += 1
+            return
         try:
             import hardware  # noqa: PLC0415 — stdlib-only; the cycle stays absent
 
+            started = time.time()
             values, elapsed = hardware.sample_gpu_state()
-            self.sampler_seconds = round(self.sampler_seconds + elapsed, 3)
+            # **Charged from OUR clock, not the sampler's return.** `elapsed` is what the reader
+            # measured around its own subprocess; the import, the call and the return are ours
+            # and are inside `attempt_seconds` too. Small, and the point of the field is that
+            # nobody has to trust it is small.
+            self.sampler_seconds = round(self.sampler_seconds + (time.time() - started), 3)
             # **A LIST, because a phase closes more than once.** `durations` accumulates with
             # `+=` and `peaks` takes a `max` for exactly this reason -- a phase re-enters, and
             # the record already reports "N phase duration(s) accumulated across re-entries".
@@ -653,11 +679,15 @@ class PhaseWatch(object):
             # finite rather than to trim the normal one. A phase that exceeds it keeps its first
             # samples and counts the rest, since the early ones are the ones with a clean run to
             # compare against.
-            series = self.gpu_state.setdefault(self.phase, [])
-            if len(series) < MAX_SAMPLES_PER_PHASE:
-                series.append(values)
-            else:
-                self.samples_dropped += 1
+            series.append(values)
+            if self.sampler_seconds > SAMPLER_RUN_BUDGET_S:
+                self._sampler_off = True
+                self.sampler_disabled = (
+                    "the run's samples have cost {:.2f}s against a {:.2f}s budget; sampling "
+                    "stopped. Each read was under the per-read budget -- this is the total, "
+                    "which the per-read breaker cannot see".format(
+                        self.sampler_seconds, SAMPLER_RUN_BUDGET_S))
+                return
             if elapsed > hardware.SAMPLE_BUDGET_S:
                 self._sampler_off = True
                 self.sampler_disabled = (
@@ -665,6 +695,13 @@ class PhaseWatch(object):
                     "instrument cannot shape the attempt it measures".format(
                         elapsed, hardware.SAMPLE_BUDGET_S))
         except Exception as exc:  # noqa: BLE001 — telemetry must never break a phase boundary
+            # **The time already spent is charged even though the read failed.** A sample that
+            # raised still occupied the attempt; leaving it out would make `sampler_seconds`
+            # understate the instrument on exactly the runs where it misbehaved.
+            try:
+                self.sampler_seconds = round(self.sampler_seconds + (time.time() - started), 3)
+            except Exception:  # noqa: BLE001 — `started` may not exist if the import raised
+                pass
             self._sampler_off = True
             self.sampler_disabled = "{}: {}".format(type(exc).__name__, exc)
 
@@ -772,6 +809,16 @@ class PhaseWatch(object):
             # phase -> [reading, ...] in the order the phase closed. A list even at length one,
             # so a reader never has to ask whether this phase happened to re-enter.
             "per_phase": {k: list(v) for k, v in self.gpu_state.items()},
+            # **THESE ARE BOUNDARY READINGS, NOT PHASE READINGS, and the record says so rather
+            # than letting the key name imply otherwise.** The sample is taken as a phase CLOSES,
+            # when its kernels have drained -- and the last one is taken in `__exit__`, after the
+            # model work is over entirely. `utilization.gpu` and the current clocks are
+            # instantaneous, so a phase that ran flat out for 13.8 s can be recorded at idle
+            # under its own name. What the series is good for is the throttle mask and the clock
+            # CEILING behaviour across a run; reading it as "the clock during dit_sample" is the
+            # misuse this field exists to prevent, and no comment in a handler travels with a
+            # corpus the way a key does.
+            "reading_taken": "at phase close, after that phase's kernels have drained",
             # **The instrument's own price, in the corpus beside its readings.** Outside
             # `phase_seconds`, inside `attempt_seconds`. Named `_seconds` rather than folded
             # into a phase so nobody has to guess which of the two it was taken out of.
