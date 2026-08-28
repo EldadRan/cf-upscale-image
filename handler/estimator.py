@@ -434,9 +434,7 @@ def plan(job, snapshot, calibration=None, force_rung=None):
         # the larger figure — a card nobody has measured is not an argument for optimism.
         answer = planner.plan(src, frames, target, usable_gb=usable, host_ram_gb=host_ram_gb,
                               tile_quality=tile_quality, schedule=schedule,
-                              gpu_name=snapshot.get("gpu_name"),
-                              allow_below_floor=bool(
-                                  job.get("allow_below_quality_floor")))
+                              gpu_name=snapshot.get("gpu_name"))
         if answer["action"] != "plan":
             # **The terminal state, computed before a GPU-second is spent.** The two options are
             # the caller's to choose between and neither is this function's to take; a sub-floor
@@ -454,7 +452,7 @@ def plan(job, snapshot, calibration=None, force_rung=None):
                     # number alone.
                     "quality_floor_frames": planner.window_floor(frames),
                     "registry_version": planner.REGISTRY_VERSION,
-                    "options": _terminal_options(job, snapshot, width, height, answer),
+                    "options": _terminal_options(job, snapshot, width, height),
                 },
             )
         chosen = solver.config_of_plan(answer, job_for_config)
@@ -462,18 +460,6 @@ def plan(job, snapshot, calibration=None, force_rung=None):
         why = planner.rationale_line(answer)
 
     rationale = {
-        # **WHAT HAPPENED, as against what was asked** -- the request flag is in the manifest's
-        # `requested` block and this is its outcome. They differ whenever a caller sends
-        # `allow_below_quality_floor` and the plan lands at or above the floor anyway, which is
-        # the common case: the flag is permission, not an instruction.
-        #
-        # **`(answer or {})`, because two of the three branches above do not produce one.** A
-        # forced rung sets `answer = None` outright -- it is a configuration named rather than
-        # solved, so there is no plan to have crossed a floor. The blind branch does produce an
-        # answer, from `lowest_in_spec`, which its own comment describes as "flagged, never
-        # sub-floor" and which carries no such key. `bool()` collapses both to False rather than
-        # letting `None` read as a third state that does not exist.
-        "sub_floor": bool((answer or {}).get("sub_floor")),
         # An internal label. It reads `planned` on every ordinary job, `blind` where the card
         # could not be read and the rung's own name only where a caller forced one.
         "rung": chosen["name"],
@@ -810,7 +796,7 @@ def _refusal_text(reason):
             "nothing quieter to fall back to.".format(reason))
 
 
-def _terminal_options(job, snapshot, width, height, answer=None):
+def _terminal_options(job, snapshot, width, height):
     """§6: the two choices a caller has when nothing at or above the floor fits.
 
     **Reported, never taken.** Both give up something that belongs to the caller -- the delivered
@@ -823,33 +809,12 @@ def _terminal_options(job, snapshot, width, height, answer=None):
     an even number, since `yuv420p` cannot encode an odd dimension.
     """
     floor = planner.window_floor(max(1, int(job.get("estimated_frames") or 1)))
-    # **Offered only when it would actually change the answer, which is two conditions and not
-    # one.** Board item 10 is that a remedy must not name an action the contract forbids; the
-    # same argument forbids naming an action the contract permits and the planner will ignore.
-    #
-    #   the caller has not already sent it -- a resend of a field they just sent refuses
-    #     identically, which is the original defect wearing different clothes and worse, since
-    #     the caller has evidence they already used it;
-    #   and the refusal is one the flag can lift -- `below_floor_would_help`, set by the planner
-    #     on the single terminal that waiving the floor unblocks. It is a FIELD rather than a
-    #     match on the reason string, because a contract that lives in prose is a contract that
-    #     breaks on a reworded sentence.
-    #
-    # **The still case is why the second condition exists.** `planner.plan` branches on
-    # `frames == 1` before the floor is consulted at all -- `MIN_WINDOW` is temporal and one
-    # frame has no temporal dimension -- so a still refused for not fitting was being told to
-    # resend with a field its own code path never reads, and the resend refused identically.
-    # That is board item 10, intact, for every still, and the first version of this fix closed
-    # it only for multi-frame clips.
-    options = []
-    if (answer or {}).get("below_floor_would_help") \
-            and not job.get("allow_below_quality_floor"):
-        options.append({
-            "option": "run_below_quality_floor",
-            "how": "resend with allow_below_quality_floor=true",
-            "cost": "the temporal window falls below {} frames, where the model no longer beats "
-                    "a plain enlargement; the job is flagged in its manifest".format(floor),
-        })
+    options = [{
+        "option": "run_below_quality_floor",
+        "how": "resend with allow_below_quality_floor=true",
+        "cost": "the temporal window falls below {} frames, where the model no longer beats a "
+                "plain enlargement; the job is flagged in its manifest".format(floor),
+    }]
 
     source_w = job["source_width"]
     source_h = job["source_height"]
