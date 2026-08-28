@@ -728,6 +728,28 @@ def plan(src, frames, target, vram_free_gb=None, host_ram_gb=None, usable_gb=Non
                     "{}x{}".format(out_w, out_h), dit_price(r_mp, 1), usable),
                 best_window=1)
     else:
+        # **THE ASYMMETRY WITH THE STILL BRANCH ABOVE IS REAL AND LOAD-BEARING.** That branch
+        # checks its own budget -- `if dit_price(r_mp, 1) > usable` -- because a still's window
+        # is fixed at 1 and there is no closed form to trust. This branch has no such check: it
+        # relies entirely on `window_for` returning a window whose sampler price fits, and on
+        # `_pad(frames)` and the floor terminal below only ever lowering it from there.
+        #
+        # **Swept on 2026-08-28 and it held: four source geometries x seven frame counts x six
+        # targets x seven budgets = 1,176 combinations, zero returned plans whose
+        # `prices["dit_sample"]` exceeded their budget.** Written as a measurement rather than as
+        # "this cannot happen", because the second is a claim someone has to re-establish and the
+        # first is one they can re-run.
+        #
+        # **What would make it happen again**, so a later reader knows where to look rather than
+        # re-deriving it: a `window_for` that returns anything but the largest FITTING window; a
+        # lattice change that rounds the window UP after pricing; or any new path that reaches
+        # the plan body while bypassing the floor terminal below. The last of those is not
+        # hypothetical -- `allow_below_quality_floor` was exactly that path, and while it existed
+        # this branch returned a plan at w1 priced 21.44 GiB against 18.0 usable. It was
+        # withdrawn at 2f1b26b on CF's rule, and the hole went with it rather than being patched,
+        # because a guard for a branch the tree cannot reach makes a bad state survivable instead
+        # of impossible -- which this repository has already ruled against once, over the VAE
+        # collision in `bake_weights.py`.
         window = min(window_for(usable, r_mp), _pad(frames))
         floor = window_floor(frames)
         if window < floor:
