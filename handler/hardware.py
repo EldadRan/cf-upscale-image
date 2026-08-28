@@ -15,6 +15,7 @@ exercises this module against injected readings rather than against a real card.
 
 import os
 import shutil
+import time
 
 BYTES_PER_GB = 1024 ** 3
 
@@ -518,7 +519,7 @@ _TOPOLOGY_KEYS = ("pcie_link_width_current", "pcie_link_width_max",
                   "clock_max_sm_mhz", "clock_max_mem_mhz", "gpu_serial", "gpu_uuid")
 
 
-def _smi_row(fields):
+def _smi_row(fields, timeout=5):
     """One `nvidia-smi --query-gpu` call for device 0. A list of strings, or a string saying why
     not. **Never raises.**
 
@@ -537,7 +538,7 @@ def _smi_row(fields):
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=" + ",".join(fields),
              "--format=csv,noheader,nounits", "-i", "0"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, text=True, timeout=timeout)
         if out.returncode != 0:
             return "{}: {}".format(
                 UNREADABLE,
@@ -588,6 +589,57 @@ def _gpu_topology():
     topology["host_id"] = os.environ.get("RUNPOD_POD_HOSTNAME") or UNREADABLE
     _TOPOLOGY_CACHE = topology
     return dict(topology)
+
+
+#: The volatile fields, in ONE query. Current clocks and why they are where they are.
+#:
+#: **`clocks_throttle_reasons.active` is a hex bitmask**, not a list of names — the per-reason
+#: boolean fields exist too but each is a separate column, and the whole point of this query is
+#: that it costs one round trip. The mask is decoded by whoever reads the corpus; recording the
+#: raw value is the honest thing anyway, since a decode table baked in here would go stale
+#: against a driver nobody has seen yet.
+_SAMPLE_FIELDS = ("clocks.current.sm", "clocks.current.memory",
+                  "clocks_throttle_reasons.active", "utilization.gpu", "utilization.memory")
+
+_SAMPLE_KEYS = ("clock_sm_mhz", "clock_mem_mhz", "throttle_reasons_hex",
+                "util_gpu_pct", "util_mem_pct")
+
+#: **The sampler's own budget, and a breaker rather than a timeout alone.** A 2 s timeout bounds
+#: ONE read; four boundaries at 2 s each would still put 8 s inside the attempt this instrument
+#: exists to measure. So the first read that costs more than `SAMPLE_BUDGET_S` disables sampling
+#: for the rest of the run, and the record says it was disabled and why.
+#:
+#: **The number is deliberately far below anything that could matter.** The shortest phase this
+#: has been observed against is postprocess at 13.8 s; a sampler allowed a tenth of that would be
+#: shaping the measurement it reports.
+SAMPLE_TIMEOUT_S = 2
+SAMPLE_BUDGET_S = 0.25
+
+
+def sample_gpu_state():
+    """One volatile GPU reading. Returns `(values, elapsed_seconds)`. **Never raises.**
+
+    **This is the half of the telemetry that measures the thing.** The one-shot half in
+    `_gpu_topology` records link topology and clock ceilings, which are stable for the life of
+    the container and therefore cannot show a run degrading; the two runs 1.9x apart had every
+    STABLE variable identical. What differed had to be volatile, and this is the only reading of
+    it — sampled where the phases already close, so encode's x2.41 and decode's x2.40 against
+    postprocess's x0.83 can be checked against clocks and throttle state per phase rather than
+    inferred from a wall clock.
+
+    **It reports its own cost.** The caller records `elapsed` so the instrument's price is in the
+    corpus beside its readings rather than asserted in a comment — which is what the one-shot
+    half failed to do, and it shipped eight subprocesses per read into a timed phase before
+    anyone noticed.
+    """
+    started = time.time()
+    row = _smi_row(_SAMPLE_FIELDS, timeout=SAMPLE_TIMEOUT_S)
+    elapsed = time.time() - started
+    if isinstance(row, str) or len(row) != len(_SAMPLE_KEYS):
+        why = row if isinstance(row, str) else "{}: expected {} fields, got {}".format(
+            UNREADABLE, len(_SAMPLE_KEYS), len(row))
+        return {key: why for key in _SAMPLE_KEYS}, elapsed
+    return dict(zip(_SAMPLE_KEYS, row)), elapsed
 
 
 def _round(value):

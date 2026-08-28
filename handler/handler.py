@@ -1468,6 +1468,12 @@ def _record_phases(record):
     # with no per-phase times it had nowhere to be attributed and was read as host variance.
     if watch.durations:
         record["phase_seconds"] = dict(watch.durations)
+    # **The volatile GPU series, beside the peaks and the seconds it has to be read against**
+    # (item 10, CF 2026-08-28). Attached unconditionally once the watch produced peaks, because
+    # its own "sampled nothing, and here is why" is a reading: a card whose clocks could not be
+    # read for a whole run is a fact about that run, and an absent key would be indistinguishable
+    # from a build that never sampled.
+    record["gpu_series"] = watch.gpu_series()
 
 
 

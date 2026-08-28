@@ -471,6 +471,22 @@ class PhaseWatch(object):
         #: entry is the one the registry's host term is waiting on.
         self.host_rss = {}
 
+        #: phase -> the volatile GPU reading taken as that phase closed (item 10, CF
+        #: 2026-08-28). **Beside `phase_peaks_gb` and `phase_seconds`, which is the whole
+        #: design**: two runs 1.9x apart had every stable variable identical, so what differed
+        #: was volatile, and the phase shares said where — encode x2.41 and decode x2.40 against
+        #: postprocess x0.83, bandwidth-bound worst. Clocks and throttle state per phase are the
+        #: reading that can confirm or kill that.
+        self.gpu_state = {}
+        #: What the instrument cost, accumulated. **Recorded rather than asserted**: it sits
+        #: outside `phase_seconds` by construction and INSIDE `attempt_seconds`, which is the
+        #: number the rates are fitted from, so a reader must be able to subtract it.
+        self.sampler_seconds = 0.0
+        #: Set when the breaker fires, and it names why. An instrument that silently stopped
+        #: would read as a phase that produced no data rather than as a sampler that stood down.
+        self.sampler_disabled = None
+        self._sampler_off = False
+
     # ── installation ────────────────────────────────────────────────────────────────────────
     def __enter__(self):
         self._debug = getattr(self._holder, "debug", None)
@@ -562,6 +578,20 @@ class PhaseWatch(object):
             self.durations[self.phase] = round(
                 self.durations.get(self.phase, 0.0) + (time.time() - self._phase_opened), 1)
             self._phase_opened = None
+        # **THE VOLATILE GPU SAMPLE, taken here and nowhere else** (item 10, CF 2026-08-28).
+        #
+        # **After the duration stamp above, which is what puts it OUTSIDE `phase_seconds`.** That
+        # ordering is not mine — the stamp was already first, under the comment "stamped before
+        # anything that can fail" — but it is the property that lets an instrument sit at a phase
+        # boundary at all. `phase_seconds` is therefore unaffected by construction rather than by
+        # measurement.
+        #
+        # **It is NOT outside `attempt_seconds`, and that is the number the rates are fitted
+        # from** — `(attempt_seconds - strip) / frames / megapixels`. So the cost is recorded
+        # rather than waved away: `sampler_seconds` accumulates every sample's own elapsed time,
+        # and a reader can subtract it or judge it. Asserting it is cheap is what the one-shot
+        # half did, and it shipped eight subprocesses per read into a timed phase.
+        self._sample_gpu()
         self.diagnosis["reads"] += 1
         try:
             peak = self._read()
@@ -584,6 +614,34 @@ class PhaseWatch(object):
             self.phase, peak,
             "" if reserved is None else "   reserved {:6.2f}   gap {:5.2f}".format(reserved, gap)))
         self._say_host(self.phase)
+
+    def _sample_gpu(self):
+        """One volatile reading for the phase that is closing. **Never raises, and gives up.**
+
+        **The breaker is the point.** A timeout bounds one read; four boundaries at the timeout
+        would still put seconds inside the attempt this instrument exists to measure. So the
+        first sample that costs more than `hardware.SAMPLE_BUDGET_S` disables sampling for the
+        rest of the run, and `sampler_disabled` says so in the record — an instrument that
+        silently stopped would be worse than one that never started, because the gap would read
+        as a phase that produced no data rather than as a sampler that stood down.
+        """
+        if self._sampler_off:
+            return
+        try:
+            import hardware  # noqa: PLC0415 — stdlib-only; the cycle stays absent
+
+            values, elapsed = hardware.sample_gpu_state()
+            self.sampler_seconds = round(self.sampler_seconds + elapsed, 3)
+            self.gpu_state[self.phase] = values
+            if elapsed > hardware.SAMPLE_BUDGET_S:
+                self._sampler_off = True
+                self.sampler_disabled = (
+                    "one sample cost {:.2f}s against a {:.2f}s budget; sampling stopped so the "
+                    "instrument cannot shape the attempt it measures".format(
+                        elapsed, hardware.SAMPLE_BUDGET_S))
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break a phase boundary
+            self._sampler_off = True
+            self.sampler_disabled = "{}: {}".format(type(exc).__name__, exc)
 
     def _say_host(self, label):
         """The `[host]` banner for a phase boundary — VmRSS, and the share of the host it is.
@@ -680,4 +738,17 @@ class PhaseWatch(object):
             "confidence": "named" if self.failed_in else "last_entered",
             "levers": list(LEVERS.get(name, ())),
             "phase_peaks_gb": {k: round(v, 2) for k, v in self.peaks.items()},
+        }
+
+    def gpu_series(self):
+        """The volatile readings, their cost, and whether the sampler gave up. **Always a dict**,
+        so a run that sampled nothing is distinguishable from a build that could not sample."""
+        return {
+            "per_phase": dict(self.gpu_state),
+            # **The instrument's own price, in the corpus beside its readings.** Outside
+            # `phase_seconds`, inside `attempt_seconds`. Named `_seconds` rather than folded
+            # into a phase so nobody has to guess which of the two it was taken out of.
+            "sampler_seconds": round(self.sampler_seconds, 3),
+            "sampler_disabled": self.sampler_disabled,
+            "samples": len(self.gpu_state),
         }
