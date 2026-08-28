@@ -33,8 +33,27 @@ class Remedy:
     #: moment one exists. Always accompanied by `shortfall`, because `needed ~62 GB at the most
     #: conservative configuration, had 48` is actionable and `out of memory` is not.
     LARGER_GPU = "larger_gpu"
+    #: The same request, on the same card, with a bigger `execution_timeout_ms`. **Unlike
+    #: `larger_gpu`, CF can grant this one by resending** — which is why `deadline_exceeded`
+    #: carries `predicted_seconds` and the limit it was measured against rather than leaving the
+    #: caller to double blindly.
+    #:
+    #: **It was emitted for a release before it was declared here** (CF, 2026-08-28).
+    #: `deadline_exceeded`'s own docstring below specifies it, `estimator.py` emits it, and rung 1
+    #: asserts it — while `ALL` named three values. Nothing enforces `ALL`, so nothing broke at
+    #: runtime; what it would have broken is anything built ON `ALL`, which is the obvious thing
+    #: to build: a published vocabulary missing a value it emits, and a validator that would
+    #: reject a legitimate refusal.
+    LONGER_DEADLINE = "longer_deadline"
 
-    ALL = (NONE, RETRY_SAME, LARGER_GPU)
+    #: **The published vocabulary, and the rule about it is directly below.** Adding a value here
+    #: is a contract change: doc-first, the gate's to rule, and this one was ruled by CF on
+    #: 2026-08-28 as part of the wave that found it.
+    #:
+    #: **`planner.py`'s `larger_host` is NOT in this set and is not an omission.** It is a second
+    #: vocabulary under the same field name, on the planner's terminal rather than on a
+    #: `cf_error`, and collapsing the two would be asserting an equivalence nobody has ruled.
+    ALL = (NONE, RETRY_SAME, LARGER_GPU, LONGER_DEADLINE)
 
 
 class WorkerError(Exception):

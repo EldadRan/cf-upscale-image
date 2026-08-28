@@ -911,7 +911,7 @@ def refuse_if_the_deadline_cannot_be_met(rationale, budget_ms, elapsed_s, frames
                              "decode grid and is where a long job's wall clock lives"}
                 .get(rationale.get("prediction_basis"), "measured"),
                 required, DEADLINE_SAFETY_FACTOR, remaining, budget_ms / 1000.0, elapsed_s),
-        remedy="longer_deadline",
+        remedy=Remedy.LONGER_DEADLINE,
         shortfall={"predicted_seconds": round(predicted, 1),
                    # **The factored figure alongside the raw one, so the factor is tunable from
                    # what fires rather than arguable.** CF asked for all three — prediction,
