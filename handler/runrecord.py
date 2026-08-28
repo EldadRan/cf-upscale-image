@@ -123,6 +123,32 @@ def build_stub(build_identity, machine, request=None, rationale=None, source=Non
         phase=PHASE_STUB)
 
 
+def _shadow_estimate(machine, output, rationale, source):
+    """The shadow model's answer for this run, or its stated absence. **Never raises.**
+
+    Reads the DELIVERED frame count and the DELIVERED plane where they exist, because the record
+    is written after the fact and an estimate keyed on what was predicted would be comparing the
+    model against a different job from the one that ran. Falls back to the rationale's geometry
+    on a run with no output — a refusal, a crash — so a record still carries the number the model
+    would have given, which is what makes a refused job comparable with a delivered one.
+    """
+    try:
+        import timemodel  # noqa: PLC0415 — leaf module; keeps the import graph honest
+
+        out = output or {}
+        rat = rationale or {}
+        frames = out.get("frames_written") or (source or {}).get("estimated_frames")
+        pixels = rat.get("output_pixels")
+        if not pixels and out.get("width") and out.get("height"):
+            pixels = out["width"] * out["height"]
+        return timemodel.predict(
+            (machine or {}).get("gpu_name"), frames, pixels,
+            still=bool((source or {}).get("still")))
+    except Exception as exc:  # noqa: BLE001 — a shadow must never cost a record
+        return {"model": "v0", "estimate_seconds": None,
+                "absent_because": "{}: {}".format(type(exc).__name__, exc)}
+
+
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL):
@@ -154,6 +180,22 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # met once.
         "plan": _configuration_of(attempts),
         "rationale": rationale,
+        # **THE SHADOW TIME MODEL, computed here and consumed nowhere** (CF, 2026-08-28;
+        # `docs/gate/time-model.md` §9). Both predictions are computed on every job, only the old
+        # one is consumed, and both are recorded — `rationale.predicted_seconds` above is the
+        # live lookup and still the only number any decision reads.
+        #
+        # **Assembled at the record rather than in the planner, deliberately.** The planner is
+        # what the deadline gate consumes; a shadow number computed there would be one refactor
+        # away from being read, and `timemodel` is a leaf whose only importer is this line. The
+        # import graph is what keeps "shadow" true, rather than a comment asking people to be
+        # careful.
+        #
+        # **It is computed even when it cannot answer**, so an unmeasured card produces a ROW
+        # saying absent rather than no row at all. That row is the one that tells CF its coverage
+        # is missing, and it is the whole defect the new model replaces — the old one borrowed a
+        # rate from whatever was furthest away and reported it as measured.
+        "time_model_shadow": _shadow_estimate(machine, output, rationale, source),
         "source": source,
         "output": output,
         # **The strip that used to be silent**, measured in halves because its two costs have
