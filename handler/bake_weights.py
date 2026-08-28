@@ -70,19 +70,55 @@ VAE_FILE = "ema_vae_fp16.safetensors"
 model_dir = os.environ["SEEDVR2_MODEL_DIR"]
 dit_file = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
 
+# **REFUSED HERE, BEFORE ANYTHING IS FETCHED (CF's ruling, 2026-08-28).** Naming the shared VAE as
+# the DiT is the one build-arg value that makes this script ship an image with no model in it and
+# report success. The whole chain is below and every link works as written:
+#
+#   `files` collapses to a single entry, so only the VAE is ever downloaded;
+#   the size and hash assertions pass, because the VAE really is the VAE;
+#   the total is right, the listing is right, and every printed line is true;
+#   and the final guard asks `isfile(model_dir/dit_file)` -- which is the VAE's own path, present
+#   because it was just fetched. **The guard is satisfied BY the file whose presence is the
+#   evidence that the DiT is missing.**
+#
+# **CF ruled the fix here rather than at that guard**, and the reason is that the guard is not
+# wrong. `dit_file` names a checkpoint; asking whether the named checkpoint arrived is exactly
+# the right question, and it answers correctly for every input except one that is a category
+# error before it is a bug. Hardening it would encode "the DiT must not be the VAE" as a
+# post-download detection, which treats a nonsensical request as a configuration to be caught
+# late instead of one to be rejected on sight. A build-arg naming the VAE as the model is never
+# a thing anyone meant.
+if dit_file == VAE_FILE:
+    # **`dit_file`, not `VAE_FILE`, even though this branch proves them equal.** Reporting the
+    # constant back instead of what the caller actually passed is correct only for as long as the
+    # comparison stays exact string equality — and the obvious next change here is to loosen it.
+    # A message that echoes a constant is a number belonging to something else.
+    sys.exit(
+        "SEEDVR2_MODEL={0} names the shared VAE as the DiT checkpoint, which is not a "
+        "configuration this image can have.\n"
+        "  The VAE is baked unconditionally alongside whichever DiT is selected, so this would "
+        "download one file, verify it correctly, and produce an image with no model in it -- and "
+        "every check downstream would pass, because the checkpoint's own presence test would be "
+        "satisfied by the VAE sitting at that path.\n"
+        "  Pass a DiT checkpoint name, or omit the build-arg for the default.".format(dit_file))
+
 os.makedirs(model_dir, exist_ok=True)
 
 total = 0.0
-# **De-duplicated, because `--build-arg SEEDVR2_MODEL=ema_vae_fp16.safetensors` makes these one
-# file.** `dit_file` is whatever the build-arg names and `VAE_FILE` is a constant, so the two can
-# be the same string — and the tuple then iterated it twice. `hf_hub_download` short-circuits on
-# the second pass, so nothing was fetched twice and nothing failed: **only `total` was wrong, too
-# large by one file, in the number CF reads for cold-start and container-disk cost.** It failed in
-# the direction that does not announce itself.
+# **Two files, always, because the collision that made this a branch is now refused above.**
 #
-# Written out rather than `dict.fromkeys((dit_file, VAE_FILE))`, which is shorter and hides why a
-# collision is possible at all. The reader needs to see the cause, not just the guard.
-files = (dit_file,) if dit_file == VAE_FILE else (dit_file, VAE_FILE)
+# This line used to read `(dit_file,) if dit_file == VAE_FILE else (dit_file, VAE_FILE)`, and the
+# history is kept because the collision it de-duplicated is real and the reason it mattered is not
+# obvious: `dit_file` is whatever the build-arg names and `VAE_FILE` is a constant, so the two
+# could be the same string, and the tuple then iterated it twice. `hf_hub_download` short-circuits
+# on the second pass, so nothing was fetched twice and nothing failed — **only `total` was wrong,
+# too large by one file, in the number CF reads for cold-start and container-disk cost.**
+#
+# **De-duplicating was the wrong layer, and that is the whole finding.** It made the collision
+# survivable and therefore silent, which is what let it go on to produce a model-less image that
+# reported success. The refusal above removes the collision instead of accommodating it, so this
+# branch has nothing left to decide.
+files = (dit_file, VAE_FILE)
 for filename in files:
     path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir,
                            revision=REVISION)
