@@ -797,24 +797,42 @@ def _refusal_text(reason):
 
 
 def _terminal_options(job, snapshot, width, height):
-    """§6: the two choices a caller has when nothing at or above the floor fits.
+    """The choice a caller has when nothing at or above the floor fits: a smaller target.
 
-    **Reported, never taken.** Both give up something that belongs to the caller -- the delivered
-    resolution, or the guarantee that the model beat a plain enlargement -- and a worker that
-    picks one while a job is running has made a product decision on their behalf. That is the one
-    decision this design says the solver reports instead of making.
+    **ONE option, not two, since CF's ruling of 2026-08-28.** This function used to offer
+    `run_below_quality_floor` alongside, with `"how": "resend with
+    allow_below_quality_floor=true"` -- a field that existed in neither field set, so in `params`
+    the door refused it by name and blamed the caller, and at the top level the leniency rule
+    swallowed it and the job refused again, identically. Board item 10: customer-facing, one paid
+    dispatch to discover, and the second failure looking like the caller's fault.
+
+    **It was withdrawn rather than implemented, and the reason is a product rule rather than a
+    bug.** CF: a clip of more than 21 frames, on hardware whose minimum workable window is below
+    21, MUST BE REJECTED. Not a default, not a quality preference, and not the caller's to waive.
+    `window_floor` is `min(MIN_WINDOW, ideal_window(frames))`, so a clip of 19 frames or fewer
+    already has a floor below 21 and plans there unaided; the waiver could therefore only ever
+    fire on a clip whose floor IS 21, and its only reachable effect was running such a clip below
+    21 -- exactly what the rule forbids. The option was advertising a decision CF never made.
+
+    It WAS implemented, at 2ea7280, and reverted at ceea64b. Recorded because the message it
+    printed is in refusals CF has already received, and a reader finding it there needs to know
+    the field never worked and is not coming.
+
+    **Reported, never taken.** The remaining option gives up something that belongs to the caller
+    -- the delivered resolution -- and a worker that picks it while a job is running has made a
+    product decision on their behalf. That is the one decision this design says the solver
+    reports instead of making.
 
     The smaller target is computed, not suggested: the largest short edge whose best plan the card
     is predicted to hold, stepped down the same 32 px grid a caller would think in and snapped to
     an even number, since `yuv420p` cannot encode an odd dimension.
+
+    **An empty list is a legitimate answer** and always was on this path: when no smaller target
+    plans either, there is nothing the caller can change and `remedy: larger_gpu` beside it is
+    the whole of the advice. Nothing indexes this list -- the only consumer is the `shortfall`
+    dict below.
     """
-    floor = planner.window_floor(max(1, int(job.get("estimated_frames") or 1)))
-    options = [{
-        "option": "run_below_quality_floor",
-        "how": "resend with allow_below_quality_floor=true",
-        "cost": "the temporal window falls below {} frames, where the model no longer beats a "
-                "plain enlargement; the job is flagged in its manifest".format(floor),
-    }]
+    options = []
 
     source_w = job["source_width"]
     source_h = job["source_height"]
