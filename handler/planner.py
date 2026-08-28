@@ -471,7 +471,9 @@ def window_floor(frames):
     before the floor is consulted — but the value IS published: `estimator.py` puts it in
     `shortfall.quality_floor_frames` and `handler.py` renders it into an OOM refusal's prose. A
     still refused with "no window at or above the 5-frame quality floor" would be telling a
-    caller about a floor their job cannot have.
+    caller about a floor their job cannot have. **The oracle guards it identically** —
+    `plan_oracle._window_floor` opens with the same `frames == 1` return, for the same published
+    reason, and the two agree at every frame count.
 
     The mirror of this function is `fable/plan_oracle.py:_window_floor` and the two must agree;
     `plan_replay`'s cases 0a, 0b and 0c are what make a disagreement fail rather than drift.
