@@ -78,6 +78,13 @@ HOST_RESERVE_RETIRED = 4.0
 #: **The temporal quality floor, and it is temporal** — below 21 frames the model stops beating
 #: a plain enlargement *on video*. A still has no time axis to floor, which is why step 0
 #: branches before this is ever consulted (ruled 2026-08-18).
+#: **The smallest window the ladder may walk down to on a multi-frame clip** (CF, 2026-08-28).
+#: Not 1, though 1 is on the 4n+1 lattice: a window of 1 is no temporal context at all, which is
+#: image upscaling of a video at the model's full price. `window_floor` carries the measurement
+#: and the two structural breakages that come with w1. Mirrored at
+#: `fable/plan_oracle.py:LADDER_BOTTOM`.
+LADDER_BOTTOM = 5
+
 MIN_WINDOW = 21
 
 #: A decode grid that blends more than this of the frame is refused: past it the seams cost
@@ -412,19 +419,66 @@ def ideal_window(frames):
 
 
 def window_floor(frames):
-    """The quality floor that applies to **this shot**: `MIN_WINDOW`, or the shot when shorter.
+    """The floor that applies to **this shot**. **AMENDED BY CF, 2026-08-28.**
 
-    **The floor is a statement about temporal context, and a shot cannot be refused for lacking
-    context it never had.** `MIN_WINDOW` says that below 21 frames the model stops beating a
-    plain enlargement *when 21 frames were available to attend to*; a ten-frame clip has no
-    eleventh frame to give it, so a 13-frame window is that clip's ceiling and its floor at once.
+    **A clip of MORE than `MIN_WINDOW` frames may never be processed below `MIN_WINDOW`. A clip
+    of `MIN_WINDOW` frames or fewer walks the 4n+1 ladder down to whatever the card holds, and is
+    refused only when nothing holds.** CF: *"you just walk the 4n+1 as you can, and if you can't
+    you refuse, this is an extreme case which I don't see a scenario that it happens."*
 
-    This is the same argument CF ratified for stills on 2026-08-18 — "MIN_WINDOW is temporal and
-    does not apply to N = 1" — carried to its own boundary rather than stopped one frame short of
-    it. The one-frame case remains its own branch because the contract writes it that way, but it
-    falls out of this function identically.
+    **What it replaced, and why the old reading was defensible.** Ruled decision 6 (CF,
+    2026-08-18) was `min(MIN_WINDOW, ideal_window(frames))` — a shorter clip "upscaled at its own
+    full length, its ideal window its ceiling and its floor at once". The floor is a statement
+    about temporal context, and a shot cannot be refused for lacking context it never had; that
+    principle is unchanged and this amendment serves it better. What the old form did was round
+    UP to the next lattice value, so a clip's floor could exceed the clip: an 18-frame clip
+    floored at 21 and was refused on a card holding only w17, when 17 is a legal rung the clip
+    could have used and there is no legal window of 18, 19 or 20 to have.
+
+    **The 18-21 band is not what this is about.** A 14-frame clip on w13 hardware and an 18-frame
+    clip on w17 hardware are the same shape — a clip whose padded window the card cannot hold —
+    and both refused under decision 6. The band is where the lattice makes it most visible, not
+    where the defect lives.
+
+    **Only clips of 2 to 21 frames change.** A single frame floored at 1 already, and the still
+    branch in `plan()` never consults this function at all; everything from 22 up floors at
+    `MIN_WINDOW` under both readings.
+
+    **THE LADDER BOTTOMS AT `LADDER_BOTTOM`, NOT AT 1** (CF, 2026-08-28, second amendment).
+    A window of 1 is on the 4n+1 lattice, so "walk the ladder as you can" permitted it — and it
+    must not be offered, because a window of 1 on a multi-frame clip is NO TEMPORAL CONTEXT AT
+    ALL: every frame alone, image upscaling of a video at the model's full price. That is what
+    `MIN_WINDOW` exists to prevent, arriving at its own limit. The refusal is honest — the
+    smallest window with any temporal context does not fit this card.
+
+    **Measured before it was ruled, and the two sets turned out identical rather than
+    overlapping.** Sweeping clips of 2-21 frames across five targets and nine budgets: 620 plans
+    returned, 80 at w1, 80 broken, and *every* broken plan was at w1 and *every* w1 plan was
+    broken. So bottoming at 5 refuses exactly the 80 and costs the other 540 nothing. The two
+    breakages at w1: `best_overlap`'s tail repair raises the overlap to 1 there, so
+    `solver.config_of_plan` emits `batch_size=1, temporal_overlap=1` — a stride of ZERO — past a
+    `preflight` with no overlap-versus-batch guard; and w1 is where the closed form bottoms out
+    on a card too small for w5, so the sampler price can exceed the budget (2 frames at 4320 on
+    18.0 GiB usable returned a plan priced 21.44 against 18.0).
+
+    **Both guards stay OUT while the bottom is 5**, and that is deliberate rather than an
+    oversight. w1 is unreachable again, so a budget check on the video branch and an
+    overlap-versus-batch rule would both be dead code — which this repository has ruled against
+    twice. **If the bottom is ever moved back to 1, both come with it.** That sentence is the
+    whole reason this paragraph exists.
+
+    **`frames == 1` returns 1.** A still never reaches this function — `plan()` branches on it
+    before the floor is consulted — but the value IS published: `estimator.py` puts it in
+    `shortfall.quality_floor_frames` and `handler.py` renders it into an OOM refusal's prose. A
+    still refused with "no window at or above the 5-frame quality floor" would be telling a
+    caller about a floor their job cannot have.
+
+    The mirror of this function is `fable/plan_oracle.py:_window_floor` and the two must agree;
+    `plan_replay`'s cases 0a, 0b and 0c are what make a disagreement fail rather than drift.
     """
-    return min(MIN_WINDOW, ideal_window(frames))
+    if frames == 1:
+        return 1
+    return MIN_WINDOW if frames > MIN_WINDOW else LADDER_BOTTOM
 
 
 def _schedule_metrics(frames, window, overlap):
