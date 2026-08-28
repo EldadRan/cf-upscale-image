@@ -426,7 +426,12 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
     needed = float(needed) if needed else max(repriced or 0.0, usable) * 1.0001
     answer = planner.correct(src, frames, target, usable, phase, needed, failed,
                              host_ram_gb=host_ram,
-                             tile_quality=failed.get("tile_quality", "default"))
+                             tile_quality=failed.get("tile_quality", "default"),
+                             # Read off the job rather than threaded through this signature:
+                             # `next_after_oom` already holds it, and a parameter would be a
+                             # second place for the same fact to be right or wrong.
+                             allow_below_floor=bool(
+                                 job.get("allow_below_quality_floor")))
 
     lever = planner.PHASE_LEVER.get(phase, "window")
     basis = "measured from the message: {} corrected against {:.2f} GiB needed at w{}".format(

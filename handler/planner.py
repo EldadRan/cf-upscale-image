@@ -674,7 +674,7 @@ def _terminal(reason, **extra):
 
 def plan(src, frames, target, vram_free_gb=None, host_ram_gb=None, usable_gb=None,
          gpu_name=None,
-         tile_quality="default", schedule="max_window"):
+         tile_quality="default", schedule="max_window", allow_below_floor=False):
     """The six steps, in the order quality demands. Returns a plan, or a terminal state.
 
     `src` is `(width, height)` of the source, `target` the requested short edge. Give either a
@@ -711,6 +711,12 @@ def plan(src, frames, target, vram_free_gb=None, host_ram_gb=None, usable_gb=Non
     out_w, out_h = output_plane(src[0], src[1], target)
     r_mp = out_w * out_h / 1e6
 
+    # **False before the branch, because only the video path can set it.** The still branch
+    # below never consults the floor at all -- `MIN_WINDOW` is temporal and one frame has no
+    # temporal dimension -- so a flag initialised inside the `else` would be undefined on every
+    # still, on a line that only runs when the caller passed the new field.
+    sub_floor = False
+
     # ── step 1 — window, closed-form ────────────────────────────────────────────────────────
     # **Stills branch before the floor is consulted, not after.** `MIN_WINDOW` is a *temporal*
     # quality floor; a single image has no temporal dimension for it to floor, and applying it
@@ -730,12 +736,65 @@ def plan(src, frames, target, vram_free_gb=None, host_ram_gb=None, usable_gb=Non
     else:
         window = min(window_for(usable, r_mp), _pad(frames))
         floor = window_floor(frames)
-        if window < floor:
+        if window < floor and not allow_below_floor:
             return _terminal(
                 "no window at or above the {}-frame quality floor fits {:.1f} GiB usable: the "
                 "closed form gives {}, and below the floor the model stops beating a plain "
                 "enlargement".format(floor, usable, max(0, window)),
-                best_window=window)
+                best_window=window,
+                # **THE ONE TERMINAL `allow_below_quality_floor` CAN LIFT, said in a field
+                # rather than in prose.** Every other terminal in this module refuses for a
+                # reason the flag does not touch -- a still that does not fit, a decode grid
+                # that cannot be built, a host cap, and the two sub-floor refusals below which
+                # fire with the flag already on. Offering the option against any of those is
+                # the defect board item 10 exists to remove, and matching on the reason string
+                # would put the contract in a sentence. The window must also be greater than 1:
+                # at a window of 1 there is no temporal context to buy back.
+                below_floor_would_help=window > 1)
+        # **The caller took §6's second option, so the floor stops being a refusal and becomes a
+        # fact about the plan.** `_terminal` has always listed "flagged sub-floor run" among the
+        # two ways out; this is the branch that lets it be taken.
+        sub_floor = window < floor
+        if sub_floor:
+            # **THE FLOOR WAS DOING TWO JOBS AND ONLY ONE OF THEM IS THE CALLER'S TO WAIVE.** It
+            # refused sub-floor QUALITY, and it incidentally refused plans that do not FIT --
+            # because `window_for` is `_lattice_floor(...)`, which is `max(1, ...)`, so a card
+            # that cannot hold a single frame gets 1 back rather than 0 and the floor comparison
+            # was the only thing standing between that and a returned plan. The video branch has
+            # no budget check of its own; the still branch above has one, and this is its twin.
+            #
+            # Without it: (7680x4320, 200 frames, usable 18.0) returned action "plan" at w1 with
+            # dit_sample priced 21.44 against 18.0 usable, binder dit_sample -- a guaranteed
+            # sampler OOM shipped as a plan, on a paid dispatch, where the same call without the
+            # flag was a terminal.
+            if dit_price(r_mp, window) > usable:
+                return _terminal(
+                    "at {} the sampler prices {:.2f} GiB against {:.1f} usable even at a window "
+                    "of {} -- below the {}-frame floor and still short, so waiving the floor "
+                    "buys nothing".format("{}x{}".format(out_w, out_h),
+                                          dit_price(r_mp, window), usable, window, floor),
+                    best_window=window)
+            # **A window of 1 on a multi-frame clip is refused even here, and it is not a
+            # clamp.** `MIN_WINDOW` says the model stops beating a plain enlargement below 21
+            # frames of context; at a window of 1 there is no temporal context at all, which is
+            # a plain enlargement rather than a quieter version of the model. There is nothing
+            # for the caller to buy.
+            #
+            # It is also the shape that breaks downstream. `best_overlap`'s tail repair raises
+            # the overlap to 1 at this window, and `solver.config_of_plan` then emits
+            # `batch_size=1, temporal_overlap=1` -- a stride of `w - v == 0` -- past a
+            # `preflight` that checks `batch > chunk`, swap devices, tile multiples and
+            # `prepend_frames` and has no `overlap >= batch` guard. And `passes` becomes one
+            # entry per frame: 100,000 frames returned a 100,000-element list into the
+            # rationale and the row, which is F-2026-08-18-15's allocation pathology reachable
+            # without a GPU-second.
+            if window <= 1:
+                return _terminal(
+                    "the largest window that fits {:.1f} GiB usable at {} is 1, which is no "
+                    "temporal context at all -- a plain enlargement rather than a quieter run, "
+                    "so there is nothing below the {}-frame floor left to offer".format(
+                        usable, "{}x{}".format(out_w, out_h), floor),
+                    best_window=window)
     # **The host cap is computed before the window is final**, because the balanced lever may
     # step the window down and can only judge that against the spans it would actually produce —
     # chunk quantization and tail included. Step 5 consumes the same number further down.
@@ -859,6 +918,12 @@ def plan(src, frames, target, vram_free_gb=None, host_ram_gb=None, usable_gb=Non
         "usable": round(usable, 2), "out": "{}x{}".format(out_w, out_h),
         "ideal_window": ideal_window(frames),
         "tile_quality": tile_quality,
+        # **Always present, like `residency` below and for the same reason.** A field that
+        # appears only on the unusual run makes its absence ambiguous, and this one has to be
+        # readable by the manifest, the run-record and anyone auditing a delivered master. False
+        # on every ordinary job; True means the caller took §6's second option and this plan ran
+        # at a window the quality floor would otherwise have refused.
+        "sub_floor": sub_floor,
         "blocks_to_swap": 36,
         # **Always present, at every rung.** A field that appears only when something unusual
         # happened makes its absence ambiguous — "resident" and "this build has no ladder" would
@@ -969,6 +1034,11 @@ def rationale_line(answer):
     if answer.get("action") != "plan":
         return "terminal: {}".format(answer.get("reason"))
     prices = answer["prices"]
+    # **The unusual state earns a clause, on the same principle as `blind` and the residency
+    # note below.** Without it the human line for a sub-floor run is identical to an in-spec
+    # one and a reader has to re-derive `window_floor(frames)` to tell them apart -- in the one
+    # place the plan is written for a person rather than parsed.
+    sub_floor = " · SUB-FLOOR (caller waived the quality floor)" if answer.get("sub_floor") else ""
     return ("w{} · dit {:.2f}{} · enc {:.2f} {} · dec {:.2f} @{} ({:.1%} blended) · post {:.2f} "
             "· of {} usable{} · registry v{}".format(
                 answer["w"], prices["dit_sample"],
@@ -986,7 +1056,8 @@ def rationale_line(answer):
                 ("" if answer.get("residency", RESIDENT) == RESIDENT else
                  " · model EVICTED for the peak phase ({} eviction(s), {} reload(s))".format(
                      answer.get("evictions", 1), answer.get("reloads", 0)))
-                + (" · BLIND, lowest in-spec plan" if answer.get("blind") else ""),
+                + (" · BLIND, lowest in-spec plan" if answer.get("blind") else "")
+                + sub_floor,
                 answer["registry_version"]))
 
 
@@ -1090,7 +1161,7 @@ PHASE_LEVER = {"dit_sample": "window", "vae_decode": "decode_grid",
 
 
 def correct(src, frames, target, usable_gb, phase, needed_gb, failed,
-            host_ram_gb=None, tile_quality="default"):
+            host_ram_gb=None, tile_quality="default", allow_below_floor=False):
     """Re-plan after a confirmed OOM: **the same six steps with one constant updated.**
 
     An OOM is a measurement. `needed_gb` is what the failing phase turned out to require at the
@@ -1139,7 +1210,15 @@ def correct(src, frames, target, usable_gb, phase, needed_gb, failed,
                 "attempt".format(float(needed_gb), failed["w"], usable_gb, failed["w"]),
                 window_cap=window, lever=lever)
         floor = window_floor(frames)
-        if window < floor:
+        # **The flag reaches the RECOVERY too, and that is a decision rather than a
+        # consequence.** `allow_below_quality_floor` is a statement about the master the caller
+        # will accept, not about which code path decides it. Honouring it on the initial plan
+        # and refusing it here would strand a job that was planned sub-floor, OOMed, and could
+        # have finished quieter -- a paid run abandoned mid-flight over a guarantee the caller
+        # had already given up. The correction still refuses when the window cannot move at all
+        # (the branch above), because that is a lever with nothing left rather than a quality
+        # choice.
+        if window < floor and not allow_below_floor:
             # **`window_floor(frames)`, not `MIN_WINDOW`.** For a clip shorter than 21 frames the
             # floor is the clip (ratified by CF 2026-08-18), and quoting the constant here shipped
             # a number that was wrong for exactly the shots the ruling was about. The *outcome*
@@ -1261,6 +1340,12 @@ def _held(failed, src, frames, target, usable_gb, r_mp, chunk, lever,
         "usable": round(usable_gb, 2), "out": "{}x{}".format(out_w, out_h),
         "ideal_window": ideal_window(frames),
         "tile_quality": failed.get("tile_quality", "default"),
+        # **A CORRECTION CAN CROSS THE FLOOR TOO, and it used to do so silently.** `correct()`
+        # honours `allow_below_floor`, so its window lever can step below the floor on a job
+        # whose INITIAL plan was in spec -- and this dict carried no such key, so every reader
+        # downstream saw the initial plan's answer and nothing else. A master delivered at w13
+        # against a 21-frame floor read as in-spec.
+        "sub_floor": frames > 1 and window < window_floor(frames),
         "blocks_to_swap": 36,
         "anchored": usable_gb <= ANCHORED_MAX_USABLE,
         "registry_version": REGISTRY_VERSION,

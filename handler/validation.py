@@ -176,6 +176,20 @@ PARAMS_FIELDS = {
     # than aliased, because two names for one field is how a contract acquires a wrong one.
     "output_size",
     "allow_oom_retry",
+    # **The second of §6's two ways out, and it lives HERE because of what it changes.**
+    # `estimator._terminal_options` has offered "resend with allow_below_quality_floor=true"
+    # since the terminal state was written, and the field was in neither set: in `params` the
+    # door refused it by name and blamed the caller, and at the top level the leniency rule
+    # swallowed it and the job refused again, identically. A remedy naming an action the
+    # contract forbids, costing a paid dispatch to discover, with the second failure looking
+    # like the caller's fault. Board item 10, CF 2026-08-28.
+    #
+    # **`params` rather than the top level is settled by this module's own docstring, not by
+    # taste.** The leniency rule at the top level is provably safe only because everything that
+    # affects the output lives in `params`; a below-floor run changes what the master looks
+    # like, so putting it at the top level would be the one field that breaks the argument the
+    # rest of the contract rests on.
+    "allow_below_quality_floor",
     "color_correction",
     "keep_audio",
     # **The master's constant-rate factor** (CF, 2026-08-18, pulled forward from the parked
@@ -601,6 +615,14 @@ def validate(job_input):
     allow_oom_retry = True if allow_oom_retry is None else _as_bool(
         allow_oom_retry, "allow_oom_retry")
 
+    # **Default False, and the asymmetry with `allow_oom_retry` above is deliberate.** An OOM
+    # retry costs time and delivers the same master, so defaulting it on takes nothing from the
+    # caller. This one gives up the guarantee that the model beat a plain enlargement, which is
+    # the caller's to give up and nobody else's -- so absent means the guarantee stands.
+    allow_below_quality_floor = params.get("allow_below_quality_floor")
+    allow_below_quality_floor = False if allow_below_quality_floor is None else _as_bool(
+        allow_below_quality_floor, "allow_below_quality_floor")
+
     keep_audio = params.get("keep_audio")
     keep_audio = DEFAULT_KEEP_AUDIO if keep_audio is None else _as_bool(
         keep_audio, "keep_audio")
@@ -663,6 +685,7 @@ def validate(job_input):
         "source_url": _as_str(job_input["source_url"], "source_url"),
         "target_short_edge_px": target,
         "allow_oom_retry": allow_oom_retry,
+        "allow_below_quality_floor": allow_below_quality_floor,
         "keep_audio": keep_audio,
         "color_correction": color_correction,
         # **All three from `envelope.derive`, never re-derived here.** One home for the codec
