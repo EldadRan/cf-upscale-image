@@ -1458,14 +1458,20 @@ def _phase_watch_state():
         # **A watch nobody stamped is ACCEPTED, and the distinction is the point.** In production
         # every watch is stamped, because `pipeline.run` is the only thing that installs one and
         # it stamps at construction — so a leftover from an earlier attempt or an earlier job
-        # always carries a token, and always a different one. An UNSTAMPED watch means something
-        # installed one without going through that path, which is the acceptance kit replacing
-        # `pipeline.run` wholesale.
+        # always carries a token, and always a different one.
         #
         # **Refusing it would be refusing what cannot be shown to be foreign**, which is the
         # opposite of the rule this function exists to serve: absent beats wrong, and a watch
         # that might be this attempt's is not wrong. The leak being closed is a watch stamped
         # with a DIFFERENT token, and that case is unaffected.
+        #
+        # **NOTHING EXERCISES THIS BRANCH ANY MORE, and it says so rather than looking covered.**
+        # It existed because the acceptance kit's double left the stamp off, so rung 1 took this
+        # path on every case — exercising a route production cannot reach while never reaching
+        # the refusal the check was written for, which is this repository's own defect class. The
+        # kit's double is stamped now (`tests/run_local.py`, and a case asserts the refusal
+        # directly), so this is defensive only: it survives for a future double, or a caller that
+        # installs a watch outside `pipeline.run`, and neither exists today.
         return watch, None
     if stamp is not token:
         return None, ("the watch on pipeline.run belongs to an earlier attempt or an earlier "
