@@ -496,25 +496,60 @@ def _library_versions():
     return versions
 
 
-def _smi(query):
-    """One `nvidia-smi --query-gpu` field for device 0, or `UNREADABLE`. **Never raises.**
+#: Read once and kept. **Every field in it is stable for the life of the container** -- link
+#: topology, clock ceilings and which card this is do not change between attempts -- and
+#: `hardware.read()` is called three or four times a job, once before validation and twice inside
+#: the model attempt, two of those landing inside the phase stopwatch that feeds the ETA and the
+#: rate. A per-read shell-out would put process-spawn latency inside a measured phase, which is
+#: the opposite of what telemetry is for.
+_TOPOLOGY_CACHE = None
+
+#: The eight fields, in ONE query. `nvidia-smi --query-gpu` takes a comma-separated list and
+#: returns a single CSV row, so this is one subprocess rather than eight for the same
+#: information. The first draft spawned eight, each with its own 5 s timeout -- up to 40 s per
+#: read on a wedged driver, and the read inside `_Ratchet.step()` happens straight after
+#: `release_gpu_memory()`, which is the moment the driver is least likely to answer promptly.
+_TOPOLOGY_FIELDS = ("pcie.link.width.current", "pcie.link.width.max",
+                    "pcie.link.gen.current", "pcie.link.gen.max",
+                    "clocks.max.sm", "clocks.max.memory", "serial", "uuid")
+
+_TOPOLOGY_KEYS = ("pcie_link_width_current", "pcie_link_width_max",
+                  "pcie_link_gen_current", "pcie_link_gen_max",
+                  "clock_max_sm_mhz", "clock_max_mem_mhz", "gpu_serial", "gpu_uuid")
+
+
+def _smi_row(fields):
+    """One `nvidia-smi --query-gpu` call for device 0. A list of strings, or a string saying why
+    not. **Never raises.**
 
     **Shelled out rather than read through torch**, because none of these is exposed there:
-    torch reports what the allocator sees, and link topology and clock ceilings are properties
-    of the machine rather than of the process. Bounded by a short timeout so a wedged smi cannot
-    hold a job -- the whole block is telemetry and a job must not wait on it.
+    torch reports what the allocator sees, and link topology and clock ceilings are properties of
+    the machine rather than of the process.
+
+    **The failure REASON is kept rather than collapsed.** An earlier draft returned a bare
+    `UNREADABLE` for an absent binary, a non-zero exit, a timeout and an empty field alike --
+    which defeats the sentinel's own purpose, since a field name a future driver stops
+    recognising would be indistinguishable from a machine with no GPU. `stderr` carries that
+    distinction and keeping it costs nothing.
     """
     try:
         import subprocess  # noqa: PLC0415
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=" + query, "--format=csv,noheader,nounits", "-i", "0"],
+            ["nvidia-smi", "--query-gpu=" + ",".join(fields),
+             "--format=csv,noheader,nounits", "-i", "0"],
             capture_output=True, text=True, timeout=5)
         if out.returncode != 0:
-            return UNREADABLE
-        value = (out.stdout or "").strip().splitlines()
-        return (value[0].strip() or UNREADABLE) if value else UNREADABLE
-    except Exception:  # noqa: BLE001 — no smi, no GPU, a timeout: all telemetry, none fatal
-        return UNREADABLE
+            return "{}: {}".format(
+                UNREADABLE,
+                (out.stderr or "").strip()[:120] or "exit {}".format(out.returncode))
+        rows = (out.stdout or "").strip().splitlines()
+        if not rows:
+            return "{}: nvidia-smi returned no rows".format(UNREADABLE)
+        return [part.strip() or UNREADABLE for part in rows[0].split(",")]
+    except FileNotFoundError:
+        return "{}: nvidia-smi is not installed".format(UNREADABLE)
+    except Exception as exc:  # noqa: BLE001 — a timeout, a wedged driver: never fatal
+        return "{}: {}".format(UNREADABLE, type(exc).__name__)
 
 
 def _gpu_topology():
@@ -531,30 +566,28 @@ def _gpu_topology():
     **The volatile half is deliberately NOT here.** Current clocks and throttle reasons are
     sampled at phase boundaries in a separate wave item, because a read at `hardware.read()` time
     samples the machine before the model has touched it -- the moment least likely to show the
-    degradation this is hunting. Ruled by the gate, 2026-08-28, and folding it in here would
-    answer a different question from the one the two runs pose.
+    degradation this is hunting. Ruled by the gate, 2026-08-28.
 
-    Every value is `UNREADABLE` rather than absent when the read fails, so a machine with no
-    `nvidia-smi` is distinguishable from a field nobody populated.
+    **Cached, because it cannot change and the read is not free.** See `_TOPOLOGY_CACHE`.
     """
-    return {
-        # Current AND max, because the pair is the finding: either alone says nothing about
-        # whether the link is degraded.
-        "pcie_link_width_current": _smi("pcie.link.width.current"),
-        "pcie_link_width_max": _smi("pcie.link.width.max"),
-        "pcie_link_gen_current": _smi("pcie.link.gen.current"),
-        "pcie_link_gen_max": _smi("pcie.link.gen.max"),
-        # The ceilings, which are stable. What the card is CURRENTLY clocked at belongs to the
-        # sampled series and is not read here.
-        "clock_max_sm_mhz": _smi("clocks.max.sm"),
-        "clock_max_mem_mhz": _smi("clocks.max.memory"),
-        # **Beyond RUNPOD_POD_ID, which names the worker and not the machine.** Two runs on one
-        # worker id landed on hosts that behaved 1.9x apart; the GPU's own serial and UUID are
-        # the only identifiers here that follow the silicon.
-        "gpu_serial": _smi("serial"),
-        "gpu_uuid": _smi("uuid"),
-        "host_id": os.environ.get("RUNPOD_POD_HOSTNAME") or UNREADABLE,
-    }
+    global _TOPOLOGY_CACHE
+    if _TOPOLOGY_CACHE is not None:
+        # A copy, so a caller mutating its snapshot cannot poison every later read.
+        return dict(_TOPOLOGY_CACHE)
+
+    row = _smi_row(_TOPOLOGY_FIELDS)
+    if isinstance(row, str) or len(row) != len(_TOPOLOGY_KEYS):
+        why = row if isinstance(row, str) else "{}: expected {} fields, got {}".format(
+            UNREADABLE, len(_TOPOLOGY_KEYS), len(row))
+        topology = {key: why for key in _TOPOLOGY_KEYS}
+    else:
+        topology = dict(zip(_TOPOLOGY_KEYS, row))
+    # **Beyond RUNPOD_POD_ID, which names the worker and not the machine.** Two runs on one
+    # worker id landed on hosts that behaved 1.9x apart; the GPU's own serial and uuid above are
+    # the only identifiers here that follow the silicon.
+    topology["host_id"] = os.environ.get("RUNPOD_POD_HOSTNAME") or UNREADABLE
+    _TOPOLOGY_CACHE = topology
+    return dict(topology)
 
 
 def _round(value):

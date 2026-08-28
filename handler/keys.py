@@ -24,11 +24,17 @@ making it more predictable."* Two things overturn it and only the second is new.
 desktop, a proxy attached to a message — every one of them was `master.mp4`, with nothing on it to
 say which job made it. The prefix identifies the file only while the file is still in it.
 
-**And under a date-partitioned prefix the old premise is simply gone.** `req/<id>/` carried the
-identity; `YYYY/MM/DD/` does not. Two jobs on the same day would both write `manifest.json`, and
-the second would silently overwrite the first. So the filename rule does not merely get to
-change — **it must.** *(storage.md §3, CF 2026-08-28. Written here because the old rule was
-correct for the old layout and somebody will otherwise re-derive it in six months.)*
+**And the prefix stops carrying the identity.** `req/<id>/` had the id in it; a date-partitioned
+prefix is about when rather than about which. *(storage.md §3, CF 2026-08-28. Written here
+because the old rule was correct for the old layout and somebody will otherwise re-derive it in
+six months.)*
+
+**FILED, NOT SETTLED, and this file does not rest on it.** `storage.md` §3 argues the change from
+"two jobs on the same day would both write `manifest.json`" — which holds only if the prefix is
+`YYYY/MM/DD/`. Its own §1 gives the layout as `YYYY/MM/DD/<request_id>/`, under which two jobs on
+one day are in different directories and could not collide. Both cannot be true. The first
+argument above — a file that leaves its directory is anonymous — holds under either reading and
+is the one this module is built on; the collision argument is the gate's to resolve.
 
 **THE EXTENSION STAYS OURS**, and that is not a leftover from the old scheme. Which extension is
 right is a fact only this worker knows at delivery time — a one-frame job is not a short video at

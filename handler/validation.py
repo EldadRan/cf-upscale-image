@@ -356,6 +356,12 @@ _AVOID = set('{}^%`]">[~<#|')
 #: ceiling here is generous against the real budget rather than against the raw limit.
 MAX_REQUEST_ID_BYTES = 256
 
+#: **ASCII digits only.** `str.isdigit()` accepts far more than this and `int()` accepts a
+#: different, overlapping set — the gap between them is where a date can pass a shape check and
+#: then either crash or parse into something nobody sent. Named rather than inlined so the two
+#: date checks below cannot drift apart from each other.
+ASCII_DIGITS = frozenset("0123456789")
+
 
 def _validated_request_id(value):
     """`request_id`, checked because it becomes part of every key. **REFUSED, never sanitized.**
@@ -427,11 +433,24 @@ def _validated_request_date(value):
             MISSING_REQUIRED_FIELD,
             "field 'request_date' is required at the top level of 'input'")
     date = _as_str(value, "request_date")
+    # **`ASCII_DIGITS`, not `str.isdigit()`.** `isdigit()` is true for superscripts and for every
+    # non-ASCII digit family, which broke this check in both directions at once:
+    #
+    #   "2026-0²-28"  passed every shape test and then raised ValueError out of int() --
+    #                  escaping validate() entirely, past `handle`'s `except WorkerError`, to be
+    #                  reported as `internal` and retried three times. That is precisely the
+    #                  failure this module's docstring says validation must never produce.
+    #   "٢٠٢٦-٠٨-٢٨"  passed AND parsed -- int() accepts Arabic-Indic digits -- so it was
+    #                  ACCEPTED and landed in manifest.request_date, which is the recovery
+    #                  path's only record of which day's partition an object came from.
+    #
+    # The second is the worse one because nothing fails. `YYYY-MM-DD` means ten ASCII bytes.
     if len(date) != 10 or date[4] != "-" or date[7] != "-" \
-            or not (date[:4].isdigit() and date[5:7].isdigit() and date[8:].isdigit()):
+            or not all(c in ASCII_DIGITS for c in date[:4] + date[5:7] + date[8:]):
         raise WorkerError(
             INVALID_FIELD_VALUE,
-            "field 'request_date' must be exactly YYYY-MM-DD, got {!r}".format(date))
+            "field 'request_date' must be exactly YYYY-MM-DD in ASCII digits, "
+            "got {!r}".format(date))
     month, day = int(date[5:7]), int(date[8:])
     if not 1 <= month <= 12 or not 1 <= day <= 31:
         raise WorkerError(

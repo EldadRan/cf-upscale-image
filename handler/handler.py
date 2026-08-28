@@ -152,13 +152,27 @@ def handle(job_input, job=None):
     # `handler()` turned it into `internal` — so every bad field was reported as a worker fault.
     # That is precisely the failure the two error tables exist to prevent, and it costs CF three
     # retries and a wrong diagnosis on a request that will fail identically forever.
+    # **Constructed BEFORE validation, because the validation refusal is a response shape and
+    # `_decorate` needs it.** It depends only on `job`, so there is nothing to wait for; what
+    # made it sit lower was that nothing above it emitted. It still emits nothing above -- the
+    # decorator reads `progress.emitted`, which is empty on this path and correctly reports no
+    # `progress_emitted` key at all.
+    progress = progress_module.Progress(job=job)
+
     try:
         request = validation.validate(job_input)
     except WorkerError as exc:
-        payload = exc.to_dict()
-        payload["hardware"] = machine
-        payload["execution_ms"] = int((time.time() - started) * 1000)
-        return payload
+        # **Through `_decorate`, not around it.** This built its two fields by hand, so the one
+        # response shape the debug gate itself produces -- a refusal for sending a lever without
+        # `debug` -- was the one shape carrying no `debug` key. `_decorate`'s own docstring
+        # claims every shape passes through it; this is what makes that true.
+        #
+        # **`job_input` rather than `request`, because `request` does not exist here**: this is
+        # the branch where validation raised, so the only reading of `debug` available is the
+        # raw one. A caller who sent `debug: true` and then a malformed lever is recorded as the
+        # debug run they were.
+        return _decorate(exc.to_dict(), machine, [], [], progress, started,
+                         debug=(job_input or {}).get("debug"))
 
     warnings = []
     attempts = []
@@ -168,7 +182,6 @@ def handle(job_input, job=None):
     # before it started — could not be written at all.
     trace = {}
     workdir = tempfile.mkdtemp(prefix="cf-upscale-")
-    progress = progress_module.Progress(job=job)
 
     # **The outcome, recorded where all three exits can reach it.** The run-record is written in
     # the `finally` below because that is the only point every run passes through — delivered,
@@ -1246,7 +1259,15 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
             "out of memory, and no configuration at or above the {}-frame quality floor fits in "
             "the memory this card has. A larger card is the remedy; a narrower window would be a "
             "worse picture than not running the model at all.".format(
-                planner.window_floor(max(1, int(estimated_frames or 1)))),
+                # **`or 1` produced a floor of 1 on a multi-frame clip**, on a video whose
+                # container carries no duration or fps -- telling a caller about a one-frame
+                # floor immediately after CF ruled that a window of 1 must never be offered.
+                # Unchanged in behaviour from the old formula, and now actively contradicted by
+                # the constant the same wave introduced. An unknown frame count is a video until
+                # something says otherwise, so it takes the ladder's bottom rather than the
+                # still's floor.
+                planner.window_floor(int(estimated_frames)
+                                     if estimated_frames else planner.LADDER_BOTTOM)),
             remedy=errors.Remedy.LARGER_GPU,
             shortfall=shortfall,
         )
