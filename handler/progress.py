@@ -54,7 +54,30 @@ class Progress:
     payloads are still recorded, which is what lets rung 1 assert the shape without RunPod.
     """
 
-    def __init__(self, job=None, estimated_frames=None, enabled=True):
+    #: **Emitted only under `debug: true`** (api.md section 7b, CF 2026-08-28). These exist for
+    #: us rather than for CF, and each one is a promise nobody should be able to build on:
+    #:
+    #:   `rung`             the internal bundle name. Already removed from the DELIVERED response
+    #:                      as "never part of the contract" -- and left in every progress payload,
+    #:                      which is the half this closes.
+    #:   `model_phase`      SeedVR2's OWN stage names. Publishing them couples a caller's UI to
+    #:                      the vendored model: swap the model and a switch statement breaks on a
+    #:                      field nobody was promised.
+    #:   `batch`/`batch_of` window mechanics. CF does not choose the window and cannot act on it.
+    #:   `chunk_pct`        identical to `pct` in every payload of the 2026-08-28 run.
+    #:   `frames_in_flight` internal scheduling, and it is what makes `frames_done` structurally 0.
+    #:
+    #: **`phase` STAYS PUBLIC, with its full vocabulary** (api.md section 7f, CF 2026-08-28). It
+    #: is the field a caller's UI is built on and it is ours to keep stable; `model_phase` is the
+    #: one that names somebody else's stages. The two are easy to conflate and the gate must not.
+    DEBUG_ONLY_FIELDS = ("rung", "model_phase", "batch", "batch_of", "chunk_pct",
+                         "frames_in_flight")
+
+    def __init__(self, job=None, estimated_frames=None, enabled=True, debug=False):
+        #: **Default closed.** A Progress built without an opinion emits the public surface only,
+        #: so a caller that forgets to thread it through leaks nothing -- the failure direction is
+        #: a missing field in our own diagnostics rather than a promise made to CF by accident.
+        self._debug = bool(debug)
         self._job = job
         # **RunPod's retry counter, read off the job rather than counted here.** A worker that is
         # restarting cannot count its own restarts — the count died with the previous container —
@@ -154,6 +177,14 @@ class Progress:
         payload["attempt"] = self._attempt
         payload["elapsed_s"] = int(time.time() - self._started)
         payload.update(facts)
+        # **Stripped HERE, at the one funnel every payload passes through.** `working()`,
+        # `frames()` and `heartbeat()` all build their facts and hand them to this method, so a
+        # gate at each emitter would be three gates to keep in step and a fourth to forget when
+        # the next emitter is written. The callers go on passing what they always passed; what
+        # changes is what leaves.
+        if not self._debug:
+            for field in self.DEBUG_ONLY_FIELDS:
+                payload.pop(field, None)
         self._emit(payload, force=force)
         return payload
 

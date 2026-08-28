@@ -192,7 +192,8 @@ def handle(job_input, job=None):
             # The code and the reason, never the log tail: this is a record, not a bundle, and a
             # tail is the bundle's job.
             outcome["error"] = {k: v for k, v in payload["cf_error"].items() if k != "log_tail"}
-            return _decorate(payload, machine, attempts, warnings, progress, started)
+            return _decorate(payload, machine, attempts, warnings, progress, started,
+                             debug=request.get("debug"))
         except Exception as exc:  # noqa: BLE001 — a job must return an envelope, never raise
             traceback.print_exc()
             _write_diagnostics(request, machine, attempts, exc, captured, failed=True,
@@ -205,7 +206,8 @@ def handle(job_input, job=None):
             outcome["status"] = "internal"
             outcome["error"] = {"code": errors.INTERNAL,
                                 "message": "{}: {}".format(type(exc).__name__, exc)}
-            return _decorate(payload, machine, attempts, warnings, progress, started)
+            return _decorate(payload, machine, attempts, warnings, progress, started,
+                             debug=request.get("debug"))
         finally:
             _write_run_record(outcome, request, machine, attempts, warnings, progress,
                               trace, job, started)
@@ -371,7 +373,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     estimated_frames = None
     if source["duration_s"] and source["fps"]:
         estimated_frames = int(round(source["duration_s"] * source["fps"]))
-    progress = progress_module.Progress(job=job, estimated_frames=estimated_frames)
+    progress = progress_module.Progress(job=job, estimated_frames=estimated_frames,
+                                        debug=request.get("debug"))
 
     # **An exact canvas changes what the model is asked for, not just what is delivered.** The
     # short edge has to cover the request in both axes or the final fit would enlarge one of them
@@ -693,7 +696,7 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
                 "crf": request.get("crf"), "tile_quality": request.get("tile_quality"),
                 "color_correction": request["color_correction"],
             },
-        }, machine, attempts, warnings, progress, started)
+        }, machine, attempts, warnings, progress, started, debug=request.get("debug"))
 
     # ── the load strip, which used to be silent ──────────────────────────────────────────────
     #
@@ -904,7 +907,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     }
     if warnings:
         response["warnings"] = warnings
-    return _decorate(response, machine, attempts, warnings, progress, started)
+    return _decorate(response, machine, attempts, warnings, progress, started,
+                     debug=request.get("debug"))
 
 
 def _job_shape_for(source, plan, estimated_frames, exact_size=None):
@@ -2007,8 +2011,17 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
         pass
 
 
-def _decorate(payload, machine, attempts, warnings, progress, started):
+def _decorate(payload, machine, attempts, warnings, progress, started, debug=None):
     payload["hardware"] = machine
+    # **`debug` is recorded, on every response shape** (api.md section 5, CF 2026-08-28). It
+    # reaches two `colorfix` calls today and appeared in no manifest, no response and no
+    # run-record, so a run that used a calibration lever was indistinguishable from one that did
+    # not -- which would make the gate a label rather than a control.
+    #
+    # Set here rather than at the four call sites because this is the one function every shape
+    # passes through: delivered, refused, internal and plan-only. Always present and never
+    # omitted-when-false, so its absence in an old record stays distinguishable from a false.
+    payload["debug"] = bool(debug)
     payload["execution_ms"] = int((time.time() - started) * 1000)
     if attempts:
         payload.setdefault("attempts", attempts)

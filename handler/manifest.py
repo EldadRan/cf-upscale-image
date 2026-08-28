@@ -75,6 +75,13 @@ def build(request, result, hardware, attempts, worker_version, model_build, job=
             "color_correction": request["color_correction"],
             "keep_audio": request["keep_audio"],
             "allow_oom_retry": request["allow_oom_retry"],
+            # **Recorded so a lever-driven run is distinguishable from an ordinary one** (api.md
+            # section 5, CF 2026-08-28). `debug` gates the twelve force_* levers, `pin`,
+            # `keep_alpha_in_model` and `plan_only` on the way in, and six internal fields on the
+            # way out -- and until this it appeared in no manifest at all, so a master produced
+            # under a forced rung looked exactly like one the formulas planned. `.get` with a
+            # default because a manifest may be rebuilt from a request that predates the field.
+            "debug": bool(request.get("debug")),
             # **The two caller levers, recorded because they are part of what the output is.**
             # A master's CRF is a property of that master and cannot be recovered from the file
             # with any confidence; `tile_quality` decided the decode grid, and therefore the

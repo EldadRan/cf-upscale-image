@@ -156,6 +156,35 @@ TOP_LEVEL_FIELDS = {
 
 REQUIRED_TOP_LEVEL = ("request_id", "source_url", "output", "params")
 
+#: **The calibration levers, which are ours and not CF's** (api.md section 5, CF 2026-08-28).
+#:
+#: Every one of these sits at the top level, where the leniency rule ignores names it does not
+#: know -- but it knows THESE, so they have been accepted from any caller since they were added.
+#: Nothing in a request says who sent it, so "internal" was a convention held up by nobody
+#: sending them.
+#:
+#: **Refused BY NAME without `debug`, never ignored.** Ignoring is the worse failure and this
+#: module's own docstring says why: a name the contract defines, offered where it is not
+#: accepted, changes the output silently if it is dropped. A caller who sends `force_rung` and
+#: gets a job planned by the formulas has been told nothing.
+#:
+#: **Derived from the field set rather than listed twice.** Every `force_*` name in
+#: `TOP_LEVEL_FIELDS` is a lever by construction, so a lever added later is gated the day it is
+#: added rather than the day someone remembers this set exists. The three that do not carry the
+#: prefix are named because they cannot be derived:
+#:
+#:   `pin`                  run exactly this, and if it does not fit, say so
+#:   `keep_alpha_in_model`  a temporary flag; CF never sends it
+#:   `plan_only`            a priced plan and no GPU-second. A TEST INSTRUMENT, not a capability
+#:
+#: **Why `debug` and not a secret or an endpoint key** (api.md section 5): all three stop a lever
+#: reaching production by accident and none stops a caller who decides to. `debug` costs nothing
+#: to keep honest -- no key, no rotation, no lookup, nothing that can go stale -- and it carries
+#: one idea, *this is not a production run*, which is already what debug logging means.
+DEBUG_ONLY_TOP_LEVEL = frozenset(
+    {f for f in TOP_LEVEL_FIELDS if f.startswith("force_")}
+    | {"pin", "keep_alpha_in_model", "plan_only"})
+
 # Everything that changes the output. Strict: a name here that this worker does not implement is
 # refused by name rather than ignored.
 PARAMS_FIELDS = {
@@ -547,6 +576,23 @@ def validate(job_input):
     # Lenient at the top level: unknown names are metadata by construction, since everything that
     # changes the output lives in `params`.
     _refuse_known_but_unaccepted(job_input, TOP_LEVEL_FIELDS, "at the top level of 'input'")
+
+    # **The `debug` gate, request half** (api.md section 5, CF 2026-08-28). Checked here, after
+    # the leniency sweep and before anything is parsed, so that a gated field is refused for
+    # being gated rather than for whatever its value happens to be -- a caller sending
+    # `force_rung: "nonsense"` without `debug` should be told the field is not theirs, not that
+    # the rung name is wrong.
+    #
+    # **Presence, not truthiness.** `plan_only: false` is still a caller reaching for an
+    # instrument that is not theirs, and refusing only the true case would make the gate depend
+    # on a value rather than on who is allowed to speak the name at all.
+    if not job_input.get("debug"):
+        for field in sorted(DEBUG_ONLY_TOP_LEVEL):
+            if field in job_input:
+                raise WorkerError(
+                    FIELD_NOT_SUPPORTED,
+                    "field '{}' is a calibration lever and is accepted only with "
+                    "'debug': true".format(field))
 
     for field in REQUIRED_TOP_LEVEL:
         _require(job_input, field, "at the top level of 'input'")
