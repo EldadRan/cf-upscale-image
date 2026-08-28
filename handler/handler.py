@@ -979,6 +979,18 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
     """
     while True:
         attempt_started = time.time()
+        # **A fresh token per attempt, published where `pipeline.run` will stamp it onto its
+        # watch.** `run.last_phases` is a function attribute that nothing clears, so a run which
+        # never reaches `pipeline.run` this attempt finds the previous one's watch still there —
+        # and `_record_phases` would write a delivered run's phase_seconds, phase_peaks_gb and
+        # gpu_series onto a still or a refusal, every field well-formed and every number from
+        # another job. ABSENT BEATS WRONG (CF, 2026-08-28): those runs now lose phase data, and
+        # that is the intended outcome rather than a side effect.
+        #
+        # **An `object()`, not a counter.** Identity is the whole requirement — two attempts must
+        # never compare equal — and a counter would collide across jobs on a warm worker, which
+        # is exactly the boundary this exists to catch.
+        pipeline.run.attempt_token = object()
         # **`batch_size` and the window it implies, because neither has ever left this process.**
         # The attempt carried `chunk_size` alone, so the temporal window -- `min(batch, chunk)`,
         # the dominant quality lever on video -- was not derivable from any response. A reader
@@ -1404,14 +1416,61 @@ def _say_host(label, writer=None):
             getattr(writer, "frames_written", "?"))))
 
 
+#: Distinguishes "this watch carries no stamp" from "this watch is stamped None". `getattr`'s
+#: own default cannot: a watch stamped with `None` — which is what `pipeline.run` writes when the
+#: handler published no token — would be indistinguishable from one never stamped at all.
+_UNSTAMPED = object()
+
+
 def _phase_watch():
-    """The watch the last `pipeline.run` installed, or None.
+    """The watch THIS ATTEMPT installed, or None. See `_phase_watch_state` for why not.
 
     Read through `getattr` for the same reason `last_ratchet` is: `run` publishes its results as
     attributes on the function, and a still, a refusal or a job that failed before the model was
     reached leaves them unset. Absent is a normal state here, not an error.
+
+    **And "unset" was never true.** Nothing clears `run.last_phases`, so on a warm worker the
+    previous run's watch is still there — `handler.py`'s own eviction comment describes it
+    surviving the idle window and a retry. Every caller of this function is attempt-scoped, so
+    the token check belongs here rather than at each of them.
     """
-    return getattr(pipeline.run, "last_phases", None)
+    return _phase_watch_state()[0]
+
+
+def _phase_watch_state():
+    """`(watch, why)` — the watch, or None with the reason it is not being used.
+
+    **Two absences with different causes must not read identically.** A run that never installed
+    a watch and a run whose watch belongs to another attempt are different facts about the
+    corpus: the first is a still or an early refusal, the second is a leak that would have been
+    recorded as measurement. Collapsing them is the defect the `gpu_series` early-return fix
+    closed one field over, and it would arrive here by the same route.
+    """
+    watch = getattr(pipeline.run, "last_phases", None)
+    if watch is None:
+        return None, "no watch on pipeline.run"
+    token = getattr(pipeline.run, "attempt_token", None)
+    if token is None:
+        # Nothing published a token, so nothing can be checked. Said rather than assumed clean.
+        return watch, None
+    stamp = getattr(watch, "attempt_token", _UNSTAMPED)
+    if stamp is _UNSTAMPED:
+        # **A watch nobody stamped is ACCEPTED, and the distinction is the point.** In production
+        # every watch is stamped, because `pipeline.run` is the only thing that installs one and
+        # it stamps at construction — so a leftover from an earlier attempt or an earlier job
+        # always carries a token, and always a different one. An UNSTAMPED watch means something
+        # installed one without going through that path, which is the acceptance kit replacing
+        # `pipeline.run` wholesale.
+        #
+        # **Refusing it would be refusing what cannot be shown to be foreign**, which is the
+        # opposite of the rule this function exists to serve: absent beats wrong, and a watch
+        # that might be this attempt's is not wrong. The leak being closed is a watch stamped
+        # with a DIFFERENT token, and that case is unaffected.
+        return watch, None
+    if stamp is not token:
+        return None, ("the watch on pipeline.run belongs to an earlier attempt or an earlier "
+                      "job; refused rather than attributed to this one")
+    return watch, None
 
 
 def _attempt_peak_gb():
@@ -1448,9 +1507,13 @@ def _record_phases(record):
     # reached the model — recorded no core count, which is exactly the run whose tail time would
     # later need one. Instrument-first, per the amendment: recorded, never fitted.
     record["cpu"] = phasewatch.cpu_configuration()
-    watch = _phase_watch()
+    watch, why = _phase_watch_state()
     if watch is None:
-        record["phase_watch"] = {"installed": False, "why": "no watch on pipeline.run"}
+        # **`stale` distinguishes the two absences**, so a corpus reader — and the classifier
+        # that decides which runs enter the fit — can tell "this run had no phases" from "this
+        # run's phases belonged to someone else and were refused".
+        record["phase_watch"] = {"installed": False, "why": why,
+                                 "stale": why is not None and "earlier" in why}
         return
     # **ABOVE the `peaks` early return, because the sampler is a different instrument.**
     # `gpu_series` was written below it, so a run whose torch peak read failed at every boundary

@@ -454,6 +454,15 @@ def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alph
     runner_cache = {}
     watch = PhaseWatch(cli, on_batch=_scheduling_eviction(on_batch, plan, runner_cache,
                                                           debug=cli.debug, schedule=schedule))
+    #: **Stamped with the attempt the handler is on.** `run.last_phases` is a function attribute
+    #: and nothing clears it, so on a warm worker it survives between jobs — and a run that
+    #: raises before reaching here (a still, a refusal, a failure before the stream) would find
+    #: the PREVIOUS run's watch waiting and record its phase times as its own. The stamp is what
+    #: lets `handler._phase_watch` tell this attempt's watch from a leftover.
+    #:
+    #: Read off `run` rather than taken as a parameter because `run`'s signature is the vendored
+    #: call's shape; the handler publishes the token the same way it reads the results back.
+    watch.attempt_token = getattr(run, "attempt_token", None)
     run.last_phases = watch
     #: **Reachable by the end-of-job release**, which runs in the handler's `finally` and has no
     #: sight of this scope. Published rather than passed because the release must also work on
