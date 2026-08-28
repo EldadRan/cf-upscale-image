@@ -43,6 +43,10 @@ PHASES = {
 #: The lever that phase's failure actually implicates. Not consulted here — this module only
 #: observes — but recorded beside the phase so the reader of a shortfall does not have to know the
 #: vendored architecture to act on it.
+#: Per-phase cap on kept samples. Phases close a handful of times a job — four is what the
+#: records show — so this is far above the real case and exists to bound the worst one.
+MAX_SAMPLES_PER_PHASE = 12
+
 LEVERS = {
     "vae_encode": ("vae_encode_tiled", "vae_encode_tile_size"),
     "dit_sample": ("batch_size", "blocks_to_swap", "swap_io_components"),
@@ -485,6 +489,9 @@ class PhaseWatch(object):
         #: Set when the breaker fires, and it names why. An instrument that silently stopped
         #: would read as a phase that produced no data rather than as a sampler that stood down.
         self.sampler_disabled = None
+        #: Samples taken past the per-phase cap. Counted rather than dropped silently — a phase
+        #: that re-entered more than `MAX_SAMPLES_PER_PHASE` times is itself a finding.
+        self.samples_dropped = 0
         self._sampler_off = False
 
     # ── installation ────────────────────────────────────────────────────────────────────────
@@ -632,7 +639,25 @@ class PhaseWatch(object):
 
             values, elapsed = hardware.sample_gpu_state()
             self.sampler_seconds = round(self.sampler_seconds + elapsed, 3)
-            self.gpu_state[self.phase] = values
+            # **A LIST, because a phase closes more than once.** `durations` accumulates with
+            # `+=` and `peaks` takes a `max` for exactly this reason -- a phase re-enters, and
+            # the record already reports "N phase duration(s) accumulated across re-entries".
+            # A single slot here would have made the reading the LAST close while the peak beside
+            # it was the MAX and the duration was the SUM: three different aggregations over one
+            # key, with nothing saying so. A reader comparing a degraded run against a clean one
+            # per phase would have been comparing one arbitrary sample of several.
+            #
+            # **Capped, because an unbounded list on a per-close path is how a record grows
+            # without limit.** Phases close a handful of times a job -- four is the observed
+            # figure -- so the cap is far above the real case and exists to make the worst case
+            # finite rather than to trim the normal one. A phase that exceeds it keeps its first
+            # samples and counts the rest, since the early ones are the ones with a clean run to
+            # compare against.
+            series = self.gpu_state.setdefault(self.phase, [])
+            if len(series) < MAX_SAMPLES_PER_PHASE:
+                series.append(values)
+            else:
+                self.samples_dropped += 1
             if elapsed > hardware.SAMPLE_BUDGET_S:
                 self._sampler_off = True
                 self.sampler_disabled = (
@@ -744,11 +769,14 @@ class PhaseWatch(object):
         """The volatile readings, their cost, and whether the sampler gave up. **Always a dict**,
         so a run that sampled nothing is distinguishable from a build that could not sample."""
         return {
-            "per_phase": dict(self.gpu_state),
+            # phase -> [reading, ...] in the order the phase closed. A list even at length one,
+            # so a reader never has to ask whether this phase happened to re-enter.
+            "per_phase": {k: list(v) for k, v in self.gpu_state.items()},
             # **The instrument's own price, in the corpus beside its readings.** Outside
             # `phase_seconds`, inside `attempt_seconds`. Named `_seconds` rather than folded
             # into a phase so nobody has to guess which of the two it was taken out of.
             "sampler_seconds": round(self.sampler_seconds, 3),
             "sampler_disabled": self.sampler_disabled,
-            "samples": len(self.gpu_state),
+            "samples": sum(len(v) for v in self.gpu_state.values()),
+            "samples_dropped": self.samples_dropped,
         }
