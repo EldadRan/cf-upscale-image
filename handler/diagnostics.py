@@ -330,10 +330,34 @@ def _runpod_identity(job):
 #: request carries `output`, and `output` carries a credential. A bundle that took the request
 #: entire would write a temporary key into a different bucket that outlives the incident — which
 #: is the one thing `CF_storage` states as a rule for this destination.
+#:
+#: **The codec surface, `tile_quality` and `schedule` are here because the corpus could not key on
+#: them** (`api.md` §6, ruled item 3). Zero of the 82 run records banked before this line carried a
+#: codec field of any kind, so "how many jobs shipped h265" was not a question `records/` could
+#: answer — every certification of the codec work rested on dated ledger verdicts and nothing
+#: queryable. These are the variables we ship; a pile of runs that cannot be keyed on them prices
+#: nothing.
+#:
+#: **The names are the FLATTENED ones, which is what a record reader will not expect.** On the wire
+#: the codec block is nested (`params.output.codec`) and `validation.py` flattens it exactly once;
+#: `request` here is always the flattened form, so `codec` is a top-level key by the time it
+#: reaches this tuple.
+#:
+#: **`codec` is what was ASKED FOR, not what shipped.** `"source"` is resolved after the probe
+#: (`envelope.resolve_codec`), and that resolution is not in this summary — it cannot be, because
+#: this is the request. A record whose `request.codec` reads `source` says which codec was
+#: *requested*; nothing in the record says which one came out. Filed to the gate rather than fixed
+#: here: the record's `output` block is scoped to "size and frame counts only" by its own comment
+#: in `handler.py`, and widening it is a spec decision.
 _REQUEST_FIELDS = (
     "target_short_edge_px", "output_size", "color_correction",
     "keep_audio", "allow_oom_retry", "execution_timeout_ms", "force_rung", "force_batch_size",
     "force_chunk_size", "force_temporal_overlap", "keep_alpha_in_model", "debug",
+    # The codec surface — `api.md` §2c, `contract.md` §1 is the law.
+    "codec", "crf", "preset", "head_keyframes", "keyframes", "keyframe_frames",
+    "keyframe_seconds",
+    # Named in the same ruling, and levers that move the plan rather than the picture.
+    "tile_quality", "schedule",
 )
 
 
