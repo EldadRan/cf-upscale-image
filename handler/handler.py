@@ -987,7 +987,7 @@ def _job_shape_for(source, plan, estimated_frames, exact_size=None):
 def _upscale_with_retry(cli, request, source, source_path, master_path, plan, rationale,
                         machine, attempts, progress, estimated_frames, still=False,
                         keep_alpha=False, exact_size=None, warnings=None, started=None,
-                        load_strip=None, codec=None):
+                        load_strip=None, codec=None, deadline=None):
     """Run the model, stepping down the ladder until a rung fits or the floor is reached.
 
     A job that OOMs has already spent everything: the source is fetched and on local disk, the
@@ -1056,12 +1056,23 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             # **Per attempt, not per job.** A fresh holder each time round the ladder, so a
             # failed rung's encoder peak can never be read onto a later rung's record.
             encoder_out = {}
+            # **The deadline watch is the opposite: per JOB.** Built once here, off the handler's
+            # own stopwatch, so every attempt measures against the same budget the caller gave.
+            if deadline is None:
+                deadline = estimator.DeadlineWatch(
+                    request.get("execution_timeout_ms"),
+                    started if started is not None else time.time())
             outcome = _upscale_once(cli, request, source, source_path, master_path, plan,
                                     progress, estimated_frames, still=still,
                                     keep_alpha=keep_alpha, exact_size=exact_size,
                                     warnings=warnings if warnings is not None else [],
                                     load_strip=load_strip, codec=codec,
-                                    encoder_out=encoder_out)
+                                    encoder_out=encoder_out,
+                                    # **One watch for the whole job, not one per attempt.** The
+                                    # budget is the job's, and a ladder that reset it would give
+                                    # a run that stepped down a fresh deadline each time — which
+                                    # is exactly the run most likely to be heading past it.
+                                    deadline=deadline)
             # **The only place a successful run's cost is recorded.** `diagnose_oom` reads the
             # peak on failure, which tells you a rung does not fit; nothing recorded what a rung
             # actually costs, so the calibration table could never fill and every job ran the
@@ -1812,7 +1823,14 @@ class _Ratchet:
 
 def _upscale_once(cli, request, source, source_path, master_path, plan, progress,
                   estimated_frames, still=False, keep_alpha=False, exact_size=None,
-                  warnings=None, load_strip=None, codec=None, encoder_out=None):
+                  warnings=None, load_strip=None, codec=None, encoder_out=None,
+                  deadline=None):
+    # **A watch that was not given one still answers**, so nothing downstream has to ask whether
+    # a deadline exists. An absent budget is a supported state and means no stop at all — the
+    # posture the capacity refusal keeps, and the one `fable/deadline_cases.py` guards with five
+    # cases against this being implemented as an inversion.
+    if deadline is None:
+        deadline = estimator.DeadlineWatch(None, time.time())
     args = pipeline.build_args(cli, plan, source_path, MODEL_BUILD,
                                request["color_correction"], debug=request["debug"])
     capture, shape = pipeline.open_source(cli, source_path, keep_alpha=keep_alpha)
@@ -2026,7 +2044,14 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                    alpha_through_model=bool(
                                        request.get("keep_alpha_in_model")),
                                    exact_size=exact_size, ratchet=ratchet,
-                                   schedule=schedule)
+                                   schedule=schedule,
+                                   # **The deadline's two stops, on the tile ladder** (api.md
+                                   # §4d). The pre-run refusal is gone; what stops a job now is a
+                                   # rate measured on this host after the first repeated unit,
+                                   # and the clock reaching the budget. Encode is 6+ tiles and
+                                   # decode 6-24, so this fires on a single-pass plan where a
+                                   # pass-granularity guard never would.
+                                   on_tile=deadline.tile)
             # **Inside the `with`, where it says it is.** The model has finished and the encoder
             # still holds everything it was fed; the drain itself happens on the block's exit.
             _say_host("tail-in", writer)

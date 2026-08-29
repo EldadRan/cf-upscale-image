@@ -396,7 +396,7 @@ def _open_still_with_alpha(cli, source_path):
 
 def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alpha=False,
         alpha_through_model=False, exact_size=None, ratchet=None, on_batch=None,
-        schedule=None):
+        schedule=None, on_tile=None):
     """Stream chunks through the model and into the writer. Returns frames written.
 
     `frame_budget` is what the caller decided to read, not what a container claimed. Passing a
@@ -452,8 +452,13 @@ def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alph
     #: vendored global cache it also populates is evicted by `release_runner_cache`, which the
     #: caller runs in a `finally`.
     runner_cache = {}
+    # **`on_tile` is the deadline checkpoint's only input** (`api.md` §4d). It rides the same tap
+    # as `on_batch` and for the same reason: the tap wraps the vendored logger and observes before
+    # delegating, so a tile announcement reaches us whether or not the vendored debug is on. A
+    # refusal raised from it travels the seam `_is_a_refusal` opened.
     watch = PhaseWatch(cli, on_batch=_scheduling_eviction(on_batch, plan, runner_cache,
-                                                          debug=cli.debug, schedule=schedule))
+                                                          debug=cli.debug, schedule=schedule),
+                       on_tile=on_tile)
     #: **Stamped with the attempt the handler is on.** `run.last_phases` is a function attribute
     #: and nothing clears it, so on a warm worker it survives between jobs — and a run that
     #: raises before reaching here (a still, a refusal, a failure before the stream) would find

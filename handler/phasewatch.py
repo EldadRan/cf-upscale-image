@@ -75,10 +75,34 @@ LEVERS = {
 #: debug off exactly like the phase banners do.
 _BATCH = re.compile(r"batch (\d+)\s*/\s*(\d+)")
 
+#: **The tile ladder, which is the only repeated unit a single-pass job has** (`api.md` §4d). The
+#: vendored VAE announces `Encoding tile 3 / 24` before it computes that tile, so the gap between
+#: two consecutive announcements is what the first one cost — measured on this host rather than
+#: borrowed from a table.
+#:
+#: **The singular form only.** The vendored code also logs a range (`Encoding tiles 3-6 / 24`)
+#: when it batches them, and that is not one unit: pricing a job off a gap that spans several
+#: tiles would refuse jobs that are fine. `(\d+)\s*/` after `tile` cannot match the range form,
+#: because the range carries a hyphen between the two numbers.
+#:
+#: **These lines reach us whether or not the vendored debug is enabled**, because the tap wraps
+#: `debug.log` and observes before delegating to the original, which is where the `enabled` check
+#: lives. That is the property that makes a tile checkpoint reachable at all, and it is asserted
+#: rather than assumed.
+_TILE = re.compile(r"(?:En|De)coding tile (\d+)\s*/\s*(\d+)")
+
 
 def _batch_from(message):
     """The (index, total) a per-batch log line announces, or None."""
     found = _BATCH.search(message)
+    if not found:
+        return None
+    return int(found.group(1)), int(found.group(2))
+
+
+def _tile_from(message):
+    """The (index, total) a per-tile line announces, or None."""
+    found = _TILE.search(message)
     if not found:
         return None
     return int(found.group(1)), int(found.group(2))
@@ -431,11 +455,15 @@ class PhaseWatch(object):
     for a decode OOM. Losing a phase label is a bad outcome; losing the job is worse.
     """
 
-    def __init__(self, debug_holder, read_peak=None, reset_peak=None, on_batch=None,
+    def __init__(self, debug_holder, read_peak=None, reset_peak=None, on_batch=None, on_tile=None,
                  announce=True, read_reserved=None):
         #: The object whose `.log` is wrapped — `inference_cli` itself in production, whose
         #: module-level `debug` is the singleton every vendored phase writes through.
         self._holder = debug_holder
+        #: `on_tile(phase, index, total)` — the deadline checkpoint's only input. Same posture as
+        #: `on_batch`: whatever it raises is swallowed unless it is a refusal, which is the point
+        #: of observing.
+        self._on_tile = on_tile
         self._read = _torch_peak_gb if read_peak is None else read_peak
         self._reset = _torch_reset_peak if reset_peak is None else reset_peak
         #: `on_batch(phase, index, total)`, called once per model batch. **This is the only
@@ -566,6 +594,18 @@ class PhaseWatch(object):
         text = message if isinstance(message, str) else str(message)
         # Per-batch lines carry no phase number, so they are matched first and attributed to
         # whichever phase is currently open.
+        # **Tiles first, and they are a different ladder from batches.** A tile line carries no
+        # phase number either, so it is attributed to whichever phase is open.
+        tile = _tile_from(text)
+        if tile is not None:
+            if self._on_tile is not None and self.phase is not None:
+                try:
+                    self._on_tile(self.phase, tile[0], tile[1])
+                except Exception as exc:  # noqa: BLE001 — see the class docstring
+                    if _is_a_refusal(exc):
+                        raise
+            return
+
         batch = _batch_from(text)
         if batch is not None and self._on_batch is not None and self.phase is not None:
             try:

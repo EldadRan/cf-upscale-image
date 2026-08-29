@@ -47,6 +47,7 @@ The levers, and why they are ordered this way (`docs/decisions.md` 0.1):
 import json
 import os
 import re
+import time
 
 import solver
 from errors import (CAPACITY_EXCEEDED, DEADLINE_EXCEEDED, INVALID_FIELD_VALUE,
@@ -855,109 +856,160 @@ def _terminal_options(job, snapshot, width, height):
     return options
 
 
+class DeadlineWatch:
+    """The two stops that replaced the pre-run refusal (`api.md` §4d). **Both measured, both
+    in-run.**
+
+    **THE FIRST-TILE CHECKPOINT SAVES THE SPEND; THE BUDGET STOP SAVES THE ERROR MESSAGE.** They
+    are not two versions of one guard. The budget stop fires when the money is already gone and
+    turns a hard kill — container ended, no master, nothing returned, every second billed — into a
+    `deadline_exceeded` the caller can read and retry with a longer one. The checkpoint fires a few
+    percent in, which is the one that keeps the money.
+
+    **After the first repeated unit, not the first pass.** The planner's best plans are
+    single-pass: a clip that fits the card's window has exactly one, so a pass-granularity
+    checkpoint would never fire on the plans this worker recommends. Encode is 6+ tiles and decode
+    6-24, so tile granularity exists on a single-pass job where pass granularity does not.
+
+    **The projection is a LOWER BOUND and refuses only when even that cannot fit.** It prices the
+    remaining tiles of the phase that is running and nothing else — not the phases still to come,
+    not the upload. So a job it stops could not have finished under any of the work it did not
+    count, and a job it admits may still be stopped later by the budget. **That asymmetry is the
+    point**: this rule replaced one that was over on 29 of 29 runs, and a checkpoint that guessed
+    high would reproduce the defect it exists to remove.
+
+    **The rate comes from the gap between two tile announcements, not from a table.** A tile line
+    is logged before its tile is computed, so the interval between tile 1's line and tile 2's is
+    what tile 1 cost — on this host, this container, this clip. That is the whole difference from
+    what was removed: `predicted_seconds` was a claim about a population, and this is a measurement
+    of the job in front of it.
+    """
+
+    def __init__(self, budget_ms, started, clock=time.time):
+        #: Absent or zero is a supported state and means no stop at all — the same posture the
+        #: capacity refusal keeps. **Five cases in `fable/deadline_cases.py` exist to catch this
+        #: being implemented as an inversion**, because a change that made "no budget" mean
+        #: "refuse" would be catastrophic and silent.
+        self.budget_s = (budget_ms / 1000.0) if budget_ms else None
+        self.started = started
+        self._clock = clock
+        #: (phase, total) -> the clock reading when the last tile of that phase was announced.
+        #: **Keyed on the phase**, because encode and decode are separate ladders and the gap
+        #: between the last encode tile and the first decode tile is not a tile.
+        self._last_tile = {}
+        #: What the checkpoint concluded, for the record. None until a first repeated unit exists.
+        self.checkpoint = None
+
+    def elapsed(self):
+        return self._clock() - self.started
+
+    def _refuse(self, message):
+        raise WorkerError(DEADLINE_EXCEEDED, message, remedy=Remedy.LONGER_DEADLINE)
+
+    def budget_spent(self):
+        """Stop if the budget is gone. **Called wherever the run announces anything.**
+
+        It does not run past the budget hoping. Past it the platform kills the container and the
+        caller receives `TIMED_OUT` with nothing attached — the worker is not asked, it is ended —
+        so the last useful thing this process can do is say so itself while it still can.
+        """
+        if self.budget_s is None:
+            return
+        spent = self.elapsed()
+        if spent < self.budget_s:
+            return
+        self._refuse(
+            "this job has spent {:.0f}s of its {:.0f}s deadline and is stopping rather than "
+            "running past it. Past the deadline the platform ends the container with nothing "
+            "delivered and every second billed, and the worker is never asked — so this is the "
+            "last thing it can say. Nothing here is a prediction: {:.0f}s is what the clock "
+            "read.".format(spent, self.budget_s, spent))
+
+    def tile(self, phase, index, total):
+        """One tile announcement. **Never raises except to stop the job.**
+
+        The checkpoint fires once, on the second tile of the first tiled phase — the first moment
+        a completed repeated unit exists to measure.
+        """
+        if self.budget_s is None:
+            return
+        self.budget_spent()
+        now = self._clock()
+        previous = self._last_tile.get(phase)
+        self._last_tile[phase] = (index, now)
+        if previous is None or self.checkpoint is not None:
+            return
+        last_index, last_at = previous
+        # **Only a forward step of exactly one unit is a measurement.** The vendored encoder logs
+        # a range form for batched tiles (`tiles 3-6 / 24`), a re-entered phase restarts the
+        # count, and a ratchet can replay one — none of those is one tile's cost, and pricing a
+        # whole job off a gap that spans several would refuse jobs that are fine.
+        if index != last_index + 1:
+            return
+        per_tile = now - last_at
+        if per_tile <= 0 or not total or total < index:
+            return
+        remaining_tiles = total - index + 1
+        projected = per_tile * remaining_tiles
+        spent = self.elapsed()
+        self.checkpoint = {
+            "phase": phase,
+            "seconds_per_tile": round(per_tile, 3),
+            "tiles_remaining": remaining_tiles,
+            "at_least_seconds_more": round(projected, 1),
+            "elapsed_seconds": round(spent, 1),
+            "budget_seconds": round(self.budget_s, 1),
+        }
+        if spent + projected <= self.budget_s:
+            return
+        self._refuse(
+            "measured on this host: tile {} of {} in the {} phase took {:.1f}s, so the {} tiles "
+            "still to run in this phase alone need at least {:.0f}s more. {:.0f}s of the {:.0f}s "
+            "deadline are already spent, and that is {:.0f}s over before any later phase or the "
+            "upload is counted. Stopped here rather than at the deadline, so the time it would "
+            "have taken to find out is not billed. Every number in this sentence was measured on "
+            "this job.".format(
+                index, total, phase, per_tile, remaining_tiles, projected, spent, self.budget_s,
+                spent + projected - self.budget_s))
+
+
 def refuse_if_the_deadline_cannot_be_met(rationale, budget_ms, elapsed_s, frames):
-    """Refuse a job that cannot finish in the time it was given, before the GPU is spent.
+    """**Records the budget and REFUSES NOTHING** (`api.md` §4d, CF 2026-08-29).
 
-    **`execution_timeout_ms` is a hard kill.** RunPod ends the container: no master is written, no
-    error is returned, every second is billed, and the caller receives `TIMED_OUT` with nothing
-    attached. The worker never gets to say anything because it is not asked — it is terminated.
-    This is the same trade as `capacity_exceeded`, on the other axis.
+    The name is kept because the gate's `fable/deadline_cases.py` pins it, and because a reader
+    coming from an older log or an older entry should land here and find out what happened rather
+    than find nothing.
 
-    **Measured against elapsed-since-handler-entry, never a wall clock.** CF sends a cap rather
-    than a timestamp deliberately: `executionTimeout` bounds time *being processed* while queue
-    time lives under `ttl`, a separate clock — so an absolute deadline would be measuring the
-    wrong one and would be wrong by however long the job sat in the queue. CF sends the cap, this
-    owns the stopwatch, and the two agree by construction.
+    **What happened: a job is no longer refused on a prediction.** The estimator that drove this
+    refusal was measured OVER on 29 of 29 recorded runs, and on 2026-08-29 it turned away a
+    539-second job against a 700-second budget — explaining itself with a premise the run beside
+    it contradicted. A never-retryable refusal is the most expensive verdict this worker can
+    issue, and it was being issued on a guess.
 
-    **Declines to guess.** No deadline, no prediction, or no frame count means no refusal — the
-    same rule the capacity refusal follows, for the same reason: refusing a job that would have
-    succeeded costs the customer their result.
+    **What replaces it is measurement, in-run**: `DeadlineWatch` below stops a job on a rate
+    measured on this host, and stops it again if the budget is actually spent. **The graceful stop
+    at the end saves the error message; the checkpoint saves the spend.**
 
-    The estimate covers **inference only**; fetch is already spent and the upload follows. So the
-    comparison is against the remaining budget with the write left out, which errs toward letting
-    a borderline job run. CF sizes the cap generously and an unhit timeout is free, so the
-    borderline case is rare by construction.
+    **The deadline block is still recorded, and that is the whole of what this now does.** A job
+    that ran with four seconds to spare looked identical to one that ran with four hours, and CF
+    tunes against what actually happens. `predicted_seconds` stays in it as an observation — it is
+    the number this project is trying to fix, and dropping it would end the only series that shows
+    whether it is getting better.
     """
     if not budget_ms:
         return
     predicted = rationale.get("predicted_seconds")
-    if not predicted or not frames:
-        return
     remaining = (budget_ms / 1000.0) - elapsed_s
-    # An approximate prediction is scaled from runs at another size rather than measured at this
-    # one, so it refuses only on a margin it cannot plausibly have invented. The two multipliers
-    # compose rather than compete: the safety factor raises what the job is assumed to need, the
-    # approximate margin raises what a *guess* is allowed to overrun by, and an approximate
-    # prediction still gets more rope than a measured one (1.33x remaining against 0.67x).
-    # **`borrowed` gets the same rope as `approximate`, and for a sharper reason.** Both are
-    # predictions the table cannot stand behind at this configuration; the borrowed-tiling one is
-    # the case that was actually observed 2x wrong (F-2026-08-20-40), which is precisely the
-    # "wrong by more than a factor of two" the approximate margin was sized for. Refusing a job on
-    # a number that has been that wrong costs a customer a result they would have got.
-    approximate = rationale.get("prediction_basis") in ("approximate", "borrowed")
-    required = predicted * DEADLINE_SAFETY_FACTOR
-    allowed = remaining * (APPROXIMATE_DEADLINE_MARGIN if approximate else 1.0)
-
-    # **Recorded whether it fires or not, which is the half that was missing.** A refusal is
-    # visible by definition; a job that passed with four seconds to spare looked identical to one
-    # that passed with four hours. CF tunes the factor from what actually happens, and until this
-    # existed the only observations available were the failures.
     rationale["deadline"] = {
-        "predicted_seconds": round(predicted, 1),
-        "safety_factor": DEADLINE_SAFETY_FACTOR,
-        "required_seconds": round(required, 1),
+        "budget_seconds": round(budget_ms / 1000.0, 1),
+        "elapsed_seconds": round(elapsed_s, 1),
         "remaining_seconds": round(remaining, 1),
-        "allowance_seconds": round(allowed, 1),
-        "headroom": round(allowed / required, 3) if required else None,
+        # **Recorded, never consumed.** Kept beside the budget so the series that shows this
+        # estimator running over stays unbroken; nothing branches on it any more.
+        "predicted_seconds": None if not predicted else round(predicted, 1),
         "basis": rationale.get("prediction_basis"),
+        "enforced_by": "first-tile checkpoint and budget-spent stop, both in-run",
     }
-    if required <= allowed:
-        return
-    raise WorkerError(
-        DEADLINE_EXCEEDED,
-        "this job needs about {:.0f}s of inference at rung '{}' ({} frames at {:.1f}s each, "
-        "{}), {:.0f}s once the {:.1f}x safety factor is applied, and {:.0f}s of its {:.0f}s "
-        "deadline remain after {:.0f}s already spent fetching and probing. Refused before the GPU "
-        "is spent: on this deadline the container would be killed partway with the whole cost "
-        "billed and nothing delivered. The factor exists because this estimator errs *under* — "
-        "measured 10-25% under on long jobs — so an unfactored comparison passes work it should "
-        "turn away."
-        .format(predicted, rationale.get("rung"), frames,
-                predicted / float(frames),
-                {"approximate": "scaled from measurements at other sizes",
-                 "borrowed": "borrowed from rows at another tile_quality, which moves the "
-                             "decode grid and is where a long job's wall clock lives"}
-                .get(rationale.get("prediction_basis"), "measured"),
-                required, DEADLINE_SAFETY_FACTOR, remaining, budget_ms / 1000.0, elapsed_s),
-        remedy=Remedy.LONGER_DEADLINE,
-        shortfall={"predicted_seconds": round(predicted, 1),
-                   # **The factored figure alongside the raw one, so the factor is tunable from
-                   # what fires rather than arguable.** CF asked for all three — prediction,
-                   # requirement and limit — precisely so that a refusal can be judged without
-                   # re-deriving the arithmetic from a log.
-                   "safety_factor": DEADLINE_SAFETY_FACTOR,
-                   "required_seconds": round(required, 1),
-                   "prediction_basis": rationale.get("prediction_basis"),
-                   # **The inputs, because the output could not be reproduced from them.** A
-                   # refusal on hardware predicted 63.5 s/frame where the same rung, table and
-                   # target reproduce 12.1 locally, and the report carried no way to tell which
-                   # of the two differed. Naming the pixel count and the per-frame figure the
-                   # prediction was built from makes the next one self-explaining.
-                   "output_pixels": rationale.get("output_pixels"),
-                   "seconds_per_frame": rationale.get("seconds_per_frame"),
-                   "remaining_seconds": round(remaining, 1),
-                   "elapsed_seconds": round(elapsed_s, 1),
-                   "execution_timeout_ms": budget_ms,
-                   # What to resend. Named rather than left as arithmetic, because a caller that
-                   # has to double blindly is being told less than this worker knows. CF resubmits
-                   # against this figure rather than doubling (CF, 2026-08-15), so it has to be a
-                   # number that passes: the *factored* requirement plus what is already spent.
-                   # It used to be `predicted * 1.5` by coincidence of the same constant; now the
-                   # factor is named once and this reads it, so the two cannot drift apart.
-                   "suggested_execution_timeout_ms": int((elapsed_s + required) * 1000),
-                   "frames": frames,
-                   "rung": rationale.get("rung")},
-    )
 
 
 _ALLOC_PATTERN = re.compile(r"Tried to allocate ([\d.]+) ([KMG])iB")

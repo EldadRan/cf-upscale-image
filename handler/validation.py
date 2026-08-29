@@ -811,17 +811,23 @@ def validate(job_input):
     derive = job_input.get("derive")
     derive = [] if derive is None else _validate_derive(derive)
 
-    diagnostics = job_input.get("diagnostics")
-    if diagnostics is not None:
-        diagnostics = _as_str(diagnostics, "diagnostics")
+    # **`diagnostics` and `run_record` are REQUIRED** (api.md §3's cutover, §6 items 1 and 2;
+    # CF, 2026-08-29). Both were optional and a missing URL was a silent skip, so the corpus had
+    # holes and nothing said so — an absence indistinguishable from a run that never happened.
+    #
+    # **This is a caller-facing break and was ruled as one.** CF's front-end and `run_one.py` both
+    # change before this image is pinned anywhere, or every job is refused at the door. It is
+    # `missing_required_field`, never retryable, and it fires before the source is fetched.
+    #
+    # **`diagnostics_reserve` stays optional** — it is the bundle with no request in scope, and a
+    # caller that cannot mint one is not a caller with a hole in its corpus.
+    diagnostics = _as_str(_require(job_input, "diagnostics", "at the top level"), "diagnostics")
 
     reserve = job_input.get("diagnostics_reserve")
     if reserve is not None:
         reserve = _as_str(reserve, "diagnostics_reserve")
 
-    run_record = job_input.get("run_record")
-    if run_record is not None:
-        run_record = _as_str(run_record, "run_record")
+    run_record = _as_str(_require(job_input, "run_record", "at the top level"), "run_record")
 
     # Flattened for the handler's use. The **wire** shape is nested; this is the normalised form
     # everything downstream reads, so the nesting exists exactly once — here — rather than being
@@ -859,9 +865,14 @@ def validate(job_input):
         # RunPod's own ceiling is 7 days. No lower bound beyond positive: a caller who sends a
         # deadline this worker cannot meet gets a refusal with the arithmetic, which is more
         # useful than an argument about whether the number was reasonable.
+        # **REQUIRED, and it is the job's whole budget** (api.md §4d). One number: CF owns
+        # keeping it under the endpoint's own `executionTimeout`, and the worker does not know
+        # that number, does not infer it, and does not need to — it treats this as the wall.
+        # Nothing is refused on it before the run; what enforces it is `estimator.DeadlineWatch`,
+        # measuring during the job.
         "execution_timeout_ms": _positive_int_or_none(
-            job_input.get("execution_timeout_ms"), "execution_timeout_ms", 604_800_000,
-            minimum=1),
+            _require(job_input, "execution_timeout_ms", "at the top level"),
+            "execution_timeout_ms", 604_800_000, minimum=1),
         # Snapped to the 4n+1 lattice by the pipeline, not refused here: a caller asking for 20
         # means "about twenty", and the nearest valid value is a better answer than an error.
         "force_batch_size": _positive_int_or_none(
