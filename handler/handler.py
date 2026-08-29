@@ -907,8 +907,22 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             "frames_match": result["decoded_in"] == result["written_out"],
             "alpha_carried": bool(keep_alpha),
             "bit_depth_known": probe.bits_per_component(source.get("pix_fmt")) is not None,
+            # **`derives_requested` counts ROLES and stays; `derives_produced` counted FILES
+            # and is DELETED** (api.md §4a, CF 2026-08-29). The comparison a reader naturally
+            # made between the two meant nothing — `poster,crop` reported requested 2, produced
+            # 4, both numbers correct — and recounting it into files would have been worse,
+            # because `derives.py` caps crops by geometry as well as by MAX_COUNT, so
+            # expected-files legitimately exceeds produced-files on a small source.
+            #
+            # **Nothing replaces it.** `derived[]` carries one entry per delivered file with its
+            # role and key, so a caller computes either number exactly: files is its length,
+            # roles is the distinct `role` values. This is the one fact `derived[]` cannot
+            # reconstruct, because a role that produced nothing leaves no entry to count.
+            #
+            # **And absence already warns, in both its forms**: a role that raises is warned as
+            # "derive 'X' failed and was omitted", and crops capped by geometry as "produced N
+            # of M requested". The count was a second and worse copy of that.
             "derives_requested": len(request["derive"]),
-            "derives_produced": len(derived),
         },
         "warnings": warnings,
     }
