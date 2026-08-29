@@ -75,21 +75,24 @@ LEVERS = {
 #: debug off exactly like the phase banners do.
 _BATCH = re.compile(r"batch (\d+)\s*/\s*(\d+)")
 
-#: **The tile ladder, which is the only repeated unit a single-pass job has** (`api.md` §4d). The
-#: vendored VAE announces `Encoding tile 3 / 24` before it computes that tile, so the gap between
-#: two consecutive announcements is what the first one cost — measured on this host rather than
-#: borrowed from a table.
+#: **The tile ladder, which is the only repeated unit a single-pass job has** (`api.md` §4d).
 #:
-#: **The singular form only.** The vendored code also logs a range (`Encoding tiles 3-6 / 24`)
-#: when it batches them, and that is not one unit: pricing a job off a gap that spans several
-#: tiles would refuse jobs that are fine. `(\d+)\s*/` after `tile` cannot match the range form,
-#: because the range carries a hyphen between the two numbers.
+#: **BOTH FORMS, and the singular one is the rare case.** The first version of this matched only
+#: `Encoding tile 3 / 24` and deliberately rejected the range — and that made the checkpoint
+#: unreachable, because the vendored encoder logs the range on almost every announcement. It logs
+#: at `tile_id % 5 == 1 or tile_id == num_tiles`, and the singular form only for the FINAL tile
+#: and only when `(tile_id - 1) % 5 == 0`. So a job emits `tiles 1-5 / 24`, `tiles 6-10 / 24`, …
+#: and a consecutive pair of singular lines essentially never occurs.
+#:
+#: **So the observable repeated unit is a BLOCK of about five tiles, not one tile**, and the
+#: distance between two announcements is what says how many. That is filed to the gate against
+#: §4d's wording — "an encode tile, not a pass" — because it changes how early the checkpoint can
+#: fire, and only the gate rules what the clause meant.
 #:
 #: **These lines reach us whether or not the vendored debug is enabled**, because the tap wraps
 #: `debug.log` and observes before delegating to the original, which is where the `enabled` check
-#: lives. That is the property that makes a tile checkpoint reachable at all, and it is asserted
-#: rather than assumed.
-_TILE = re.compile(r"(?:En|De)coding tile (\d+)\s*/\s*(\d+)")
+#: lives. `tests/run_local.py` drives a real `PhaseWatch` over a disabled logger to hold that.
+_TILE = re.compile(r"(?:En|De)coding tiles? (\d+)(?:\s*-\s*(\d+))?\s*/\s*(\d+)")
 
 
 def _batch_from(message):
@@ -101,11 +104,16 @@ def _batch_from(message):
 
 
 def _tile_from(message):
-    """The (index, total) a per-tile line announces, or None."""
+    """The `(first, last, total)` a tile announcement covers, or None.
+
+    `Encoding tile 24 / 24` is `(24, 24, 24)`; `Encoding tiles 6-10 / 24` is `(6, 10, 24)`. The
+    caller needs the span rather than an index because the span is the repeated unit it can price.
+    """
     found = _TILE.search(message)
     if not found:
         return None
-    return int(found.group(1)), int(found.group(2))
+    first, last, total = found.group(1), found.group(2), found.group(3)
+    return int(first), int(last or first), int(total)
 
 
 def _phase_from(message):
@@ -600,7 +608,7 @@ class PhaseWatch(object):
         if tile is not None:
             if self._on_tile is not None and self.phase is not None:
                 try:
-                    self._on_tile(self.phase, tile[0], tile[1])
+                    self._on_tile(self.phase, tile[0], tile[1], tile[2])
                 except Exception as exc:  # noqa: BLE001 — see the class docstring
                     if _is_a_refusal(exc):
                         raise

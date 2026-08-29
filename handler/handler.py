@@ -626,15 +626,16 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # used** rather than a second threshold of its own: a warning that disagreed with the check it
     # warns about would be worse than no warning, and the 0.75 that used to live here was one more
     # number nobody could tie to the refusal that actually fires.
-    checked = rationale.get("deadline")
-    if checked and checked.get("headroom") and checked["headroom"] < 1.3:
-        warnings.append(
-            "this job is predicted to take {:.0f}s ({:.0f}s with the {:.1f}x safety factor) of a "
-            "remaining {:.0f}s deadline — inside it, but with {:.0f}% margin, and the estimate "
-            "covers inference only. A larger execution_timeout_ms would cost nothing unhit."
-            .format(checked["predicted_seconds"], checked["required_seconds"],
-                    checked["safety_factor"], checked["remaining_seconds"],
-                    100 * (checked["headroom"] - 1)))
+    # **The margin warning went with the refusal it was written against** (api.md §4d). It read
+    # `headroom`, `required_seconds` and `safety_factor` off the deadline block — three fields the
+    # pre-run refusal computed and nothing computes now — so it had silently stopped firing on
+    # every job while `.get("headroom")` returned None. A warning that cannot fire is worse than
+    # no warning: it reads, to anyone auditing, exactly like a run with comfortable margin.
+    #
+    # **Nothing replaces it, and that is the ruling rather than an omission.** A margin warning is
+    # a claim about time this job has not spent yet, which is the class of claim §4d removed. What
+    # the caller gets instead is the checkpoint's own reading, recorded below whether or not it
+    # stopped anything.
 
     # The bundle is written from `handle`, which never sees these. Recorded as they are learned,
     # and re-recorded after the force overrides so a pinned run's bundle describes what ran.
@@ -771,6 +772,12 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # rather than for one.
     master = keys.master_name(request["request_id"], still, out_w, out_h)
     master_path = os.path.join(workdir, master)
+    # **One watch for the whole job, built here** (api.md §4d). Off the handler's own stopwatch,
+    # so every attempt on the OOM ladder measures against the same budget the caller gave — a
+    # ladder that reset it would hand a fresh deadline to the run most likely to be heading past
+    # one. Built in `_run` rather than inside the retry loop because the checkpoint's reading is
+    # recorded below, after the loop returns.
+    deadline = estimator.DeadlineWatch(request.get("execution_timeout_ms"), started)
     result = _upscale_with_retry(cli, request, source, source_path, master_path, plan,
                                  rationale, machine, attempts, progress, estimated_frames,
                                  still=still, keep_alpha=keep_alpha, exact_size=exact_size,
@@ -780,8 +787,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
                                  # probed codec and the writer is two frames further in.
                                  codec=resolved_codec,
                                  # The stopwatch the retry loop's stop is measured against — the
-                                 # same one the deadline refusal uses, started at handler entry.
-                                 started=started)
+                                 # same one the deadline watch uses, started at handler entry.
+                                 started=started, deadline=deadline)
 
     # **What was delivered, on the trace, for the run-record** (F-2026-08-19-36). Size and frame
     # counts only — the key and the bucket are the customer's, and a corpus does not need them to
@@ -794,6 +801,13 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             "frames_decoded": result.get("decoded_in"),
             "seconds": round(result["seconds"], 1) if result.get("seconds") else None,
         }
+
+    # **The checkpoint's own reading, recorded whether or not it stopped anything.** A job that
+    # was admitted by it and later killed left no evidence it had ever run — a check that skipped
+    # and a check that passed producing identical output, which is the shape this worker keeps
+    # being burned by. It is also the only in-run measurement of tile cost this project has.
+    if deadline is not None and deadline.checkpoint is not None:
+        rationale.setdefault("deadline", {})["checkpoint"] = deadline.checkpoint
 
     predicted, actual = result.get("predicted_size"), result.get("actual_size")
     if predicted and actual and tuple(predicted) != tuple(actual):
@@ -899,8 +913,14 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         #
         # A named entry that reads `false` is visible. A line that was never printed is not.
         "checks": {
-            "deadline": bool(request.get("execution_timeout_ms")
-                             and rationale.get("predicted_seconds")),
+            # **What ENFORCED the deadline, not whether a prediction existed** (api.md §4d).
+            # This read `execution_timeout_ms and predicted_seconds`; the first is now always
+            # true because the field is required, and the second is recorded-but-never-consumed —
+            # so the flag reported whether the calibration table happened to answer, while
+            # `false` appeared on jobs whose two in-run stops had run exactly as on the `true`
+            # ones. A guard's own check reporting a different fact from its name is the class
+            # this block exists to make visible.
+            "deadline": bool((rationale.get("deadline") or {}).get("checkpoint")),
             "capacity": bool(rationale.get("usable_vram_gb") is not None
                              and rationale.get("calibrated")),
             "source_exhausted": True,          # asserted in `_upscale_once` or the job raised
@@ -1056,12 +1076,6 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             # **Per attempt, not per job.** A fresh holder each time round the ladder, so a
             # failed rung's encoder peak can never be read onto a later rung's record.
             encoder_out = {}
-            # **The deadline watch is the opposite: per JOB.** Built once here, off the handler's
-            # own stopwatch, so every attempt measures against the same budget the caller gave.
-            if deadline is None:
-                deadline = estimator.DeadlineWatch(
-                    request.get("execution_timeout_ms"),
-                    started if started is not None else time.time())
             outcome = _upscale_once(cli, request, source, source_path, master_path, plan,
                                     progress, estimated_frames, still=still,
                                     keep_alpha=keep_alpha, exact_size=exact_size,
@@ -2018,7 +2032,10 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # every reading of the code and is measured at nothing, which is why it is a flag.
             # `decisions.md` 4.9.
             written = pipeline.run(cli, capture, args, plan, budget, writer,
-                                   on_chunk=progress.frames,
+                                   # **And on the chunk boundary**, which is the last hook a job
+                                   # with neither tiles nor batches still reaches.
+                                   on_chunk=lambda written: (deadline.budget_spent(),
+                                                             progress.frames(written))[1],
                                    # **The heartbeat, and it is not the same thing as `on_chunk`.**
                                    # `frames_done` cannot advance here -- frames are not written
                                    # until the chunk yields -- so this re-mints the payload with
@@ -2033,12 +2050,19 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                    # `host_capacity_exceeded` rather than letting the kernel take
                                    # the container with no exception, no bundle and a platform
                                    # retry that repeats it.
+                                   # **The budget stop rides here too, not only on tiles.** A run
+                                   # with tiling switched off — a forced `vae_*_tiled: false`, a
+                                   # rung whose plan is untiled — emits no tile line at all, and
+                                   # a guard reachable on one run shape and not another is the
+                                   # shape this project keeps paying for. The batch hook fires on
+                                   # every job that reaches the model.
                                    on_batch=_first_phase_closes_the_strip(
                                        lambda phase, index, total: (
+                                           deadline.budget_spent(),
                                            guard.sample(frames_done=writer.frames_written,
                                                         phase=phase),
                                            progress.working(phase, index, total,
-                                                            chunk_frames=plan["chunk_size"]))[1],
+                                                            chunk_frames=plan["chunk_size"]))[2],
                                        into=load_strip),
                                    keep_alpha=keep_alpha,
                                    alpha_through_model=bool(

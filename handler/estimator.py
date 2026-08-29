@@ -860,29 +860,31 @@ class DeadlineWatch:
     """The two stops that replaced the pre-run refusal (`api.md` §4d). **Both measured, both
     in-run.**
 
-    **THE FIRST-TILE CHECKPOINT SAVES THE SPEND; THE BUDGET STOP SAVES THE ERROR MESSAGE.** They
-    are not two versions of one guard. The budget stop fires when the money is already gone and
-    turns a hard kill — container ended, no master, nothing returned, every second billed — into a
-    `deadline_exceeded` the caller can read and retry with a longer one. The checkpoint fires a few
-    percent in, which is the one that keeps the money.
+    **THE CHECKPOINT SAVES THE SPEND; THE BUDGET STOP SAVES THE ERROR MESSAGE.** They are not two
+    versions of one guard. The budget stop fires when the money is already gone and turns a hard
+    kill — container ended, no master, nothing returned, every second billed — into a
+    `deadline_exceeded` the caller can read and resend against. The checkpoint fires while the job
+    is still cheap to abandon.
 
-    **After the first repeated unit, not the first pass.** The planner's best plans are
-    single-pass: a clip that fits the card's window has exactly one, so a pass-granularity
-    checkpoint would never fire on the plans this worker recommends. Encode is 6+ tiles and decode
-    6-24, so tile granularity exists on a single-pass job where pass granularity does not.
+    **THE RATE IS THE FASTEST BLOCK SEEN, NOT THE FIRST ONE.** This is the correction that matters
+    and it was got wrong first time round. Pricing every remaining block at what the FIRST one
+    cost prices them at the one interval that also contains everything the phase pays once —
+    kernel autotune, allocator growth, weights faulting in. On a measured shape that made a job
+    needing ~176s look like it needed ~1440s, and stopping it would have been the same
+    never-retryable verdict the wave removed, wearing a measured-looking number.
 
-    **The projection is a LOWER BOUND and refuses only when even that cannot fit.** It prices the
-    remaining tiles of the phase that is running and nothing else — not the phases still to come,
-    not the upload. So a job it stops could not have finished under any of the work it did not
-    count, and a job it admits may still be stopped later by the budget. **That asymmetry is the
-    point**: this rule replaced one that was over on 29 of 29 runs, and a checkpoint that guessed
-    high would reproduce the defect it exists to remove.
+    **A minimum is the only direction that supports a refusal**, which this module already says in
+    `fastest_seconds_per_frame`: *if a job cannot finish even at the fastest rate anyone has ever
+    observed, no configuration will rescue it.* Same reasoning, one axis over — the fastest block
+    THIS job has run, against the blocks it has left.
 
-    **The rate comes from the gap between two tile announcements, not from a table.** A tile line
-    is logged before its tile is computed, so the interval between tile 1's line and tile 2's is
-    what tile 1 cost — on this host, this container, this clip. That is the whole difference from
-    what was removed: `predicted_seconds` was a claim about a population, and this is a measurement
-    of the job in front of it.
+    **And it re-evaluates on every announcement rather than concluding once.** A single verdict
+    taken on the first attempt says nothing about the rung the OOM ladder steps down to, which is
+    slower by construction and is exactly the attempt worth stopping.
+
+    **The count is exact and the rate is a lower bound, so the projection is a lower bound.** It
+    prices the blocks left in the phase that is running and nothing else — not later phases, not
+    the upload. A job it stops could not have finished under the work it did not count.
     """
 
     def __init__(self, budget_ms, started, clock=time.time):
@@ -893,25 +895,36 @@ class DeadlineWatch:
         self.budget_s = (budget_ms / 1000.0) if budget_ms else None
         self.started = started
         self._clock = clock
-        #: (phase, total) -> the clock reading when the last tile of that phase was announced.
-        #: **Keyed on the phase**, because encode and decode are separate ladders and the gap
-        #: between the last encode tile and the first decode tile is not a tile.
+        #: phase -> `(last_tile_index, announced_at)`. **Keyed on the phase** because encode and
+        #: decode are separate ladders and the gap between one ladder's end and the next's start
+        #: is not a block.
         self._last_tile = {}
-        #: What the checkpoint concluded, for the record. None until a first repeated unit exists.
+        #: phase -> the cheapest seconds-per-tile measured in it. **Per phase, because a decode
+        #: tile and an encode tile are different quantities** and the cheapest of the two pooled
+        #: would price the expensive ladder at the cheap one's rate.
+        self._fastest = {}
+        #: phase -> how many blocks have been measured in it. **The first is measured and never
+        #: convicts**; see the note at the refusal.
+        self._samples = {}
+        #: The most recent projection, for the record and for the refusal's `shortfall`. Replaced
+        #: on every announcement rather than latched.
         self.checkpoint = None
 
     def elapsed(self):
         return self._clock() - self.started
 
-    def _refuse(self, message):
-        raise WorkerError(DEADLINE_EXCEEDED, message, remedy=Remedy.LONGER_DEADLINE)
+    def _refuse(self, message, shortfall=None):
+        raise WorkerError(DEADLINE_EXCEEDED, message, remedy=Remedy.LONGER_DEADLINE,
+                          shortfall=shortfall)
 
-    def budget_spent(self):
-        """Stop if the budget is gone. **Called wherever the run announces anything.**
+    def budget_spent(self, *_ignored, **_also_ignored):
+        """Stop if the budget is gone. **Wired to every hook the run has**, not only to tiles.
 
-        It does not run past the budget hoping. Past it the platform kills the container and the
-        caller receives `TIMED_OUT` with nothing attached — the worker is not asked, it is ended —
-        so the last useful thing this process can do is say so itself while it still can.
+        It takes and ignores arguments so it can sit directly on `on_batch` and `on_chunk`
+        alongside `on_tile` — a run with tiling switched off emits no tile line at all, and the
+        first version of this had its only call site inside `tile()`, which left exactly those
+        jobs with neither stop. A guard reachable on one run shape and not another is the shape
+        this project keeps paying for.
         """
         if self.budget_s is None:
             return
@@ -923,54 +936,100 @@ class DeadlineWatch:
             "running past it. Past the deadline the platform ends the container with nothing "
             "delivered and every second billed, and the worker is never asked — so this is the "
             "last thing it can say. Nothing here is a prediction: {:.0f}s is what the clock "
-            "read.".format(spent, self.budget_s, spent))
+            "read.".format(spent, self.budget_s, spent),
+            shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
+                       "elapsed_seconds": round(spent, 1),
+                       # **What to resend, rather than a caller doubling blindly.** The figure is
+                       # deliberately not a prediction of the whole job: nothing here knows what
+                       # is left, so it names the budget that would at least have covered what has
+                       # already run, and says so.
+                       "suggested_execution_timeout_ms": int(spent * 2000),
+                       "suggestion_basis": "twice what this job had already spent when it stopped;"
+                                           " the worker does not know what remained"})
 
-    def tile(self, phase, index, total):
-        """One tile announcement. **Never raises except to stop the job.**
+    def tile(self, phase, first, last, total):
+        """One tile announcement — `(6, 10, 24)` for `Encoding tiles 6-10 / 24`.
 
-        The checkpoint fires once, on the second tile of the first tiled phase — the first moment
-        a completed repeated unit exists to measure.
+        **The span is the input, not an index.** The vendored encoder announces roughly every
+        fifth tile as a range, so the repeated unit this can actually price is a block, and how
+        many tiles a block held is the distance to the next announcement.
         """
         if self.budget_s is None:
             return
         self.budget_spent()
         now = self._clock()
         previous = self._last_tile.get(phase)
-        self._last_tile[phase] = (index, now)
-        if previous is None or self.checkpoint is not None:
+        self._last_tile[phase] = (first, last, now)
+        if previous is None:
             return
-        last_index, last_at = previous
-        # **Only a forward step of exactly one unit is a measurement.** The vendored encoder logs
-        # a range form for batched tiles (`tiles 3-6 / 24`), a re-entered phase restarts the
-        # count, and a ratchet can replay one — none of those is one tile's cost, and pricing a
-        # whole job off a gap that spans several would refuse jobs that are fine.
-        if index != last_index + 1:
+        prev_first, prev_last, prev_at = previous
+        # **The gap covers the PREVIOUS block, and the previous block's own span says how many
+        # tiles that was.** A line is logged before its tiles are computed, so when `tiles 6-10`
+        # is announced, tiles 1-5 have just finished — five tiles, not the one the index step
+        # suggests. Counting the step instead priced a five-tile block as a single tile and made
+        # every rate five times too slow.
+        #
+        # **Only a forward step prices anything.** A re-entered phase restarts the count and a
+        # ratchet replays it; neither gap is work this job has left, and pricing one would refuse
+        # a job that is fine.
+        if first <= prev_last:
             return
-        per_tile = now - last_at
-        if per_tile <= 0 or not total or total < index:
+        tiles_done = prev_last - prev_first + 1
+        gap = now - prev_at
+        if tiles_done <= 0 or gap <= 0 or not total or total < prev_last:
             return
-        remaining_tiles = total - index + 1
-        projected = per_tile * remaining_tiles
+        per_tile = gap / float(tiles_done)
+        fastest = min(self._fastest.get(phase, per_tile), per_tile)
+        self._fastest[phase] = fastest
+        self._samples[phase] = self._samples.get(phase, 0) + 1
+        # Everything after the block that just finished. The block now being announced is still
+        # ahead of the job, so it counts.
+        remaining = total - prev_last
+        if remaining <= 0:
+            return
+        projected = fastest * remaining
         spent = self.elapsed()
         self.checkpoint = {
             "phase": phase,
-            "seconds_per_tile": round(per_tile, 3),
-            "tiles_remaining": remaining_tiles,
+            "fastest_seconds_per_tile": round(fastest, 3),
+            "blocks_measured": self._samples.get(phase, 0),
+            "tiles_remaining": remaining,
             "at_least_seconds_more": round(projected, 1),
             "elapsed_seconds": round(spent, 1),
             "budget_seconds": round(self.budget_s, 1),
         }
         if spent + projected <= self.budget_s:
             return
+        # **ONE BLOCK IS NOT ENOUGH TO CONVICT, and this is a deliberate departure from §4d's
+        # wording.** The clause says to stop after the first repeated unit. The first unit's
+        # interval is the one that also contains everything the phase pays once — kernel autotune,
+        # allocator growth, weights faulting in — so pricing the rest of the job at it is a claim
+        # about a population made from its least representative member. On a measured shape that
+        # made a job needing ~176s look like it needed ~1440s.
+        #
+        # **That is the same never-retryable verdict on a guess that this whole amendment
+        # removed**, wearing a measured-looking number, so it is not a thing to approximate. The
+        # checkpoint measures from the first block and CONVICTS from the second, where the rate is
+        # the cheaper of two real samples. On the vendored encoder's five-tile announcements that
+        # is still a few percent in, and it is filed to the gate rather than decided here.
+        if self._samples.get(phase, 0) < 2:
+            return
         self._refuse(
-            "measured on this host: tile {} of {} in the {} phase took {:.1f}s, so the {} tiles "
-            "still to run in this phase alone need at least {:.0f}s more. {:.0f}s of the {:.0f}s "
-            "deadline are already spent, and that is {:.0f}s over before any later phase or the "
+            "measured on this host: the fastest block in the {} phase ran at {:.1f}s a tile, and "
+            "{} tiles remain in this phase alone — at least {:.0f}s more. {:.0f}s of the {:.0f}s "
+            "deadline are already spent, so this is {:.0f}s over before any later phase or the "
             "upload is counted. Stopped here rather than at the deadline, so the time it would "
-            "have taken to find out is not billed. Every number in this sentence was measured on "
-            "this job.".format(
-                index, total, phase, per_tile, remaining_tiles, projected, spent, self.budget_s,
-                spent + projected - self.budget_s))
+            "have taken to find out is not billed. The rate is the FASTEST block this job has "
+            "run, not an average and not a number from a table: at any slower rate it is further over."
+            .format(phase, fastest, remaining, projected, spent, self.budget_s,
+                    spent + projected - self.budget_s),
+            shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
+                       "elapsed_seconds": round(spent, 1),
+                       "at_least_seconds_more": round(projected, 1),
+                       "suggested_execution_timeout_ms": int((spent + projected) * 1000),
+                       "suggestion_basis": "elapsed plus the remaining tiles of this phase at the "
+                                           "fastest rate measured; later phases are not counted, "
+                                           "so this is a floor"})
 
 
 def refuse_if_the_deadline_cannot_be_met(rationale, budget_ms, elapsed_s, frames):
