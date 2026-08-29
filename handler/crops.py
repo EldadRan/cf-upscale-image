@@ -238,12 +238,17 @@ def render_pair(source_rgb, output_rgb, region, scale):
     }
 
 
-def write_lossless_webp(array, path):
+def write_lossless_webp(array, path, xmp=None):
     """**Lossless**, because this is evidence. Lossy compression would put artefacts into an
-    artefact-detection image, which is the one place they cannot be tolerated."""
+    artefact-detection image, which is the one place they cannot be tolerated.
+
+    `xmp` is the delivered file's identity (`derives._xmp_packet`) and rides in a metadata chunk,
+    so stamping a crop with whose job it came from costs the evidence nothing.
+    """
     from PIL import Image
 
-    Image.fromarray(array.astype(np.uint8), mode="RGB").save(
-        path, format="WEBP", lossless=True, quality=100, method=4
-    )
+    options = {"format": "WEBP", "lossless": True, "quality": 100, "method": 4}
+    if xmp:
+        options["xmp"] = xmp
+    Image.fromarray(array.astype(np.uint8), mode="RGB").save(path, **options)
     return path

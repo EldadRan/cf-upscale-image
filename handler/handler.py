@@ -820,7 +820,16 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             entries = derives.build(request["derive"], master_path, source_path, workdir,
                                     frame_count=result["written_out"], scale=scale,
                                     request_id=request["request_id"],
-                                    warn=warnings.append)
+                                    warn=warnings.append,
+                                    # **The same three facts the master is stamped with**, and
+                                    # from the same constants — a derive that named a different
+                                    # build from the master beside it would be worse than one
+                                    # naming none.
+                                    identity={
+                                        "cf_request_id": request["request_id"],
+                                        "cf_worker_version": WORKER_VERSION,
+                                        "cf_model_build": MODEL_BUILD,
+                                    })
         except Exception as exc:  # noqa: BLE001 — a derive must never lose a written master
             # **A failed derive leaves the master intact and recoverable**, so it is reported
             # rather than raised: raising here would return a refusal for a job whose master is

@@ -597,7 +597,7 @@ class MasterWriter:
         return False
 
 
-def encode_proxy(source_path, destination, max_duration_s=None):
+def encode_proxy(source_path, destination, max_duration_s=None, identity=None):
     """A delivery rendition of the **output**, to the platform's semantics.
 
     Inter-coded, 8-bit, 1280 on the long edge, H.264 in MP4 with AAC, audio carried through,
@@ -618,8 +618,13 @@ def encode_proxy(source_path, destination, max_duration_s=None):
                "force_divisible_by=2",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", destination,
     ]
+    command += _identity_tags(identity or {})
+    # **`+use_metadata_tags` is not optional here either.** The MP4 muxer drops any key it does
+    # not recognise — `comment` and `title` survive, `cf_request_id` does not — with a zero exit
+    # code and no warning. The master's mux already carries this flag for exactly that reason;
+    # a proxy written without it would leave every tag above absent while this call succeeded.
+    command += ["-movflags", "+faststart+use_metadata_tags", destination]
     _run(command, "encoding the proxy")
     return destination
 

@@ -20,10 +20,143 @@ redoing.
 """
 
 import os
+import struct
 
 import crops
 import encoder
 import keys
+
+
+#: **The identity a delivered derive carries** (`api.md` §6, ruled item 4; `contract.md` §3 is the
+#: rule it answers to). Until this existed, `identity_tags` appeared in this module zero times: the
+#: master was stamped and every artefact beside it was anonymous, so a crop or a proxy that left
+#: its prefix — copied into a review folder, attached to a ticket, downloaded and renamed — could
+#: not say whose job produced it.
+#:
+#: **Identity only, exactly as the master's tags are.** These files are delivered. Timings,
+#: hardware, tiling configuration and anything resembling a credential stay in the manifest and
+#: the diagnostics bundle. A recovery aid and never a source of truth.
+#:
+#: **The role is stamped as well as the id**, which the master does not need and a derive does: a
+#: `poster` and a `crop` from the same request differ in what they are for, and a file found alone
+#: cannot be told apart by its pixels.
+IDENTITY_XMP_NAMESPACE = "https://cf/ns/upscale/1.0/"
+
+
+def _xmp_packet(tags):
+    """The `cf_*` identity as an XMP packet.
+
+    **XMP rather than EXIF because the keys are ours.** EXIF has a fixed tag table and no room for
+    a name this project invented; XMP carries arbitrary properties under a namespace, which is
+    what a set of `cf_`-prefixed facts needs. WebP carries XMP natively, so the same packet serves
+    both roles that write one.
+    """
+    properties = "".join(
+        ' cf:{}="{}"'.format(key, _xml_escape(str(value)))
+        for key, value in sorted(tags.items()) if value is not None)
+    return (
+        '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about="" xmlns:cf="{}"{}/>'
+        '</rdf:RDF></x:xmpmeta>'
+        '<?xpacket end="w"?>'.format(IDENTITY_XMP_NAMESPACE, properties)).encode("utf-8")
+
+
+def _xml_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+#: The VP8X flag bit that says "this file carries an XMP chunk". Bit 2 of the flags byte, per the
+#: WebP container specification.
+_VP8X_XMP_FLAG = 0x04
+
+
+def _webp_chunks(blob):
+    """Walk a RIFF/WEBP container. Chunks are padded to an even length; the pad is not payload."""
+    offset = 12
+    while offset + 8 <= len(blob):
+        fourcc = blob[offset:offset + 4]
+        size = struct.unpack("<I", blob[offset + 4:offset + 8])[0]
+        yield fourcc, blob[offset + 8:offset + 8 + size]
+        offset += 8 + size + (size & 1)
+
+
+def _webp_chunk(fourcc, payload):
+    return fourcc + struct.pack("<I", len(payload)) + payload + (
+        b"\x00" if len(payload) & 1 else b"")
+
+
+def stamp_webp(path, tags, width, height):
+    """Add the identity to a WebP **without re-encoding it**, in place.
+
+    **ffmpeg's WebP muxer silently discards `-metadata`, with a zero exit code and no warning** —
+    measured, not assumed. That is the same failure the MP4 path already carries a comment about,
+    where `+use_metadata_tags` is what makes the master's tags exist at all; here there is no flag
+    that helps, because the muxer never writes a metadata chunk.
+
+    So the container is rewritten rather than the picture. A simple-format WebP holds one image
+    chunk and nothing else and has nowhere to put metadata; the extended format (`VP8X`) does. The
+    image chunk is carried across byte-for-byte and only the container around it changes, which is
+    the property that matters: **a poster is a delivered artefact, and re-encoding one to attach a
+    label would trade the customer's pixels for our bookkeeping.** Re-saving through PIL would do
+    exactly that, which is why it is not what happens here.
+
+    Returns True if the file now carries the identity.
+    """
+    with open(path, "rb") as handle:
+        blob = handle.read()
+    if blob[:4] != b"RIFF" or blob[8:12] != b"WEBP":
+        raise ValueError("not a WebP container: {}".format(path))
+
+    existing = list(_webp_chunks(blob))
+    # A second XMP chunk would be undefined; an existing VP8X keeps its canvas and its other
+    # flags, because it may be announcing an alpha channel this code knows nothing about.
+    carried = [(f, p) for f, p in existing if f not in (b"VP8X", b"XMP ")]
+    previous = [p for f, p in existing if f == b"VP8X"]
+    if previous:
+        header = bytes([previous[0][0] | _VP8X_XMP_FLAG]) + previous[0][1:]
+    else:
+        # Flags, three reserved bytes, then canvas width-1 and height-1 as 24-bit little-endian.
+        header = (bytes([_VP8X_XMP_FLAG]) + b"\x00\x00\x00"
+                  + struct.pack("<I", width - 1)[:3] + struct.pack("<I", height - 1)[:3])
+
+    body = _webp_chunk(b"VP8X", header)
+    for fourcc, payload in carried:
+        body += _webp_chunk(fourcc, payload)
+    # XMP goes last, which is where the container specification puts it.
+    body += _webp_chunk(b"XMP ", _xmp_packet(tags))
+
+    with open(path, "wb") as handle:
+        handle.write(b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body)
+    return True
+
+
+def _stamp(path, tags, size=None, warn=None):
+    """Stamp a delivered WebP, and **never lose the artefact over the label.**
+
+    The same order the module already keeps between a derive and the master: an unstamped poster
+    is a poster, and a poster that failed to be written is nothing. So a stamping failure warns
+    and leaves the file exactly as it was.
+
+    **It warns rather than passing quietly**, because a stamp that silently does nothing is
+    indistinguishable from one that works — and this project has already paid for a metadata
+    mechanism that was absent from every file while every check around it passed.
+    """
+    try:
+        if size is None:
+            from PIL import Image  # noqa: PLC0415 — only needed on the ffmpeg-written path
+            with Image.open(path) as image:
+                size = image.size
+        stamp_webp(path, tags, size[0], size[1])
+        return True
+    except Exception as exc:  # noqa: BLE001 — the artefact outranks its label
+        if warn is not None:
+            warn("derive identity not stamped on {} ({}: {}); the file is delivered and intact, "
+                 "but it cannot say whose job it came from".format(
+                     os.path.basename(path), type(exc).__name__, str(exc)[:200]))
+        return False
 
 
 def poster_frame_index(at_fraction, frame_count):
@@ -37,7 +170,7 @@ def poster_frame_index(at_fraction, frame_count):
 
 
 def build(spec, master_path, source_path, workdir, frame_count, scale, request_id,
-          warn=None):
+          warn=None, identity=None):
     """Produce every requested role. Returns a list of entries, one per artefact written.
 
     Each entry carries the local `path` and the fields CF's `derived[]` needs; the caller
@@ -55,18 +188,27 @@ def build(spec, master_path, source_path, workdir, frame_count, scale, request_i
     Nothing ever failed here, which is why nobody found it: a guarantee that is never exercised
     looks identical to one that works.
     """
+    # **The identity every role stamps into what it delivers**, `api.md` §6 item 4. Assembled
+    # once here rather than per role: the three writers disagree about the container and about
+    # nothing else, and a per-role copy is how two of them would end up saying different things
+    # about the same job.
+    identity = dict(identity or {})
+    identity.setdefault("cf_request_id", request_id)
+
     entries = []
     for item in spec:
         role = item["role"]
         try:
             if role == "poster":
-                entries.append(_poster(item, master_path, workdir, frame_count, request_id))
+                entries.append(_poster(item, master_path, workdir, frame_count, request_id,
+                                       identity=identity, warn=warn))
             elif role == "proxy":
-                entries.append(_proxy(item, master_path, workdir, request_id))
+                entries.append(_proxy(item, master_path, workdir, request_id,
+                                      identity=identity))
             elif role == "crop":
                 entries.extend(_crops(item, master_path, source_path, workdir, frame_count, scale,
                                       request_id,
-                                      warn=warn))
+                                      warn=warn, identity=identity))
         except Exception as exc:  # noqa: BLE001 — the master outranks every derive, see above
             if warn is not None:
                 warn("derive '{}' failed and was omitted: {}: {}".format(
@@ -74,7 +216,7 @@ def build(spec, master_path, source_path, workdir, frame_count, scale, request_i
     return entries
 
 
-def _poster(item, master_path, workdir, frame_count, request_id):
+def _poster(item, master_path, workdir, frame_count, request_id, identity=None, warn=None):
     """The display role. **Lossy WebP, and that is CF's requirement rather than a choice here.**
 
     Handoff §4 names it: "poster — round(at_fraction x (frame_count - 1)) of the file this call
@@ -96,27 +238,38 @@ def _poster(item, master_path, workdir, frame_count, request_id):
     path = os.path.join(workdir, name)
     index = poster_frame_index(item.get("at_fraction", 0.25), frame_count)
     encoder.extract_poster(master_path, path, index, fps=None)
+    # **After the encode, and without touching it.** ffmpeg wrote these bytes and dropped every
+    # `-metadata` it was given; the container is rewritten around the picture rather than the
+    # picture re-encoded. `bytes` is read afterwards so the recorded size is the delivered size.
+    stamped = _stamp(path, dict(identity or {}, cf_role="poster", cf_frame_index=index),
+                     warn=warn)
     return {
         "role": "poster", "name": name, "path": path,
         "content_type": keys.content_type(name),
         "frame_index": index,
+        "identity_stamped": stamped,
         "bytes": os.path.getsize(path),
     }
 
 
-def _proxy(item, master_path, workdir, request_id):
+def _proxy(item, master_path, workdir, request_id, identity=None):
     name = keys.for_role(request_id, "proxy")
     path = os.path.join(workdir, name)
-    encoder.encode_proxy(master_path, path, max_duration_s=item.get("max_duration_s"))
+    # **The proxy is an MP4, so it is stamped in the mux that is already happening** — the same
+    # mechanism the master uses, `+use_metadata_tags` included, because without that flag the MP4
+    # muxer drops every key it does not recognise and `cf_request_id` is one of them.
+    encoder.encode_proxy(master_path, path, max_duration_s=item.get("max_duration_s"),
+                         identity=dict(identity or {}, cf_role="proxy"))
     return {
         "role": "proxy", "name": name, "path": path,
         "content_type": keys.content_type(name),
+        "identity_stamped": True,
         "bytes": os.path.getsize(path),
     }
 
 
 def _crops(item, master_path, source_path, workdir, frame_count, scale, request_id,
-           warn=None):
+           warn=None, identity=None):
     """The evidence role. One file per crop, source beside output, lossless.
 
     **Lossless because CF required it, and for a reason worth keeping** (2026-08-15): "poster is a
@@ -164,9 +317,16 @@ def _crops(item, master_path, source_path, workdir, frame_count, scale, request_
         pair, coordinates = crops.render_pair(source_rgb, output_rgb, region, scale)
         name = keys.crop_name(request_id, ordinal)
         path = os.path.join(workdir, name)
-        crops.write_lossless_webp(pair, path)
+        # **PIL writes this one, and PIL carries XMP itself** — no container surgery is needed
+        # where the encoder is ours to ask. Still lossless: the identity rides in a metadata
+        # chunk and the evidence pixels are untouched.
+        crops.write_lossless_webp(
+            pair, path,
+            xmp=_xmp_packet(dict(identity or {}, cf_role="crop", cf_crop_ordinal=ordinal,
+                                 cf_frame_index=index)))
         entries.append({
             "role": "crop", "name": name, "path": path,
+            "identity_stamped": True,
             "content_type": keys.content_type(name),
             "ordinal": ordinal,
             "frame_index": index,
