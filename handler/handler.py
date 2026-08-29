@@ -341,7 +341,13 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # `codec` and `preset` here: `StillWriter` takes none of the four, so a still that named one
     # would be answered with a PNG that honours nothing — and the end-of-encode keyframe refusal
     # cannot catch it either, because a `StillWriter` has no `unplaced_keyframes` to ask.
-    asked_for_encode = (request.get("codec", envelope.DEFAULT_CODEC) != envelope.DEFAULT_CODEC
+    # **Anchored on `H264` rather than on a default, because there is no default any more.** This
+    # preserves the behaviour exactly: a still naming h264 is served, a still naming h265 is
+    # refused. **It also makes h264 the one codec a still may name, which nothing has ruled** —
+    # `codec` is now required on every request including a still's, so a caller sending an image
+    # must name a codec that will not be used, and only one of the two values is accepted. Filed
+    # to the gate rather than decided here.
+    asked_for_encode = (request.get("codec", envelope.H264) != envelope.H264
                         or request.get("preset", encoder.DEFAULT_PRESET)
                         != encoder.DEFAULT_PRESET
                         or request.get("keyframes", envelope.DEFAULT_KEYFRAMES)
@@ -361,8 +367,13 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     envelope.check_keyframe_cap(request,
                                 source.get("duration_s") or source.get("video_duration_s"),
                                 source.get("fps"))
-    resolved_codec = envelope.resolve_codec(
-        request.get("codec", envelope.DEFAULT_CODEC), source.get("codec")) if not still else None
+    # **The codec is whatever the caller named, and there is nothing left to resolve.** `"source"`
+    # is retired (`contract.md` §1a), so this no longer needs the probe and no longer has a
+    # refusal in it: the post-probe branch existed only to reject a source whose codec this worker
+    # could not encode, and the source's codec has stopped mattering — the master is re-encoded
+    # from raw frames, so any source we can decode we can deliver in either codec. A still has no
+    # encoder at all, which is why it is still None here.
+    resolved_codec = None if still else request["codec"]
 
     # **`proxy` is refused on a still rather than produced badly.** A proxy is a duration-bounded,
     # long-edge-capped *video* for scrubbing; over one frame it is a worse copy of the master with

@@ -32,8 +32,25 @@ import encoder
 #: **The worker's constants are `encoder`'s, not copies.** The oracle carries its own `DEFAULT_CRF`
 #: and `DEFAULT_PRESET` because it must run with no worker on the path; the conformance link is
 #: what keeps the two honest, and a drift between them fails there rather than in a delivery.
-CODECS = ("h264", "h265", "source")
-DEFAULT_CODEC = "h264"
+CODECS = ("h264", "h265")
+
+#: **`codec` is REQUIRED and has no default (CF, 2026-08-29; `contract.md` §1a).** An omitted codec
+#: is refused rather than defaulted, and `"source"` is retired.
+#:
+#: `"source"` meant *"keep the input's codec"*. It could not be resolved at the door, because the
+#: door has not opened the file — so it resolved after the probe and could refuse a whole job with
+#: the fetch already paid for. **A caller who must name the codec cannot be silently handed a
+#: different one, which is what that value existed to prevent.** The bad state is unexpressible
+#: now rather than detected, which is the trade this project keeps making on purpose.
+#:
+#: **And the source's own codec stops mattering entirely.** The master is re-encoded from raw
+#: frames — there is no stream to copy — so what the input was encoded with has no bearing on what
+#: this worker can deliver. Any source it can decode, it can deliver in either codec. The claim
+#: filed against `resolve_codec`'s docstring went with the value: it never needed ruling.
+#:
+#: **`H264` is still named**, because `release_2_equivalent` and `default_off_identity` both anchor
+#: on it. It is an anchor for a property, not a default for a request.
+H264 = "h264"
 
 CRF_MIN, CRF_MAX = 0, 51
 
@@ -89,7 +106,17 @@ def derive(params):
         )
 
     # ---- codec ---------------------------------------------------------------------------
-    codec = output.get("codec", DEFAULT_CODEC)
+    # **Required, and refused by absence before it is refused by value.** A caller that omits it
+    # is not asking for h264; it is a caller that has not been updated, and answering it with a
+    # default is the "answered rather than served" failure this worker exists to avoid.
+    if "codec" not in output:
+        raise WorkerError(
+            MISSING_REQUIRED_FIELD,
+            "output.codec is required and has no default; name 'h264' or 'h265' in "
+            "'params.output'. Note that the top-level 'output' is the R2 destination and a "
+            "different field entirely.",
+        )
+    codec = output["codec"]
     if codec not in CODECS:
         raise WorkerError(
             INVALID_FIELD_VALUE,
@@ -254,7 +281,7 @@ def derive(params):
         # **`head_keyframes` counts, and it is the reason the flag is safe.** It changes the
         # master's bytes when set, so a request naming it has moved production's output and must
         # not report otherwise. Default off is what makes `codec_default_unmoved` hold.
-        "release_2_equivalent": (codec == DEFAULT_CODEC
+        "release_2_equivalent": (codec == H264
                                  and crf == encoder.DEFAULT_CRF
                                  and preset == encoder.DEFAULT_PRESET
                                  and head_keyframes is False
@@ -333,50 +360,27 @@ def check_keyframe_cap(config, duration_s, fps):
         )
 
 
-def resolve_codec(codec, source_codec):
-    """`"source"` into a concrete codec, against what the source actually is.
-
-    **The master is re-encoded from raw frames, so `"source"` can never mean `-c:v copy`** — there
-    is no stream to copy. It means "encode with the codec the source used", and that is only
-    answerable once the source has been probed, which is why it is resolved here rather than in
-    `derive`: the request surface is validated at the door, and the door has not opened the file.
-
-    **UNRULED, and implemented conservatively rather than left to guess.** Contract §5c lists
-    `"source"` as a legal value and says nothing about what the worker does with it;
-    `envelope_cases.py` section 2 asserts only that `derive` ACCEPTS it. So the behaviour below is
-    the builder's reading and is filed as a claim: a source whose codec this worker can encode is
-    honoured, and **anything else is refused rather than quietly encoded as h264.** A silent
-    fallback would be the silent-reinterpretation class — a caller who asked to stay in their own
-    codec receiving a different one and no word about it.
-
-    Neither of the two codec-cost jobs exercises this path: both name their codec outright.
-    """
-    if codec != "source":
-        return codec
-    family = {"h264": "h264", "avc1": "h264", "hevc": "h265", "h265": "h265"}.get(
-        (source_codec or "").lower())
-    if family is None:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "output.codec 'source' asks for the source's own codec and this source is {!r}, "
-            "which this worker does not encode. The master is re-encoded from raw frames, so "
-            "'source' selects an encoder rather than copying a stream. Name 'h264' or 'h265' "
-            "explicitly.".format(source_codec or "unknown"),
-        )
-    return family
-
-
 def default_off_identity(release_2_params):
     """THE SAFETY PROPERTY, executable — `codec_default_unmoved`.
 
-    A request naming none of the codec fields must derive a config that changes nothing. **This is
-    what lets the development tier run new codec code while medium and high serve production**, and
-    it is enforced by a local run before a dispatch, never by CI. Returns True or raises.
+    A request naming `codec: "h264"` and none of the other five fields must derive a config that
+    changes nothing. **This is what lets the development tier run new codec code while medium and
+    high serve production**, and it is enforced by a local run before a dispatch, never by CI.
+    Returns True or raises.
+
+    **Restated 2026-08-29, when `codec` became required** (`contract.md` §4). The property used to
+    begin "a request naming none of the six fields" — and that request no longer exists, so this
+    check would have gone hollow without failing, which is the defect class this project is named
+    after. What it defends now is the five fields that can still move a delivered master's bytes
+    without anyone asking for them.
     """
     cfg = derive(release_2_params)
-    assert cfg["codec"] == DEFAULT_CODEC, "an omitted codec must deliver h264"
+    # **The codec is no longer a default to defend**; the caller has already said h264, and this
+    # asserts only that deriving does not move it.
+    assert cfg["codec"] == H264, "the h264 anchor must survive derive unchanged"
     assert cfg["crf"] == encoder.DEFAULT_CRF, "an omitted crf must deliver 12"
     assert cfg["preset"] == encoder.DEFAULT_PRESET, "an omitted preset must deliver medium"
-    assert cfg["head_keyframes"] is False, "an omitted head_keyframes must deliver off"
+    assert cfg["head_keyframes"] is False, "an omitted head_keyframes must not add keyframes"
+    assert cfg["keyframes"] == DEFAULT_KEYFRAMES, "an omitted keyframes must not place any"
     assert cfg["release_2_equivalent"] is True
     return True
