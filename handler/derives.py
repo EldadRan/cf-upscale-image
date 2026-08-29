@@ -19,6 +19,7 @@ costs hours of GPU to reproduce. So a derive that fails leaves the expensive art
 redoing.
 """
 
+import json
 import os
 import struct
 
@@ -83,6 +84,21 @@ def _webp_chunks(blob):
         offset += 8 + size + (size & 1)
 
 
+def _webp_chunks_with_end(blob):
+    """Every chunk, and the offset the walk finished at — so a caller can tell whether it read
+    the whole file or merely as much of it as was there."""
+    chunks, offset = [], 12
+    while offset + 8 <= len(blob):
+        fourcc = blob[offset:offset + 4]
+        size = struct.unpack("<I", blob[offset + 4:offset + 8])[0]
+        payload = blob[offset + 8:offset + 8 + size]
+        if len(payload) != size:
+            return chunks, offset
+        chunks.append((fourcc, payload))
+        offset += 8 + size + (size & 1)
+    return chunks, offset
+
+
 def _webp_chunk(fourcc, payload):
     return fourcc + struct.pack("<I", len(payload)) + payload + (
         b"\x00" if len(payload) & 1 else b"")
@@ -110,7 +126,24 @@ def stamp_webp(path, tags, width, height):
     if blob[:4] != b"RIFF" or blob[8:12] != b"WEBP":
         raise ValueError("not a WebP container: {}".format(path))
 
-    existing = list(_webp_chunks(blob))
+    # **The walk has to consume the file exactly.** `_webp_chunks` stops when fewer than eight
+    # bytes remain and reports what it read; it cannot tell a complete container from a truncated
+    # one. Rewriting a truncated file would emit *corrected* chunk lengths — a container that
+    # every parser now calls well-formed while the image payload inside it is short, which is a
+    # worse outcome than the unstamped file it started as.
+    #
+    # **This is checked here rather than left to whoever opened the image first.** It was, once:
+    # the caller happened to decode the file through PIL and that rejected a truncation on the
+    # way past. A guard that lives in another function's incidental behaviour is a guard that
+    # leaves when that function does.
+    declared = struct.unpack("<I", blob[4:8])[0] if len(blob) >= 8 else 0
+    if declared + 8 != len(blob):
+        raise ValueError("WebP size field says {} bytes, file holds {}: {}".format(
+            declared + 8, len(blob), path))
+    existing, consumed = _webp_chunks_with_end(blob)
+    if consumed != len(blob):
+        raise ValueError("WebP chunk walk ended at {} of {} bytes: {}".format(
+            consumed, len(blob), path))
     # A second XMP chunk would be undefined; an existing VP8X keeps its canvas and its other
     # flags, because it may be announcing an alpha channel this code knows nothing about.
     carried = [(f, p) for f, p in existing if f not in (b"VP8X", b"XMP ")]
@@ -127,13 +160,65 @@ def stamp_webp(path, tags, width, height):
         body += _webp_chunk(fourcc, payload)
     # XMP goes last, which is where the container specification puts it.
     body += _webp_chunk(b"XMP ", _xmp_packet(tags))
+    stamped = b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body
 
-    with open(path, "wb") as handle:
-        handle.write(b"RIFF" + struct.pack("<I", len(body) + 4) + b"WEBP" + body)
+    # **Written beside the file and moved onto it, never over it.** `open(path, "wb")` truncates
+    # before the first byte is written, so a failed write — a full disk, an I/O error, the cgroup
+    # SIGKILL this worker has a documented history of — would leave a zero-byte poster where a
+    # delivered one had been, and the caller above would report it as intact and upload it. The
+    # rename is atomic on the same filesystem, so the artefact is either the original or the
+    # stamped one and never a truncation of either.
+    temporary = path + ".stamping"
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(stamped)
+        os.replace(temporary, path)
+    except BaseException:
+        # BaseException, not Exception: a KeyboardInterrupt or a SystemExit between the two must
+        # not leave the scratch file behind either.
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
     return True
 
 
-def _stamp(path, tags, size=None, warn=None):
+def verify(path):
+    """Read the identity back **out of the delivered bytes**. False when it is not there.
+
+    **The field beside it used to be a literal `True`.** Two of the three roles reported that they
+    had been stamped without anything having looked: PIL ignores a save option it does not
+    implement, and the MP4 muxer drops keys it does not recognise with a zero exit code — which
+    are the two failures the code around this already carries comments about. A run on a runtime
+    whose Pillow predates WebP XMP would have written an anonymous crop and filed a record saying
+    it had not.
+
+    That is the class this module's own docstring names: a mechanism absent from every file while
+    every check around it passes. The kit catches it on the machine running the kit; this catches
+    it in the image, on the job, which is where it would actually happen.
+
+    **Never raises.** A verification that could fail a job would be worse than the defect.
+    """
+    try:
+        if path.lower().endswith(".webp"):
+            from PIL import Image  # noqa: PLC0415 — leaf import, same as the stamping path
+            with Image.open(path) as image:
+                packet = image.info.get("xmp") or b""
+            return b"cf_request_id" in packet
+        import subprocess  # noqa: PLC0415 — only the container-tagged roles reach this
+        probed = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags", "-print_format", "json",
+             path], capture_output=True, timeout=30)
+        if probed.returncode != 0:
+            return False
+        tags = json.loads(probed.stdout).get("format", {}).get("tags", {})
+        return bool(tags.get("cf_request_id"))
+    except Exception:  # noqa: BLE001 — an unverifiable stamp is reported as unstamped
+        return False
+
+
+def _stamp(path, tags, warn=None):
     """Stamp a delivered WebP, and **never lose the artefact over the label.**
 
     The same order the module already keeps between a derive and the master: an unstamped poster
@@ -145,12 +230,11 @@ def _stamp(path, tags, size=None, warn=None):
     mechanism that was absent from every file while every check around it passed.
     """
     try:
-        if size is None:
-            from PIL import Image  # noqa: PLC0415 — only needed on the ffmpeg-written path
-            with Image.open(path) as image:
-                size = image.size
+        from PIL import Image  # noqa: PLC0415 — the canvas is not in the container's header
+        with Image.open(path) as image:
+            size = image.size
         stamp_webp(path, tags, size[0], size[1])
-        return True
+        return verify(path)
     except Exception as exc:  # noqa: BLE001 — the artefact outranks its label
         if warn is not None:
             warn("derive identity not stamped on {} ({}: {}); the file is delivered and intact, "
@@ -263,7 +347,9 @@ def _proxy(item, master_path, workdir, request_id, identity=None):
     return {
         "role": "proxy", "name": name, "path": path,
         "content_type": keys.content_type(name),
-        "identity_stamped": True,
+        # **Read back, not asserted.** The muxer drops what it does not recognise and says
+        # nothing; a literal True here would report a tag that is not in the file.
+        "identity_stamped": verify(path),
         "bytes": os.path.getsize(path),
     }
 
@@ -326,7 +412,8 @@ def _crops(item, master_path, source_path, workdir, frame_count, scale, request_
                                  cf_frame_index=index)))
         entries.append({
             "role": "crop", "name": name, "path": path,
-            "identity_stamped": True,
+            # PIL ignores a save option it does not implement, so this is read back too.
+            "identity_stamped": verify(path),
             "content_type": keys.content_type(name),
             "ordinal": ordinal,
             "frame_index": index,
