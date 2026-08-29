@@ -182,6 +182,20 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # that was not written yet. A corpus whose entries cannot say which shape they are is a
         # corpus that can only be parsed by the code that wrote it.
         "record_version": 1,
+        # **The id, in the BODY and not only in the key** (`api.md` §6, ruled item 2). CF mints
+        # the key and the id lives in the name it chose; a record harvested into a fitting
+        # directory, or renamed, or read out of a bucket listing, joined to nothing at all. This
+        # document's own docstring says it is meant to be read years from now by something not
+        # written yet, and until this line the only thing that could identify it was its filename.
+        #
+        # **Top level rather than inside `request`**, which is the summary of what was ASKED for.
+        # The id is what this record IS, not a parameter of the job — and a reader looking for it
+        # should not have to know that the summary exists, or that the summary drops `None`.
+        #
+        # **`None` is written rather than omitted.** A run refused before validation has no id to
+        # carry, and a key present-but-null says that; an absent key says the record predates this
+        # line, which is a different fact.
+        "request_id": (request or {}).get("request_id"),
         "utc": diagnostics._now(),
         "status": status,
         "build": build_identity,
