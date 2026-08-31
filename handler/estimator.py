@@ -220,6 +220,74 @@ def _row_tile_quality(row):
     return row.get("tile_quality") or DEFAULT_TILE_QUALITY
 
 
+#: **A row banked as PURE RECORD is not a prediction** (CF, 2026-08-28; `time-model.md` §0c). Two
+#: H200 rows were landed as coverage and explicitly ruled not to make `same_card` non-empty.
+#:
+#: **They were invisible only because the selector was blind, and §0c removes exactly that
+#: blindness** — so the ruling needs a field of its own rather than a bug to shelter behind. Until
+#: today it lived in prose in each row's `note`, which is not something a selector can read.
+PURE_RECORD = "pure_record"
+
+
+def _in_one_unit(row):
+    """A row the caller can price, carrying `seconds_per_frame`, or None. **Never mutates.**
+
+    `time-model.md` §0c, ruled 2026-08-31:
+
+        a bare `seconds_per_frame`                     used as-is
+        `seconds_per_frame_post_strip`                 post_strip + strip_seconds / frames
+        post-strip without `strip_seconds`/`frames`    NOT used, counted as skipped
+        neither                                        not used
+
+    **Amendment 6e ruled on 2026-08-20 that a new row carries the post-strip rate and never a bare
+    one, and this selector read the bare one** — so three conforming rows were unreadable from the
+    day they were banked and `calibration_rows.py` was about to emit fifty more into the same
+    silence. A measurement pipeline built end to end, terminating in a table nothing reads.
+
+    **The conversion is exact arithmetic and takes no model.** `post_strip + strip_seconds/frames`
+    reproduces `attempt_seconds/frames` to within 0.0005 on the three banked rows. Anything that
+    needed a strip ESTIMATE would be the time model, which CF buried today.
+
+    **It re-contaminates each converted row by one draw of the strip** — 2.3%, 11.7% and 5.6% on
+    those three — and that is accepted rather than overlooked. It is what 6e exists to prevent;
+    against the never-retryable refusal it was unacceptable, and `api.md` §4d removed the refusal.
+    Against an ETA it is cheap. Converting DOWN is not available: no visible row carries a strip,
+    and `max()` may not range over two units.
+
+    **A copy, always.** Writing the converted rate onto the caller's row would put a derived value
+    into the calibration table for the life of the process, where the next reader cannot tell it
+    from a measurement.
+    """
+    if not isinstance(row, dict) or row.get(PURE_RECORD):
+        return None
+    bare = row.get("seconds_per_frame")
+    if bare:
+        return row
+    post_strip = row.get("seconds_per_frame_post_strip")
+    if not post_strip:
+        return None
+    strip, frames = row.get("strip_seconds"), row.get("frames")
+    # **Half a 6e row is refused rather than guessed at.** Without both columns the strip is
+    # either inside the rate or outside it depending on nothing a reader can see, and a row that
+    # cannot say which unit it is in has the shape of a measurement without being one.
+    if strip is None or not frames:
+        return None
+    return dict(row, seconds_per_frame=post_strip + strip / float(frames))
+
+
+def _unconvertible(calibration):
+    """Rows carrying a post-strip rate that cannot be converted. **Counted, never silent.**
+
+    §0c says such a row is skipped; a skip nobody counts is indistinguishable from a table that
+    never held one, which is how the original mismatch survived eleven days.
+    """
+    return [r for r in calibration or []
+            if isinstance(r, dict) and not r.get(PURE_RECORD)
+            and not r.get("seconds_per_frame")
+            and r.get("seconds_per_frame_post_strip")
+            and (r.get("strip_seconds") is None or not r.get("frames"))]
+
+
 def _timing_rows(calibration, output_pixels, window, unbatched=None):
     """Rows to borrow a per-frame time from when the configuration has no rung name.
 
@@ -235,9 +303,9 @@ def _timing_rows(calibration, output_pixels, window, unbatched=None):
     # the window's effect on speed is real but second-order beside it, and folding it in through
     # row selection made the prediction unstable rather than sharper.
     del window
-    rows = [r for r in calibration
-            if r.get("seconds_per_frame") and r.get("output_pixels")
-            and 0.5 <= r["output_pixels"] / float(output_pixels) <= 2.0]
+    rows = [row for row in (_in_one_unit(r) for r in calibration or [])
+            if row is not None and row.get("output_pixels")
+            and 0.5 <= row["output_pixels"] / float(output_pixels) <= 2.0]
 
     # **A row that ran without temporal batching may never price one that will, or the reverse**
     # (F-2026-08-20-40, third face). The reason is one sentence: a window of 1 pays the whole
