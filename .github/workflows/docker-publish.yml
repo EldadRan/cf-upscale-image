@@ -303,8 +303,31 @@ jobs:
           # value on every layer rebuild and would invalidate everything below it.
           echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
+      # **THREE ATTEMPTS, AND ONLY THE LAST ONE IS COLD (C13, CF 2026-08-31).** One dropped
+      # connection inside a ~4 minute transfer of the 15.68 GB weights layer ended a publish that
+      # had both toolchain gates already paid for:
+      #
+      #   ERROR: failed to compute cache key: short read:
+      #     expected 15683232139 bytes but got 12761169920: unexpected EOF
+      #
+      # `docker/build-push-action` wraps no retry around the cache pull, so that was the whole
+      # run. Not disk — 88 GB free at the moment it died — and not a bad artefact: GHCR still
+      # serves that layer at exactly 15683232139 bytes. The transfer was cut at 81%.
+      #
+      # **RETRY BEFORE DEGRADE, and the order is the decision.** The failure was transient and the
+      # same sha built green minutes later unchanged, so a second attempt fixes it in seconds
+      # while a cold build pays ~33 extra minutes for the same image. Retrying first dominates on
+      # every axis this project ranks: identical quality, higher success than one attempt, lower
+      # cost than degrading. Degrading immediately would also hide a genuinely unreadable cache
+      # as merely a slow build; this way the log says which of the two happened.
+      #
+      # **The three `with:` blocks differ ONLY in `cache-from`**, and three copies of one fact is
+      # the shape this project keeps paying for — so `tests/run_local.py` asserts they agree
+      # rather than a comment asking anyone to keep them in step. GitHub Actions has no YAML
+      # anchors, which is why they are copies at all.
       - uses: docker/build-push-action@v7
         id: build
+        continue-on-error: true
         with:
           context: ./handler
           push: true
@@ -312,14 +335,6 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:sha-${{ github.sha }}
-          # **What the image needs in order to identify itself in its own bundles.** Ten
-          # calibration runs were banked against an image that reported `"image": null`, so the
-          # only evidence they shared a build was that nobody remembered changing one. The
-          # immutable `:sha-` tag rather than `:latest`, because `:latest` moves and a worker
-          # reporting it would name a build it is not necessarily running.
-          #
-          # Below the weights layer in the Dockerfile, so these change every build and cost one
-          # small layer rather than a 17 GB re-download.
           build-args: |
             IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
             BUILD_COMMIT=${{ github.sha }}
@@ -336,6 +351,80 @@ jobs:
           # metadata rides in the image itself and gives the same handler-only rebuild.
           cache-from: type=registry,ref=${{ env.IMAGE }}:latest
           cache-to: type=inline
+
+      # Attempt two, identical to attempt one. This is where a dropped connection is meant to end.
+      - uses: docker/build-push-action@v7
+        id: retry
+        if: steps.build.outcome == 'failure'
+        continue-on-error: true
+        with:
+          context: ./handler
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_UTC=${{ env.BUILD_UTC }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to: type=inline
+
+      # **Attempt three has no `cache-from` at all**, so a cache that cannot be read stops being
+      # able to end the run. It rebuilds the weights layer from scratch — the ~42 minute path
+      # rather than the ~9 minute one — which is why it is last and never first.
+      - uses: docker/build-push-action@v7
+        id: cold
+        if: steps.build.outcome == 'failure' && steps.retry.outcome == 'failure'
+        with:
+          context: ./handler
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_UTC=${{ env.BUILD_UTC }}
+          cache-to: type=inline
+
+      # **Which path produced the image, said out loud.** A degraded build is thirty minutes
+      # slower than a warm one, and the next person looking at a slow publish should find the
+      # reason here rather than guessing at GHCR. `always()` for the same reason the disk reading
+      # is: the run worth reading is the one that went badly.
+      - name: How this image was built
+        if: always()
+        run: |
+          {
+            echo "## How this image was built"
+            echo
+            echo "| attempt | cache | outcome |"
+            echo "|---|---|---|"
+            echo "| 1 | registry, from :latest | ${{ steps.build.outcome }} |"
+            echo "| 2 (retry) | registry, from :latest | ${{ steps.retry.outcome || 'not needed' }} |"
+            echo "| 3 (cold) | NONE — weights rebuilt | ${{ steps.cold.outcome || 'not needed' }} |"
+            echo
+            if [ "${{ steps.cold.outcome }}" = "success" ]; then
+              echo "**DEGRADED TO A COLD BUILD.** The registry cache could not be read twice, so the"
+              echo "weights layer was rebuilt from scratch. This publish is roughly thirty minutes"
+              echo "slower than a warm one and the image is identical. If this recurs, the cache"
+              echo "blob is the thing to look at, not the build."
+            elif [ "${{ steps.retry.outcome }}" = "success" ]; then
+              echo "**The first attempt failed and the retry succeeded**, which is the signature of a"
+              echo "transient cache-pull failure. No degradation was needed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # **Every attempt failed, so the job fails.** `continue-on-error` on the first two means the
+      # job would otherwise go green having published nothing at all — a build that reports
+      # success and produces no image is worse than one that fails.
+      - name: Refuse to report success without an image
+        if: steps.build.outcome == 'failure' && steps.retry.outcome == 'failure' && steps.cold.outcome != 'success'
+        run: |
+          echo "all three build attempts failed — no image was published" >&2
+          exit 1
 
       # `always()`, because the reading that matters most is the one taken after a build that ran
       # out of disk — and that is exactly the run where a normal step is skipped.
@@ -368,7 +457,7 @@ jobs:
             echo '| field | value |'
             echo '|---|---|'
             echo "| reference | \`${IMAGE}:sha-${GITHUB_SHA}\` |"
-            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest || steps.retry.outputs.digest || steps.cold.outputs.digest }}\` |"
             echo "| commit | \`${GITHUB_SHA}\` |"
             echo "| built (UTC) | ${BUILD_UTC} |"
             echo
