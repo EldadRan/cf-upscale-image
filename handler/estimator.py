@@ -379,8 +379,13 @@ def fastest_seconds_per_frame(calibration, output_pixels):
     refusal: if a job cannot finish even at the fastest rate anyone has ever observed, no
     configuration will rescue it.
     """
-    rows = [r for r in (calibration or [])
-            if _priceable(r) and r.get("seconds_per_frame") and r.get("output_pixels")]
+    # **Through `_in_one_unit` as well — "every rate reader", not two of three.** This one is the
+    # lower bound `refuse_frames_no_deadline_admits` uses to DENY a job, and a minimum taken over
+    # a subset is HIGHER than one taken over the whole table: a cheap 6e row it could not see made
+    # the bound stricter and refused work that would have finished. That is the unsafe direction
+    # for the one reader whose output is a refusal.
+    rows = [row for row in (_in_one_unit(r) for r in (calibration or []))
+            if row is not None and row.get("output_pixels")]
     if not rows:
         return None
     return min(r["seconds_per_frame"] * (output_pixels / float(r["output_pixels"]))
@@ -851,18 +856,20 @@ def _approximate_seconds_per_frame(calibration, rung_name, output_pixels, estima
     exists does it fall back to everything rather than to nothing. A rough number is the point of
     this function; a rough number drawn from the wrong kind of run is not.
     """
-    # **`_priceable` here too.** A row ruled out of predictions must be out of ALL of them; this
-    # fallback is reached exactly when `_timing_rows` found nothing, which is when a single row
-    # decides the whole estimate.
+    # **THROUGH `_in_one_unit`, THE SAME PREDICATE THE OTHER TWO READERS USE** (`time-model.md`
+    # §0c, amended 2026-08-31 from "the selector" to "every rate reader").
     #
-    # **It still selects on a BARE rate, and that is a known gap rather than an oversight** — a
-    # rung whose only banked rows came in under 6e is invisible here even though `_timing_rows`
-    # can now read them. Filed to the gate: `time-model.md` §0c rules on the selector and this is
-    # a second one, and widening it moves predictions on a path with its own `approximate`
-    # labelling. It grows with every row `calibration_rows.py` emits.
-    rows = [run for run in calibration
-            if _priceable(run) and run.get("rung") == rung_name
-            and run.get("seconds_per_frame") and run.get("output_pixels")]
+    # This selected on a bare rate while `_timing_rows` had learned both units, so a rung whose
+    # only banked rows came in under 6e produced NO prediction at all — and this is the path
+    # reached exactly when `_timing_rows` found nothing, which is when one row decides the whole
+    # estimate. The clause said "the selector" and there are three; the marker said "not a
+    # prediction" and reached one of them. Same defect, one from each of us, on the same day.
+    #
+    # **Expressed through the shared function rather than beside it**, so the three cannot drift:
+    # two predicates that must agree are a term-against-term defect waiting, and this project has
+    # paid for that shape more than once.
+    rows = [row for row in (_in_one_unit(run) for run in calibration or [])
+            if row is not None and row.get("rung") == rung_name and row.get("output_pixels")]
     if estimated_frames:
         sequence = estimated_frames > 1
         alike = [run for run in rows
