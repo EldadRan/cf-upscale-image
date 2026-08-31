@@ -229,6 +229,18 @@ def _row_tile_quality(row):
 PURE_RECORD = "pure_record"
 
 
+def _priceable(row):
+    """May this row inform a prediction at all? **One predicate, every reader.**
+
+    `PURE_RECORD` reached `_in_one_unit` and nothing else, so a row a person ruled out was still
+    read by `fastest_seconds_per_frame` — the lower bound `refuse_frames_no_deadline_admits` uses
+    to REFUSE work — and by `_approximate_seconds_per_frame`. The marker said "not a prediction"
+    and meant "not one prediction out of three". It was unreachable only because both marked rows
+    happen to carry no bare rate, which is the bug sheltering the ruling all over again.
+    """
+    return isinstance(row, dict) and not row.get(PURE_RECORD)
+
+
 def _in_one_unit(row):
     """A row the caller can price, carrying `seconds_per_frame`, or None. **Never mutates.**
 
@@ -258,21 +270,34 @@ def _in_one_unit(row):
     into the calibration table for the life of the process, where the next reader cannot tell it
     from a measurement.
     """
-    if not isinstance(row, dict) or row.get(PURE_RECORD):
+    if not _priceable(row):
         return None
     bare = row.get("seconds_per_frame")
-    if bare:
-        return row
+    if _positive_number(bare):
+        # **A copy on this path too.** It used to hand back the caller's own dict, so nine of nine
+        # returned rows were the table's own objects while the docstring promised a copy — a
+        # future caller normalising a rate onto a returned row would corrupt the shipped table
+        # for bare rows and not for converted ones, which is the worst shape that bug can take.
+        return dict(row)
     post_strip = row.get("seconds_per_frame_post_strip")
-    if not post_strip:
+    if not _positive_number(post_strip):
         return None
     strip, frames = row.get("strip_seconds"), row.get("frames")
     # **Half a 6e row is refused rather than guessed at.** Without both columns the strip is
     # either inside the rate or outside it depending on nothing a reader can see, and a row that
     # cannot say which unit it is in has the shape of a measurement without being one.
-    if strip is None or not frames:
+    if not _number(strip) or not _positive_number(frames):
         return None
     return dict(row, seconds_per_frame=post_strip + strip / float(frames))
+
+
+def _number(value):
+    """A real number, and `True` is not one. **`isinstance(True, int)` is the trap.**"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _positive_number(value):
+    return _number(value) and value > 0
 
 
 def _unconvertible(calibration):
@@ -281,11 +306,19 @@ def _unconvertible(calibration):
     §0c says such a row is skipped; a skip nobody counts is indistinguishable from a table that
     never held one, which is how the original mismatch survived eleven days.
     """
+    # **DEFINED IN TERMS OF `_in_one_unit`, so the two cannot disagree.** Spelling the same
+    # predicates twice was already wrong twice: they read `frames: "0"` differently — `not "0"` is
+    # False, so the guard meant to stop the division let it through and `_in_one_unit` raised
+    # `ZeroDivisionError` inside `_timing_rows`, taking the whole estimate down while this
+    # function called the row convertible. Matching the predicates fixed that pair and left a
+    # string post-strip rate dropped by one and counted by neither.
+    #
+    # **A row that LOOKS 6e-shaped and cannot be priced is counted, whatever the reason** — the
+    # key being present is what makes it a row somebody meant as a measurement.
     return [r for r in calibration or []
-            if isinstance(r, dict) and not r.get(PURE_RECORD)
-            and not r.get("seconds_per_frame")
-            and r.get("seconds_per_frame_post_strip")
-            and (r.get("strip_seconds") is None or not r.get("frames"))]
+            if _priceable(r)
+            and r.get("seconds_per_frame_post_strip") is not None
+            and _in_one_unit(r) is None]
 
 
 def _timing_rows(calibration, output_pixels, window, unbatched=None):
@@ -347,7 +380,7 @@ def fastest_seconds_per_frame(calibration, output_pixels):
     configuration will rescue it.
     """
     rows = [r for r in (calibration or [])
-            if r.get("seconds_per_frame") and r.get("output_pixels")]
+            if _priceable(r) and r.get("seconds_per_frame") and r.get("output_pixels")]
     if not rows:
         return None
     return min(r["seconds_per_frame"] * (output_pixels / float(r["output_pixels"]))
@@ -675,6 +708,19 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     # video that plans 1 is the floor rung, and costs the same way for the same reason.
     comparable = _timing_rows(calibration, output_pixels, window,
                               unbatched=(window == 1))
+    # **The skipped rows are RECORDED, which is the half `_unconvertible` existed for and did not
+    # do.** It was written with a docstring saying a skip nobody counts is indistinguishable from
+    # a table that never held one — and then nothing in the worker called it, so in production a
+    # half-6e row was still dropped in exactly that silence. `0` is written as readily as a
+    # number, because the absence of the key would be the same silence one level up.
+    skipped = _unconvertible(calibration)
+    if skipped:
+        rationale["rows_unconvertible"] = len(skipped)
+        rationale["rows_unconvertible_why"] = (
+            "carry seconds_per_frame_post_strip without both strip_seconds and frames, so the "
+            "strip is either inside the rate or outside it depending on nothing a reader can see")
+    else:
+        rationale["rows_unconvertible"] = 0
     if not comparable:
         per_frame = _approximate_seconds_per_frame(
             calibration, chosen["name"], output_pixels, job.get("estimated_frames"))
@@ -805,8 +851,17 @@ def _approximate_seconds_per_frame(calibration, rung_name, output_pixels, estima
     exists does it fall back to everything rather than to nothing. A rough number is the point of
     this function; a rough number drawn from the wrong kind of run is not.
     """
+    # **`_priceable` here too.** A row ruled out of predictions must be out of ALL of them; this
+    # fallback is reached exactly when `_timing_rows` found nothing, which is when a single row
+    # decides the whole estimate.
+    #
+    # **It still selects on a BARE rate, and that is a known gap rather than an oversight** — a
+    # rung whose only banked rows came in under 6e is invisible here even though `_timing_rows`
+    # can now read them. Filed to the gate: `time-model.md` §0c rules on the selector and this is
+    # a second one, and widening it moves predictions on a path with its own `approximate`
+    # labelling. It grows with every row `calibration_rows.py` emits.
     rows = [run for run in calibration
-            if run.get("rung") == rung_name
+            if _priceable(run) and run.get("rung") == rung_name
             and run.get("seconds_per_frame") and run.get("output_pixels")]
     if estimated_frames:
         sequence = estimated_frames > 1
