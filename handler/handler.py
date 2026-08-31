@@ -2034,8 +2034,27 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             written = pipeline.run(cli, capture, args, plan, budget, writer,
                                    # **And on the chunk boundary**, which is the last hook a job
                                    # with neither tiles nor batches still reaches.
-                                   on_chunk=lambda written: (deadline.budget_spent(),
-                                                             progress.frames(written))[1],
+                                   #
+                                   # **`**forwarded`, because a wrapper that names its arguments
+                                   # is a wrapper that breaks when the caller adds one.** This
+                                   # took `written` alone and `_stream` calls it BOTH ways —
+                                   # `on_chunk(frames_written, boundary=False)` every
+                                   # `_PROGRESS_EVERY` frames and `on_chunk(frames_written)` at
+                                   # the boundary. Every video job on sha-0d84ae6 died of the
+                                   # first one: 563 s of GPU, all four phases, the output
+                                   # assembled, and then a TypeError in a bookkeeping call. The
+                                   # forwarding is the fix rather than adding `boundary` to the
+                                   # signature — this wrapper has no business knowing what the
+                                   # callee's arguments are, only that they are not its own.
+                                   #
+                                   # **A lambda rather than a named nested function, and that is
+                                   # not style.** `tests/call_binding.py` resolves a lambda at a
+                                   # call site exactly and a nested `def` not at all, so a named
+                                   # one would put this line back outside the instrument that
+                                   # now covers it.
+                                   on_chunk=lambda written, **forwarded: (
+                                       deadline.budget_spent(),
+                                       progress.frames(written, **forwarded))[1],
                                    # **The heartbeat, and it is not the same thing as `on_chunk`.**
                                    # `frames_done` cannot advance here -- frames are not written
                                    # until the chunk yields -- so this re-mints the payload with
