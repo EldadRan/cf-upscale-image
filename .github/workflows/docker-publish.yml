@@ -403,8 +403,11 @@ jobs:
             echo "| attempt | cache | outcome |"
             echo "|---|---|---|"
             echo "| 1 | registry, from :latest | ${{ steps.build.outcome }} |"
-            echo "| 2 (retry) | registry, from :latest | ${{ steps.retry.outcome || 'not needed' }} |"
-            echo "| 3 (cold) | NONE — weights rebuilt | ${{ steps.cold.outcome || 'not needed' }} |"
+            # `skipped` is what a step that did not run reports, and it is a non-empty string —
+            # so a `|| 'not needed'` fallback beside it never fired and the table did not say
+            # what it looked like it said. The outcome is printed as it is.
+            echo "| 2 (retry) | registry, from :latest | ${{ steps.retry.outcome }} |"
+            echo "| 3 (cold) | NONE — weights rebuilt | ${{ steps.cold.outcome }} |"
             echo
             if [ "${{ steps.cold.outcome }}" = "success" ]; then
               echo "**DEGRADED TO A COLD BUILD.** The registry cache could not be read twice, so the"
@@ -417,11 +420,18 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # **Every attempt failed, so the job fails.** `continue-on-error` on the first two means the
-      # job would otherwise go green having published nothing at all — a build that reports
-      # success and produces no image is worse than one that fails.
+      # **Every attempt failed, so the job says so in words.** `continue-on-error` on the first two
+      # means the job would otherwise go green having published nothing at all — a build that
+      # reports success and produces no image is worse than one that fails.
+      #
+      # **`always()` is what makes this reachable, and without it the step was dead text.** An
+      # `if:` carrying no status function has `success()` applied implicitly; getting here needs
+      # `cold` to have failed, and `cold` has no `continue-on-error`, so the job status is already
+      # `failure` and the implicit `success()` was never true. The guarantee held anyway — from
+      # `cold` failing the job, not from this step — but a step that cannot run is not evidence of
+      # anything, and `tests/run_local.py` was reading its presence as though it were.
       - name: Refuse to report success without an image
-        if: steps.build.outcome == 'failure' && steps.retry.outcome == 'failure' && steps.cold.outcome != 'success'
+        if: always() && steps.build.outcome == 'failure' && steps.retry.outcome == 'failure' && steps.cold.outcome != 'success'
         run: |
           echo "all three build attempts failed — no image was published" >&2
           exit 1
@@ -457,7 +467,11 @@ jobs:
             echo '| field | value |'
             echo '|---|---|'
             echo "| reference | \`${IMAGE}:sha-${GITHUB_SHA}\` |"
-            echo "| digest | \`${{ steps.build.outputs.digest || steps.retry.outputs.digest || steps.cold.outputs.digest }}\` |"
+            # **LAST attempt first.** An earlier attempt that failed after its push completed
+            # could still carry a digest, and reading `build` first would record a digest from a
+            # build that did not publish while a later one did — every visible signal correct and
+            # the identity belonging to a different image, which is this project's house defect.
+            echo "| digest | \`${{ steps.cold.outputs.digest || steps.retry.outputs.digest || steps.build.outputs.digest }}\` |"
             echo "| commit | \`${GITHUB_SHA}\` |"
             echo "| built (UTC) | ${BUILD_UTC} |"
             echo
