@@ -12,8 +12,10 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,17 +33,32 @@ import planner  # noqa: E402
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+#: e499dd5 is the image tiers ran before service/ existed: same handler/ tree as HEAD, other commit.
+SAME_TREE_COMMIT = "e499dd51929b3fe25a0b5fdce7aee840d2027789"
+#: 26294cc is e499dd5's parent, and e499dd5 changed handler/estimator.py.
+OTHER_TREE_COMMIT = "26294cc5cb1f90fdaabe84f59223c1215a6f3fc1"
 
 with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as _handle:
     TABLE = json.load(_handle)["cards"]
 
+A40 = "NVIDIA A40"
+H200 = "NVIDIA H200"
+B200 = "NVIDIA B200"
+BLACKWELL = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+MIG = "NVIDIA RTX PRO 6000 Blackwell MIG 2g.48gb"
 
-#: Wire field -> the rationale key it is the worker's output of.
+#: Card answer field -> the rationale key it is the worker's own output of.
 PROJECTED_FROM_RATIONALE = (
     ("predicted_seconds", "predicted_seconds"), ("residency", "residency"),
-    ("best_window", "window"), ("ideal_window", "ideal_window"),
     ("binding_phase", "binding_phase"), ("anchored", "anchored"),
     ("prediction_basis", "prediction_basis"),
+)
+#: `quality` (§3d) -> the rationale key each field is the plan's own.
+QUALITY_FROM_RATIONALE = (
+    ("best_window", "window"), ("ideal_window", "ideal_window"), ("passes", "passes"),
+    ("shortest_pass", "shortest_pass"), ("decode_grid", "decode_grid"),
+    ("decode_tile", "decode_tile"), ("encode_grid", "encode_grid"),
+    ("encode_tile", "encode_tile"),
 )
 
 
@@ -52,10 +69,12 @@ def job(**overrides):
     return body
 
 
+def card(gpu_name=A40, **fields):
+    return dict({"gpu_name": gpu_name}, **fields)
+
+
 def tier(**overrides):
-    body = {"tier": "t1", "host_ram_gb": 46.57,
-            "cards": [{"gpu_name": "NVIDIA A40", "vram_total_gb": 44.7}],
-            "worker_commit": None, "idle": None, "last_run": None}
+    body = {"tier": "t1", "host_ram_gb": 46.57, "worker_commit": None, "cards": [card()]}
     body.update(overrides)
     return body
 
@@ -65,7 +84,13 @@ def request(job_body=None, tiers=None):
 
 
 def one(body, commit=None):
+    """The first tier's answer."""
     return ps.estimate_core(body, commit=commit)[0]
+
+
+def answer(body, index=0, commit=None):
+    """One card's answer, in CF's order."""
+    return one(body, commit=commit)["cards"][index]
 
 
 def refused_field(test, body, field):
@@ -74,8 +99,13 @@ def refused_field(test, body, field):
     test.assertEqual(caught.exception.field, field, caught.exception.message)
 
 
+def _git(*args):
+    return subprocess.run(["git", "-C", REPO_ROOT] + list(args), capture_output=True,
+                          text=True, check=True).stdout
+
+
 class Parity(unittest.TestCase):
-    """cd622500: the job's request with its own hardware block as idle reproduces its rationale."""
+    """cd622500: the job's request, its hardware block as its one card, reproduces its rationale."""
 
     RECORD = "2026-08-31_01REAL20260831T15562300.json"
     #: The two keys the handler adds after `estimator.plan` returns (§7, ruled on C3).
@@ -94,14 +124,15 @@ class Parity(unittest.TestCase):
                 target_short_edge_px=req["target_short_edge_px"],
                 tile_quality=req["tile_quality"], schedule=req["schedule"]),
             [tier(host_ram_gb=hw["host_ram_gb"],
-                  cards=[{"gpu_name": hw["gpu_name"], "vram_total_gb": hw["vram_total_gb"]}],
-                  idle={k: hw[k] for k in ("gpu_name", "vram_total_gb", "vram_free_gb",
-                                           "host_ram_gb")})])
-        core = one(body)
-        fresh, recorded = core["rationale"], record["rationale"]
+                  cards=[card(hw["gpu_name"], vram_total_gb=hw["vram_total_gb"],
+                              vram_free_gb=hw["vram_free_gb"], host_ram_gb=hw["host_ram_gb"],
+                              label="idle")])])
+        entry = one(body)
+        got = entry["cards"][0]
+        fresh, recorded = got["rationale"], record["rationale"]
 
-        self.assertEqual(core["card_source"], "idle")
-        self.assertEqual(core["vram_source"], "idle")
+        self.assertEqual(got["vram_source"], "given")
+        self.assertIsNone(got["resolved_from"])
         compared = sorted(k for k in recorded if k not in self.HANDLER_ADDED)
         mismatched = {k: (recorded[k], fresh.get(k, "<absent>"))
                       for k in compared if fresh.get(k, object()) != recorded[k]}
@@ -109,33 +140,312 @@ class Parity(unittest.TestCase):
         only_fresh = sorted(set(fresh) - set(recorded))
         print("\n  parity: {} recorded keys equal; excluded {}; only in fresh output: {}".format(
             len(compared), list(self.HANDLER_ADDED), only_fresh))
-        self.assertEqual(core["predicted_seconds"], 897.1)
+        self.assertEqual(got["predicted_seconds"], 897.1)
         self.assertEqual(recorded["predicted_seconds"], 897.1)
-        # Every planning field the wire carries is the worker's own, key for key (review F2, F3).
+        # Every field the wire carries is the worker's own, key for key (review F2, F3 on P1).
         for field, key in PROJECTED_FROM_RATIONALE:
-            self.assertEqual(core[field], recorded[key], field)
-        self.assertEqual(core["prediction_basis"], "measured")
+            self.assertEqual(got[field], recorded[key], field)
+        for field, key in QUALITY_FROM_RATIONALE:
+            self.assertEqual(got["quality"][field], recorded[key], field)
+        self.assertEqual(got["prediction_basis"], "measured")
+        self.assertEqual((entry["output_width"], entry["output_height"]),
+                         (record["output"]["width"], record["output"]["height"]))
+
+
+class PerCard(unittest.TestCase):
+    """cards[] in and cards[] out: same length, same order, and nothing is reordered."""
+
+    CARDS = [card(H200, vram_total_gb=141.0), card(A40, vram_total_gb=44.7), card(B200),
+             card(MIG, vram_total_gb=44.5)]
+
+    def test_same_length_same_order(self):
+        entry = one(request(tiers=[tier(host_ram_gb=377.0,
+                                        cards=[dict(c) for c in self.CARDS])]))
+        self.assertEqual([c["gpu_name"] for c in entry["cards"]],
+                         [c["gpu_name"] for c in self.CARDS])
+
+    def test_labels_echoed(self):
+        cards = [card(A40, label="idle"), card(H200, label="catalog"), card(B200)]
+        entry = one(request(tiers=[tier(host_ram_gb=377.0, cards=cards)]))
+        self.assertEqual([c["label"] for c in entry["cards"]], ["idle", "catalog", None])
+
+    def test_fits_any_and_all(self):
+        # A 4320 target: the A40 cannot hold it, the B200 can.
+        entry = one(request(job(target_short_edge_px=4320),
+                            [tier(host_ram_gb=377.0, cards=[card(A40), card(B200)])]))
+        self.assertEqual([c["fits"] for c in entry["cards"]], [False, True])
+        self.assertIs(entry["fits_any"], True)
+        self.assertIs(entry["fits_all"], False)
+
+        allfit = one(request(tiers=[tier(cards=[card(A40), card(B200)])]))
+        self.assertEqual([c["fits"] for c in allfit["cards"]], [True, True])
+        self.assertIs(allfit["fits_any"], True)
+        self.assertIs(allfit["fits_all"], True)
+
+        none = one(request(job(target_short_edge_px=4320), [tier(cards=[card(A40)])]))
+        self.assertIs(none["fits_any"], False)
+        self.assertIs(none["fits_all"], False)
+
+    def test_a_card_that_cannot_be_planned_is_an_entry_that_says_why(self):
+        entry = one(request(job(target_short_edge_px=4320),
+                            [tier(host_ram_gb=377.0, cards=[card(A40), card(B200)])]))
+        self.assertEqual(len(entry["cards"]), 2)
+        self.assertFalse(entry["cards"][0]["fits"])
+        self.assertIsNotNone(entry["cards"][0]["reason"])
+        self.assertIsNone(entry["cards"][0]["predicted_seconds"])
+        self.assertIsNone(entry["cards"][0]["quality"])
+
+    def test_tier_fields_named_once(self):
+        entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
+        for field in ("output_width", "output_height", "registry_version", "commit",
+                      "handler_tree", "worker_handler_tree", "handler_match"):
+            self.assertIn(field, entry)
+            self.assertNotIn(field, entry["cards"][0])
+
+    def test_several_tiers_answer_in_order(self):
+        entries = ps.estimate_core(request(tiers=[tier(), tier(tier="t2", host_ram_gb=377.0,
+                                                              cards=[card(B200)])]), commit=None)
+        self.assertEqual([e["tier"] for e in entries], ["t1", "t2"])
+        self.assertEqual([c["gpu_name"] for e in entries for c in e["cards"]], [A40, B200])
+
+
+class Quality(unittest.TestCase):
+    """§3d: window, tail and tiling — and the chunk and the blocks are not on the wire."""
+
+    def test_quality_equals_the_plan(self):
+        got = answer(request())
+        for field, key in QUALITY_FROM_RATIONALE:
+            self.assertEqual(got["quality"][field], got["rationale"][key], field)
+        self.assertEqual(sorted(got["quality"]), sorted(f for f, _ in QUALITY_FROM_RATIONALE))
+
+    def test_chunk_and_blocks_are_not_on_the_wire(self):
+        from service import app
+        status, payload = app.route("POST", "/estimate",
+                                    json.dumps(request()).encode("utf-8"), commit=SHA_A)
+        self.assertEqual(status, 200)
+        text = json.dumps(payload)
+        for absent in ("chunk_size", "blocks_to_swap", "chunks", "tail_chunk", "rationale"):
+            self.assertNotIn(absent, text)
+
+    def test_ideal_window_says_whether_a_bigger_card_helps(self):
+        entry = one(request(tiers=[tier(host_ram_gb=377.0, cards=[card(A40), card(B200)])]))
+        small, large = (c["quality"] for c in entry["cards"])
+        self.assertLess(small["best_window"], small["ideal_window"])
+        self.assertEqual(large["best_window"], large["ideal_window"])
+
+
+class VramOrder(unittest.TestCase):
+    """given, then table, then nearest_memory, then pool_floor — each stops the next (§4a-i)."""
+
+    def test_given_first(self):
+        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.43,
+                                                     vram_free_gb=44.08)])]))
+        self.assertEqual(got["vram_source"], "given")
+        self.assertEqual(got["hardware_used"]["vram_total_gb"], 44.43)
+        self.assertEqual(got["hardware_used"]["vram_free_gb"], 44.08)
+        self.assertIsNone(got["vram_stats"])
+
+    def test_free_without_total_is_not_a_reading(self):
+        got = answer(request(tiers=[tier(cards=[card(A40, vram_free_gb=44.08)])]))
+        self.assertEqual(got["vram_source"], "table")
+        self.assertEqual(got["hardware_used"]["vram_free_gb"], TABLE[A40]["vram_free_gb"])
+
+    def test_table_before_nearest(self):
+        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.7)])]))
+        self.assertEqual(got["vram_source"], "table")
+        self.assertEqual(got["hardware_used"]["gpu_name"], A40)
+        self.assertEqual(got["hardware_used"]["vram_total_gb"], TABLE[A40]["vram_total_gb"])
+
+    def test_total_without_free_is_a_nominal_never_planned_against(self):
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
+        self.assertEqual(got["vram_source"], "nearest_memory")
+        self.assertNotEqual(got["hardware_used"]["vram_total_gb"], 44.5)
+        self.assertEqual(got["hardware_used"]["vram_total_gb"], TABLE[A40]["vram_total_gb"])
+
+    def test_unmeasured_without_nominal_is_pool_floor(self):
+        got = answer(request(tiers=[tier(cards=[card(MIG)])]))
+        self.assertEqual(got["vram_source"], "pool_floor")
+
+    def test_basis_not_rewritten_where_the_card_is_cfs(self):
+        for entry_card in (card(A40), card(A40, vram_total_gb=44.43, vram_free_gb=44.08)):
+            got = answer(request(tiers=[tier(cards=[entry_card])]))
+            self.assertIn(got["vram_source"], ("given", "table"))
+            self.assertIsNone(got["resolved_from"])
+            self.assertEqual(got["prediction_basis"], got["rationale"]["prediction_basis"])
+            self.assertEqual(got["prediction_basis"], "measured")
+
+
+class PoolFloor(unittest.TestCase):
+    """No nominal: the worst measured card in THIS list, else the table's worst (§4a-i)."""
+
+    def test_worst_measured_in_this_list(self):
+        cards = [card(MIG), card(H200, vram_total_gb=141.0), card(B200, vram_total_gb=179.0)]
+        got = answer(request(tiers=[tier(host_ram_gb=377.0, cards=cards)]))
+        self.assertEqual(got["vram_source"], "pool_floor")
+        # The H200 is the worst card in THIS list that the table measures — not the A40, which is
+        # the table's worst and is not in this list.
+        self.assertEqual(got["hardware_used"]["gpu_name"], H200)
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": H200})
+        self.assertEqual(got["prediction_basis"], "borrowed")
+
+    def test_floor_card_is_borrowed_even_when_the_worker_measured_it(self):
+        # The floor lands on the A40, which the table measures at this size, so the worker labels
+        # the rate "measured". It is not a measurement of the card CF named.
+        cards = [card(MIG), card(A40, vram_total_gb=44.7)]
+        got = answer(request(tiers=[tier(cards=cards)]))
+        self.assertEqual(got["vram_source"], "pool_floor")
+        self.assertEqual(got["hardware_used"]["gpu_name"], A40)
+        self.assertEqual(got["rationale"]["prediction_basis"], "measured")
+        self.assertEqual(got["prediction_basis"], "borrowed")
+
+    def test_tables_worst_where_the_list_measures_none(self):
+        got = answer(request(tiers=[tier(cards=[card(MIG), card("NVIDIA MADE UP 9000")])]))
+        self.assertEqual(got["vram_source"], "pool_floor")
+        worst = min(TABLE, key=lambda name: TABLE[name]["vram_total_gb"])
+        self.assertEqual(got["hardware_used"]["gpu_name"], worst)
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": worst})
+        self.assertEqual(got["hardware_used"]["vram_total_gb"], TABLE[worst]["vram_total_gb"])
+
+
+class Nearest(unittest.TestCase):
+    """A nominal resolves to the nearest measured card; resolved_from names both."""
+
+    def test_resolves_and_is_borrowed(self):
+        self.assertNotIn(MIG, TABLE)
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
+        self.assertEqual(got["vram_source"], "nearest_memory")
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": A40})
+        self.assertEqual(got["hardware_used"]["gpu_name"], A40)
+        self.assertEqual(got["rationale"]["prediction_basis"], "measured")
+        self.assertEqual(got["prediction_basis"], "borrowed")
+
+    def test_nominal_near_a_bigger_card(self):
+        got = answer(request(tiers=[tier(host_ram_gb=377.0,
+                                         cards=[card(MIG, vram_total_gb=96.0)])]))
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": BLACKWELL})
+
+    def test_tie_takes_lower_memory(self):
+        low, high = TABLE[A40]["vram_total_gb"], TABLE[BLACKWELL]["vram_total_gb"]
+        table = {A40: TABLE[A40], BLACKWELL: TABLE[BLACKWELL]}
+        self.assertEqual(ps.nearest_measured((low + high) / 2.0, table), A40)
+
+
+class VramStats(unittest.TestCase):
+    """The corpus behind a table figure rides back; the plan uses the MINIMUM (§4a)."""
+
+    def test_stats_on_table(self):
+        got = answer(request(tiers=[tier(cards=[card(A40)])]))
+        self.assertEqual(got["vram_source"], "table")
+        self.assertEqual(got["vram_stats"], TABLE[A40]["stats"])
+        self.assertEqual(got["hardware_used"]["vram_free_gb"], TABLE[A40]["vram_free_gb"])
+        self.assertNotEqual(got["hardware_used"]["vram_free_gb"],
+                            got["vram_stats"]["free_mean_gb"])
+        self.assertLess(got["hardware_used"]["vram_free_gb"], got["vram_stats"]["free_max_gb"])
+
+    def test_stats_on_nearest(self):
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
+        self.assertEqual(got["vram_stats"], TABLE[A40]["stats"])
+
+    def test_no_stats_where_the_figure_is_not_the_tables(self):
+        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.43,
+                                                     vram_free_gb=44.08)])]))
+        self.assertIsNone(got["vram_stats"])
+
+    def test_stats_are_generated_and_the_plan_uses_the_minimum(self):
+        out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_vram_table.py"),
+                              "--check", RUNS], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        for name, row in TABLE.items():
+            self.assertEqual(sorted(row["stats"]),
+                             ["free_max_gb", "free_mean_gb", "free_min_gb", "n"], name)
+            self.assertLessEqual(row["stats"]["free_min_gb"], row["vram_free_gb"], name)
+            self.assertLessEqual(row["vram_free_gb"], row["stats"]["free_mean_gb"], name)
+
+
+class HostRam(unittest.TestCase):
+    """A card's own host_ram_gb wins over the tier's; neither refuses THAT card by name."""
+
+    def test_card_before_tier(self):
+        cards = [card(A40, host_ram_gb=51.22), card(H200)]
+        entry = one(request(tiers=[tier(host_ram_gb=46.57, cards=cards)]))
+        self.assertEqual(entry["cards"][0]["hardware_used"]["host_ram_gb"], 51.22)
+        self.assertEqual(entry["cards"][1]["hardware_used"]["host_ram_gb"], 46.57)
+
+    def test_neither_refuses_that_card(self):
+        body = request(tiers=[tier(host_ram_gb=None,
+                                   cards=[card(A40, host_ram_gb=46.57), card(H200)])])
+        refused_field(self, body, "tiers[0].cards[1].host_ram_gb")
+
+    def test_tier_host_ram_may_be_absent_when_every_card_has_one(self):
+        t = tier(cards=[card(A40, host_ram_gb=46.57)])
+        del t["host_ram_gb"]
+        got = answer(request(tiers=[t]))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 46.57)
+
+
+class Refusals(unittest.TestCase):
+    """By name, never defaulted (§4)."""
+
+    def test_empty_cards(self):
+        refused_field(self, request(tiers=[tier(cards=[])]), "tiers[0].cards")
+
+    def test_absent_cards(self):
+        t = tier()
+        del t["cards"]
+        refused_field(self, request(tiers=[t]), "tiers[0].cards")
+
+    def test_card_without_gpu_name(self):
+        refused_field(self, request(tiers=[tier(cards=[card(A40), {"vram_total_gb": 44.7}])]),
+                      "tiers[0].cards[1].gpu_name")
+
+    def test_no_host_ram(self):
+        t = tier(cards=[card(A40)])
+        del t["host_ram_gb"]
+        refused_field(self, request(tiers=[t]), "tiers[0].cards[0].host_ram_gb")
+
+    def test_both_sizing_forms(self):
+        refused_field(self, request(job(output_size={"width": 2000, "height": 1000})),
+                      "job.output_size")
+
+    def test_neither_sizing_form(self):
+        body = request(job())
+        del body["job"]["target_short_edge_px"]
+        refused_field(self, body, "job.target_short_edge_px")
+
+    def test_short_worker_commit(self):
+        refused_field(self, request(tiers=[tier(worker_commit=SAME_TREE_COMMIT[:7])]),
+                      "tiers[0].worker_commit")
+
+    def test_empty_tiers(self):
+        refused_field(self, {"job": job(), "tiers": []}, "tiers")
+
+    def test_still_with_frames(self):
+        refused_field(self, request(job(frames=90, is_still=True)), "job.frames")
+
+    def test_no_measured_card_at_all(self):
+        # Only reachable with an empty VRAM table: with a table, pool_floor always answers.
+        with self.assertRaises(ps.Refusal) as caught:
+            ps.estimate_core(request(tiers=[tier(cards=[card(MIG)])]), commit=None,
+                             vram_table={"cards": {}, "corpus": {}})
+        self.assertEqual(caught.exception.field, "service.vram_table")
 
 
 class Residency(unittest.TestCase):
-    """On a refusal, planner.plan refuses too, and residency comes from that verdict."""
+    """On a refusal, planner.plan refuses too, and the labels follow planner.fits (§3b)."""
 
     def test_host_refusal_reports_route_up(self):
-        # 8 GiB of host RAM: the host slice cannot hold the window, so a bigger machine is the answer.
-        core = one(request(tiers=[tier(host_ram_gb=8.0)]))
-        self.assertFalse(core["fits"])
-        self.assertIn("host RAM", core["reason"])
-        verdict = core["planner_verdict"]
+        got = answer(request(tiers=[tier(host_ram_gb=8.0)]))
+        self.assertFalse(got["fits"])
+        self.assertIn("host RAM", got["reason"])
+        verdict = got["planner_verdict"]
         self.assertNotEqual(verdict["action"], "plan")
-        self.assertEqual(core["residency"], "route_up")
-        self.assertEqual(core["residency"], verdict["residency"])
-        self.assertEqual(estimator._refusal_text(verdict["reason"]), core["reason"])
-        self.assertEqual(core["anchored"], estimator._usable_vram(core["hardware_used"])
+        self.assertEqual(got["residency"], "route_up")
+        self.assertEqual(got["residency"], verdict["residency"])
+        self.assertEqual(estimator._refusal_text(verdict["reason"]), got["reason"])
+        self.assertEqual(got["anchored"], estimator._usable_vram(got["hardware_used"])
                          <= planner.ANCHORED_MAX_USABLE)
 
     def test_diverging_verdict_is_an_error(self):
-        # If planner.plan refuses for a different reason than estimator.plan did, the residency
-        # read is not from the same verdict, and the service must not answer (review F4).
         # Only the service's own call diverges: estimator.plan's internal planner calls are real.
         real_plan, real_estimate = planner.plan, estimator.plan
         state = {"estimator_done": False}
@@ -147,69 +457,60 @@ class Residency(unittest.TestCase):
                 state["estimator_done"] = True
 
         def other_reason(*args, **kwargs):
-            answer = real_plan(*args, **kwargs)
-            return dict(answer, reason="a different constraint") if state["estimator_done"] \
-                else answer
+            reply = real_plan(*args, **kwargs)
+            return dict(reply, reason="a different constraint") if state["estimator_done"] \
+                else reply
 
         planner.plan, estimator.plan = other_reason, estimate_then_flag
         try:
             with self.assertRaises(RuntimeError):
-                one(request(tiers=[tier(host_ram_gb=8.0)]))
+                answer(request(tiers=[tier(host_ram_gb=8.0)]))
         finally:
             planner.plan, estimator.plan = real_plan, real_estimate
 
     def test_vram_refusal_labels_follow_planner_fits(self):
-        # An 8K target on the A40's table figures: the VRAM floor refuses, and that terminal
-        # answer carries no residency. P1a (cf-planner.md §3b @5a8652f): residency and anchored
-        # are what planner.fits answers for the same inputs.
-        core = one(request(job(target_short_edge_px=4320)))
-        self.assertFalse(core["fits"])
-        verdict = core["planner_verdict"]
-        self.assertNotEqual(verdict["action"], "plan")
+        got = answer(request(job(target_short_edge_px=4320)))
+        self.assertFalse(got["fits"])
+        verdict = got["planner_verdict"]
         self.assertNotIn("residency", verdict)
-        self.assertEqual(estimator._refusal_text(verdict["reason"]), core["reason"])
-        hw = core["hardware_used"]
+        self.assertEqual(estimator._refusal_text(verdict["reason"]), got["reason"])
+        hw = got["hardware_used"]
         fits = planner.fits((1920, 1080), 90, 4320, estimator._usable_vram(hw),
                             host_ram_gb=hw["host_ram_gb"], tile_quality="default",
                             gpu_name=hw["gpu_name"])
         self.assertFalse(fits["fits"])
-        self.assertEqual(core["residency"], "route_up")
-        self.assertEqual(core["residency"], fits["residency"])
-        self.assertIsNotNone(core["anchored"])
-        self.assertEqual(core["anchored"], fits["anchored"])
+        self.assertEqual(got["residency"], "route_up")
+        self.assertEqual(got["residency"], fits["residency"])
+        self.assertIsNotNone(got["anchored"])
+        self.assertEqual(got["anchored"], fits["anchored"])
 
     def test_refusal_anchored_at_both_sides_of_the_span(self):
-        # Review W1 on P1a: the A40 is anchored either way. The H200's table figures sit on the
-        # boundary (total above ANCHORED_MAX_USABLE, usable at or below it), the B200 beyond it.
-        for card, expected in (("NVIDIA H200", True), ("NVIDIA B200", False)):
-            nominal = TABLE[card]["vram_total_gb"]
-            core = one(request(tiers=[tier(host_ram_gb=8.0,
-                                           cards=[{"gpu_name": card, "vram_total_gb": nominal}])]))
-            self.assertFalse(core["fits"], card)
-            self.assertEqual(core["vram_source"], "table", card)
-            hw = core["hardware_used"]
+        for name, expected in ((H200, True), (B200, False)):
+            got = answer(request(tiers=[tier(host_ram_gb=8.0, cards=[card(name)])]))
+            self.assertFalse(got["fits"], name)
+            self.assertEqual(got["vram_source"], "table", name)
+            hw = got["hardware_used"]
             fits = planner.fits((1920, 1080), 90, 1480, estimator._usable_vram(hw),
                                 host_ram_gb=hw["host_ram_gb"], tile_quality="default",
                                 gpu_name=hw["gpu_name"])
-            self.assertFalse(fits["fits"], card)
-            self.assertIs(core["anchored"], expected, card)
-            self.assertEqual(core["anchored"], fits["anchored"], card)
-            self.assertEqual(core["residency"], fits["residency"], card)
+            self.assertFalse(fits["fits"], name)
+            self.assertIs(got["anchored"], expected, name)
+            self.assertEqual(got["anchored"], fits["anchored"], name)
 
     def test_refusal_anchored_on_the_boundary(self):
-        # A banked H200 reading (free 139.07) leaves usable exactly at ANCHORED_MAX_USABLE, which
-        # planner.fits counts as anchored (<=).
-        idle = {"gpu_name": "NVIDIA H200", "vram_total_gb": 139.8, "vram_free_gb": 139.07}
-        core = one(request(tiers=[tier(host_ram_gb=8.0, idle=idle,
-                                       cards=[{"gpu_name": "NVIDIA H200", "vram_total_gb": 139.8}])]))
-        self.assertFalse(core["fits"])
-        self.assertEqual(estimator._usable_vram(core["hardware_used"]), planner.ANCHORED_MAX_USABLE)
-        self.assertIs(core["anchored"], True)
+        # A banked H200 reading (free 139.07) leaves usable exactly at ANCHORED_MAX_USABLE.
+        got = answer(request(tiers=[tier(host_ram_gb=8.0,
+                                         cards=[card(H200, vram_total_gb=139.8,
+                                                     vram_free_gb=139.07)])]))
+        self.assertFalse(got["fits"])
+        self.assertEqual(estimator._usable_vram(got["hardware_used"]),
+                         planner.ANCHORED_MAX_USABLE)
+        self.assertIs(got["anchored"], True)
 
     def test_fit_residency_from_the_plan(self):
-        core = one(request())
-        self.assertTrue(core["fits"])
-        self.assertEqual(core["residency"], core["rationale"]["residency"])
+        got = answer(request())
+        self.assertTrue(got["fits"])
+        self.assertEqual(got["residency"], got["rationale"]["residency"])
 
 
 class NoTorch(unittest.TestCase):
@@ -236,8 +537,6 @@ class NoTorch(unittest.TestCase):
                              worker_path.HANDLER, module.__name__)
 
     def test_resolved_handler_wins_over_an_earlier_path_entry(self):
-        import shutil
-        import tempfile
         decoy = tempfile.mkdtemp(prefix="decoy_handler_")
         probe = (
             "import sys; sys.path.insert(0, {decoy!r}); sys.path.insert(1, {handler!r})\n"
@@ -268,170 +567,27 @@ class OutputSize(unittest.TestCase):
     """Planned at short_edge_covering; output_width/height equal the canvas exactly."""
 
     def test_canvas(self):
-        body = request(job(target_short_edge_px=None, output_size={"width": 2001, "height": 1003}))
+        body = request(job(output_size={"width": 2001, "height": 1003}))
         del body["job"]["target_short_edge_px"]
-        core = one(body)
+        entry = one(body)
         covering = estimator.short_edge_covering(1920, 1080, 2001, 1003)
-        self.assertEqual(core["planned_short_edge_px"], covering)
-        self.assertEqual(core["rationale"]["output_width"],
+        self.assertEqual(entry["planned_short_edge_px"], covering)
+        self.assertEqual(entry["cards"][0]["rationale"]["output_width"],
                          estimator.output_dimensions(1920, 1080, covering)[0])
-        self.assertEqual((core["output_width"], core["output_height"]), (2001, 1003))
+        self.assertEqual((entry["output_width"], entry["output_height"]), (2001, 1003))
 
 
 class Still(unittest.TestCase):
     """An image source plans at frames 1 and delivers output_dimensions."""
 
     def test_still(self):
-        core = one(request(job(frames=1, is_still=True, source_width=749, source_height=500,
-                               target_short_edge_px=1920)))
-        self.assertTrue(core["fits"])
-        self.assertEqual(core["rationale"]["window"], 1)
-        self.assertEqual((core["output_width"], core["output_height"]),
+        entry = one(request(job(frames=1, is_still=True, source_width=749, source_height=500,
+                                target_short_edge_px=1920)))
+        got = entry["cards"][0]
+        self.assertTrue(got["fits"])
+        self.assertEqual(got["quality"]["best_window"], 1)
+        self.assertEqual((entry["output_width"], entry["output_height"]),
                          estimator.output_dimensions(749, 500, 1920))
-
-    def test_still_with_frames_refused(self):
-        refused_field(self, request(job(frames=90, is_still=True)), "job.frames")
-
-
-class WorstCard(unittest.TestCase):
-    """No idle worker: the card with the least vram_total_gb in cards[] is planned."""
-
-    def test_least_memory(self):
-        cards = [{"gpu_name": "NVIDIA H200", "vram_total_gb": 141.0},
-                 {"gpu_name": "NVIDIA A40", "vram_total_gb": 44.7},
-                 {"gpu_name": "NVIDIA B200", "vram_total_gb": 179.0}]
-        core = one(request(tiers=[tier(cards=cards)]))
-        self.assertEqual(core["card_source"], "worst_card")
-        self.assertEqual(core["hardware_used"]["gpu_name"], "NVIDIA A40")
-
-
-class VramOrder(unittest.TestCase):
-    """idle, then last_run of the SAME card, then table; each stops the next being consulted."""
-
-    IDLE = {"gpu_name": "NVIDIA A40", "vram_total_gb": 44.43, "vram_free_gb": 44.08}
-    LAST = {"gpu_name": "NVIDIA A40", "vram_total_gb": 47.40, "vram_free_gb": 47.05}
-
-    def test_idle_first(self):
-        core = one(request(tiers=[tier(idle=dict(self.IDLE), last_run=dict(self.LAST))]))
-        self.assertEqual(core["vram_source"], "idle")
-        self.assertEqual(core["hardware_used"]["vram_free_gb"], 44.08)
-
-    def test_idle_with_one_figure_falls_through_to_last_run(self):
-        idle = {"gpu_name": "NVIDIA A40", "vram_total_gb": 44.43}
-        core = one(request(tiers=[tier(idle=idle, last_run=dict(self.LAST))]))
-        self.assertEqual(core["card_source"], "idle")
-        self.assertEqual(core["vram_source"], "last_run")
-        self.assertEqual(core["hardware_used"]["vram_free_gb"], 47.05)
-
-    def test_basis_not_rewritten_off_nearest(self):
-        for t in (tier(), tier(idle=dict(self.IDLE)), tier(last_run=dict(self.LAST))):
-            core = one(request(tiers=[t]))
-            self.assertNotEqual(core["vram_source"], "nearest_memory")
-            self.assertEqual(core["prediction_basis"], core["rationale"]["prediction_basis"])
-            self.assertEqual(core["prediction_basis"], "measured")
-
-    def test_last_run_before_table(self):
-        core = one(request(tiers=[tier(last_run=dict(self.LAST))]))
-        self.assertEqual(core["vram_source"], "last_run")
-        self.assertEqual(core["hardware_used"]["vram_total_gb"], 47.40)
-
-    def test_last_run_of_another_card_not_used(self):
-        other = {"gpu_name": "NVIDIA H200", "vram_total_gb": 139.8, "vram_free_gb": 139.06}
-        core = one(request(tiers=[tier(last_run=other)]))
-        self.assertEqual(core["vram_source"], "table")
-        self.assertEqual(core["hardware_used"]["vram_total_gb"],
-                         TABLE["NVIDIA A40"]["vram_total_gb"])
-        self.assertEqual(core["hardware_used"]["vram_free_gb"],
-                         TABLE["NVIDIA A40"]["vram_free_gb"])
-
-    def test_last_run_with_one_figure_falls_through_to_table(self):
-        last = {"gpu_name": "NVIDIA A40", "vram_free_gb": 47.05}
-        core = one(request(tiers=[tier(last_run=last)]))
-        self.assertEqual(core["vram_source"], "table")
-
-    def test_host_ram_idle_before_tier(self):
-        idle = dict(self.IDLE, host_ram_gb=51.22)
-        core = one(request(tiers=[tier(idle=idle)]))
-        self.assertEqual(core["hardware_used"]["host_ram_gb"], 51.22)
-
-
-class TableGenerated(unittest.TestCase):
-    """vram_table.json is the generator's output over the corpus, never hand-edited (§4a)."""
-
-    def test_committed_table_matches_corpus(self):
-        out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_vram_table.py"),
-                              "--check", RUNS], capture_output=True, text=True)
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-
-
-class Nearest(unittest.TestCase):
-    """An unmeasured gpu_name resolves to the nearest measured card by memory."""
-
-    MIG = "NVIDIA RTX PRO 6000 Blackwell MIG 2g.48gb"
-
-    def test_resolves_to_nearest_and_is_not_measured(self):
-        self.assertNotIn(self.MIG, TABLE)
-        core = one(request(tiers=[tier(cards=[{"gpu_name": self.MIG, "vram_total_gb": 44.5}])]))
-        self.assertEqual(core["vram_source"], "nearest_memory")
-        self.assertEqual(core["resolved_from"], {"card": self.MIG, "measured": "NVIDIA A40"})
-        self.assertEqual(core["hardware_used"]["gpu_name"], "NVIDIA A40")
-        self.assertEqual(core["hardware_used"]["vram_free_gb"], TABLE["NVIDIA A40"]["vram_free_gb"])
-        self.assertEqual(core["rationale"]["prediction_basis"], "measured")
-        self.assertEqual(core["prediction_basis"], "borrowed")
-
-    def test_tie_takes_lower_memory(self):
-        low, high = TABLE["NVIDIA A40"]["vram_total_gb"], TABLE[
-            "NVIDIA RTX PRO 6000 Blackwell Server Edition"]["vram_total_gb"]
-        midpoint = (low + high) / 2.0
-        table = {"NVIDIA A40": TABLE["NVIDIA A40"],
-                 "NVIDIA RTX PRO 6000 Blackwell Server Edition":
-                     TABLE["NVIDIA RTX PRO 6000 Blackwell Server Edition"]}
-        chosen = ps.nearest_measured(midpoint, table)
-        self.assertEqual(chosen, "NVIDIA A40")
-
-    def test_idle_card_with_own_total_resolves(self):
-        idle = {"gpu_name": self.MIG, "vram_total_gb": 94.0}
-        core = one(request(tiers=[tier(idle=idle)]))
-        self.assertEqual(core["vram_source"], "nearest_memory")
-        self.assertEqual(core["resolved_from"]["measured"],
-                         "NVIDIA RTX PRO 6000 Blackwell Server Edition")
-
-    def test_duplicate_name_nominal_is_the_worst_entry(self):
-        cards = [{"gpu_name": self.MIG, "vram_total_gb": 94.0},
-                 {"gpu_name": self.MIG, "vram_total_gb": 44.5}]
-        core = one(request(tiers=[tier(cards=cards)]))
-        self.assertEqual(core["resolved_from"]["measured"], "NVIDIA A40")
-
-    def test_idle_card_without_nominal_refused(self):
-        idle = {"gpu_name": self.MIG}
-        refused_field(self, request(tiers=[tier(idle=idle)]), "tiers[0].idle.gpu_name")
-
-
-class Refusal(unittest.TestCase):
-    """Each unusable input refused by name."""
-
-    def test_missing_host_ram(self):
-        t = tier()
-        del t["host_ram_gb"]
-        refused_field(self, request(tiers=[t]), "tiers[0].host_ram_gb")
-
-    def test_empty_cards(self):
-        refused_field(self, request(tiers=[tier(cards=[])]), "tiers[0].cards")
-
-    def test_both_sizing_forms(self):
-        body = request(job(output_size={"width": 2000, "height": 1000}))
-        refused_field(self, body, "job.output_size")
-
-    def test_neither_sizing_form(self):
-        body = request(job())
-        del body["job"]["target_short_edge_px"]
-        refused_field(self, body, "job.target_short_edge_px")
-
-
-#: e499dd5 is the image tiers ran before service/ existed: same handler/ tree as HEAD, other commit.
-SAME_TREE_COMMIT = "e499dd51929b3fe25a0b5fdce7aee840d2027789"
-#: 26294cc is e499dd5's parent, and e499dd5 changed handler/estimator.py.
-OTHER_TREE_COMMIT = "26294cc5cb1f90fdaabe84f59223c1215a6f3fc1"
 
 
 class Match(unittest.TestCase):
@@ -439,44 +595,40 @@ class Match(unittest.TestCase):
 
     def test_same_tree_other_commit_matches(self):
         self.assertNotEqual(SAME_TREE_COMMIT, _git("rev-parse", "HEAD").strip())
-        core = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
-        self.assertEqual(core["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
-        self.assertEqual(core["worker_handler_tree"],
+        entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
+        self.assertEqual(entry["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
+        self.assertEqual(entry["worker_handler_tree"],
                          _git("rev-parse", SAME_TREE_COMMIT + ":handler").strip())
-        self.assertIs(core["handler_match"], True)
-        self.assertEqual(core["commit"], SHA_A)
-        self.assertNotIn("commit_match", core)
+        self.assertIs(entry["handler_match"], True)
+        self.assertEqual(entry["commit"], SHA_A)
+        self.assertNotIn("commit_match", entry)
 
     def test_other_tree_mismatches(self):
-        core = one(request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT)]))
-        self.assertEqual(core["worker_handler_tree"],
+        entry = one(request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT)]))
+        self.assertEqual(entry["worker_handler_tree"],
                          _git("rev-parse", OTHER_TREE_COMMIT + ":handler").strip())
-        self.assertNotEqual(core["worker_handler_tree"], core["handler_tree"])
-        self.assertIs(core["handler_match"], False)
+        self.assertNotEqual(entry["worker_handler_tree"], entry["handler_tree"])
+        self.assertIs(entry["handler_match"], False)
 
     def test_commit_not_in_table_is_null(self):
-        core = one(request(tiers=[tier(worker_commit=SHA_B)]))
-        self.assertIsNone(core["worker_handler_tree"])
-        self.assertIsNone(core["handler_match"])
-        self.assertIsNotNone(core["handler_tree"])
+        entry = one(request(tiers=[tier(worker_commit=SHA_B)]))
+        self.assertIsNone(entry["worker_handler_tree"])
+        self.assertIsNone(entry["handler_match"])
+        self.assertIsNotNone(entry["handler_tree"])
 
     def test_none_sent_is_null(self):
-        core = one(request())
-        self.assertIsNone(core["worker_handler_tree"])
-        self.assertIsNone(core["handler_match"])
-
-    def test_short_sha_refused(self):
-        refused_field(self, request(tiers=[tier(worker_commit=SAME_TREE_COMMIT[:7])]),
-                      "tiers[0].worker_commit")
+        entry = one(request())
+        self.assertIsNone(entry["worker_handler_tree"])
+        self.assertIsNone(entry["handler_match"])
 
     def test_service_commit_is_information(self):
         with self.assertRaises(ValueError):
             ps.service_commit({"CF_PLANNER_COMMIT": "abc1234"})
         self.assertEqual(ps.service_commit({"CF_PLANNER_COMMIT": SHA_A}), SHA_A)
         self.assertIsNone(ps.service_commit({}))
-        core = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=None)
-        self.assertIsNone(core["commit"])
-        self.assertIs(core["handler_match"], True)
+        entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=None)
+        self.assertIsNone(entry["commit"])
+        self.assertIs(entry["handler_match"], True)
 
 
 class TablesAfterTheDoor(unittest.TestCase):
@@ -509,7 +661,6 @@ class HistoryTable(unittest.TestCase):
                               text=True)
 
     def test_check_fails_on_a_hand_edit(self):
-        import tempfile
         table = ps.load_handler_history()
         edits = {
             "tree changed": lambda t: t["commits"].__setitem__(list(t["commits"])[3], "0" * 40),
@@ -528,8 +679,6 @@ class HistoryTable(unittest.TestCase):
                 os.remove(handle.name)
 
     def test_shallow_clone_stops(self):
-        import shutil
-        import tempfile
         clone = tempfile.mkdtemp(prefix="shallow_")
         try:
             subprocess.run(["git", "clone", "-q", "--depth", "3", "file://" + REPO_ROOT, clone],
@@ -562,11 +711,12 @@ class HistoryTable(unittest.TestCase):
 class Projection(unittest.TestCase):
     """For the same inputs, every §3b field on the wire equals the core output."""
 
-    WIRE_FIELDS = ("fits", "predicted_seconds", "reason", "residency", "output_width",
-                   "output_height", "best_window", "ideal_window", "binding_phase", "anchored",
-                   "prediction_basis", "hardware_used", "card_source", "vram_source",
-                   "resolved_from", "registry_version", "commit", "handler_tree",
-                   "worker_handler_tree", "handler_match")
+    TIER_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
+                   "registry_version", "commit", "handler_tree", "worker_handler_tree",
+                   "handler_match")
+    CARD_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis", "reason",
+                   "residency", "anchored", "binding_phase", "quality", "hardware_used",
+                   "vram_source", "vram_stats", "resolved_from")
 
     def _through_http(self, body):
         from service import app
@@ -579,26 +729,31 @@ class Projection(unittest.TestCase):
         cases = [
             request(),
             request(job(target_short_edge_px=4320), [tier(host_ram_gb=16.0)]),
-            request(tiers=[tier(cards=[{"gpu_name": Nearest.MIG, "vram_total_gb": 44.5}],
+            request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5), card(A40, label="idle")],
                                 worker_commit=SAME_TREE_COMMIT)]),
-            request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT)]),
+            request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT),
+                           tier(tier="t2", cards=[card(B200)], host_ram_gb=377.0)]),
         ]
-        all_matches = set()
+        matches = set()
         for body in cases:
             cores = ps.estimate_core(copy.deepcopy(body), commit=SHA_A)
             wire = self._through_http(body)["tiers"]
             self.assertEqual(len(wire), len(cores))
-            seen_match = set()
             for core, entry in zip(cores, wire):
-                seen_match.add(entry["handler_match"])
-                self.assertEqual(sorted(entry), sorted(("tier",) + self.WIRE_FIELDS))
-                self.assertNotIn("rationale", entry)
-                self.assertEqual(entry["tier"], core["tier"])
-                for field in self.WIRE_FIELDS:
+                self.assertEqual(sorted(entry), sorted(self.TIER_FIELDS + ("cards",)))
+                matches.add(entry["handler_match"])
+                for field in self.TIER_FIELDS:
                     self.assertIs(type(entry[field]), type(core[field]), field)
                     self.assertEqual(entry[field], core[field], field)
-            all_matches.update(seen_match)
-        self.assertEqual(all_matches, {None, True, False})
+                self.assertEqual(len(entry["cards"]), len(core["cards"]))
+                for got, answered in zip(entry["cards"], core["cards"]):
+                    self.assertEqual(sorted(got), sorted(self.CARD_FIELDS))
+                    self.assertNotIn("rationale", got)
+                    self.assertNotIn("planner_verdict", got)
+                    for field in self.CARD_FIELDS:
+                        self.assertIs(type(got[field]), type(answered[field]), field)
+                        self.assertEqual(got[field], answered[field], field)
+        self.assertEqual(matches, {None, True, False})
 
     def test_refusal_on_the_wire_names_the_field(self):
         from service import app
@@ -621,11 +776,6 @@ class Projection(unittest.TestCase):
         self.assertEqual(payload["handler_tree"], table["commits"][table["newest"]])
         self.assertEqual(payload["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
         self.assertEqual(payload["handler_history_newest"], table["newest"])
-
-
-def _git(*args):
-    return subprocess.run(["git", "-C", REPO_ROOT] + list(args), capture_output=True,
-                          text=True, check=True).stdout
 
 
 class Isolation(unittest.TestCase):

@@ -27,25 +27,49 @@
       "vram_total_gb": 44.34,
       "vram_free_gb": 43.72,
       "readings": 49,
-      "readings_at_total": 2
+      "readings_at_total": 2,
+      "stats": {
+        "free_mean_gb": 44.3016,
+        "free_min_gb": 43.72,
+        "free_max_gb": 47.05,
+        "n": 49
+      }
     },
     "NVIDIA B200": {
       "vram_total_gb": 178.35,
       "vram_free_gb": 177.52,
       "readings": 2,
-      "readings_at_total": 2
+      "readings_at_total": 2,
+      "stats": {
+        "free_mean_gb": 177.53,
+        "free_min_gb": 177.52,
+        "free_max_gb": 177.54,
+        "n": 2
+      }
     },
     "NVIDIA H200": {
       "vram_total_gb": 139.8,
       "vram_free_gb": 139.06,
       "readings": 23,
-      "readings_at_total": 21
+      "readings_at_total": 21,
+      "stats": {
+        "free_mean_gb": 139.0683,
+        "free_min_gb": 139.06,
+        "free_max_gb": 139.08,
+        "n": 23
+      }
     },
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
       "vram_total_gb": 94.97,
       "vram_free_gb": 93.74,
       "readings": 8,
-      "readings_at_total": 5
+      "readings_at_total": 5,
+      "stats": {
+        "free_mean_gb": 94.21,
+        "free_min_gb": 93.74,
+        "free_max_gb": 94.29,
+        "n": 8
+      }
     }
   }
 }

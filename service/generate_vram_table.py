@@ -112,11 +112,21 @@ def build(runs_dir):
         rows = by_card[gpu_name]
         total = min(t for t, _ in rows)
         at_total = [f for t, f in rows if t == total]
+        frees = [f for _t, f in rows]
         cards[gpu_name] = {
             "vram_total_gb": total,
             "vram_free_gb": min(at_total),
             "readings": len(rows),
             "readings_at_total": len(at_total),
+            # **The corpus behind the figure** (§4a), over EVERY included reading of this card —
+            # a card that reads the same every time, against one that swings with ECC. **The plan
+            # uses `vram_free_gb` above; these are information and nothing plans on them.**
+            "stats": {
+                "free_mean_gb": round(sum(frees) / len(frees), 4),
+                "free_min_gb": min(frees),
+                "free_max_gb": max(frees),
+                "n": len(frees),
+            },
         }
 
     utcs = sorted(u for (_, _, _, u) in readings.values() if u)

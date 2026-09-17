@@ -1,11 +1,15 @@
-"""Will it fit, and how long will it run — per tier, by the worker's own planning code.
+"""Will it fit, and how long will it run — per CARD, by the worker's own planning code.
 
 `cf-planner.md` (cf-upscale-project) is the spec. This module is the per-tier core that
 `POST /estimate` projects from; `app.py` is only the door.
 
+**One ordered `cards[]` in, one answer per card out, in CF's order** (§3a, §4). The service
+reorders nothing, chooses no card and ranks nothing: which card CF expects, and what it pays for
+placement risk, is CF's policy.
+
 **Every number is the worker's own output.** What this module adds is where each input came from.
-The one field it ever rewrites is `prediction_basis`, from `measured` to `borrowed`, on
-`nearest_memory` only (§4).
+The one field it ever rewrites is `prediction_basis`, from `measured` to `borrowed`, wherever the
+planned card is not the card CF named — `nearest_memory` and `pool_floor` (§4a-i).
 """
 
 import json
@@ -24,18 +28,15 @@ for _module in (estimator, planner, validation):
         raise ImportError("{} loaded from {}, not the resolved worker at {}".format(
             _module.__name__, _module.__file__, worker_path.HANDLER))
 
-VRAM_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vram_table.json")
-HANDLER_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "handler_history.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+VRAM_TABLE_PATH = os.path.join(HERE, "vram_table.json")
+HANDLER_HISTORY_PATH = os.path.join(HERE, "handler_history.json")
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
-#: The four fields `estimator.plan` reads from a hardware snapshot (§1).
-HARDWARE_FIELDS = ("gpu_name", "vram_total_gb", "vram_free_gb", "host_ram_gb")
-
 
 class Refusal(Exception):
-    """An input the service cannot use, named. Never defaulted (§3b)."""
+    """An input the service cannot use, named. Never defaulted (§4)."""
 
     def __init__(self, field, message):
         super().__init__("{}: {}".format(field, message))
@@ -62,7 +63,7 @@ def service_handler_tree(history):
 
 
 def service_commit(environ):
-    """The commit this service runs: a full 40-hex sha, or None where it cannot be established.
+    """The commit this service runs: a full 40-hex sha, or None where none can be established.
 
     **A malformed value is a deployment error and raises** rather than reading as unknown — an
     unknown commit is a legitimate state, a mistyped one is a misconfiguration nobody would see.
@@ -83,39 +84,12 @@ def _number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _positive_number(body, key, where):
-    if key not in body or body[key] is None:
-        raise Refusal("{}.{}".format(where, key), "required")
-    if not _number(body[key]) or body[key] <= 0:
-        raise Refusal("{}.{}".format(where, key), "must be a positive number")
-    return body[key]
-
-
 def _positive_int(body, key, where):
     value = body.get(key)
     if key not in body or value is None:
         raise Refusal("{}.{}".format(where, key), "required")
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise Refusal("{}.{}".format(where, key), "must be a positive integer")
-    return value
-
-
-def _object(body, key, where, nullable=False):
-    if key not in body:
-        raise Refusal("{}.{}".format(where, key), "required" + (" (null allowed)" if nullable
-                                                                  else ""))
-    value = body[key]
-    if value is None and nullable:
-        return None
-    if not isinstance(value, dict):
-        raise Refusal("{}.{}".format(where, key), "must be an object")
-    return value
-
-
-def _gpu_name(body, where):
-    value = body.get("gpu_name")
-    if not isinstance(value, str) or not value:
-        raise Refusal("{}.gpu_name".format(where), "required, a non-empty string")
     return value
 
 
@@ -126,6 +100,14 @@ def _optional_number(body, key, where):
     if not _number(value) or value <= 0:
         raise Refusal("{}.{}".format(where, key), "must be a positive number when present")
     return value
+
+
+def _object(body, key, where):
+    if key not in body or body[key] is None:
+        raise Refusal("{}.{}".format(where, key), "required")
+    if not isinstance(body[key], dict):
+        raise Refusal("{}.{}".format(where, key), "must be an object")
+    return body[key]
 
 
 def read_job(body):
@@ -177,18 +159,7 @@ def read_tier(body, index):
         raise Refusal(where, "must be an object")
     if "tier" not in body or body["tier"] is None:
         raise Refusal("{}.tier".format(where), "required")
-    host_ram_gb = _positive_number(body, "host_ram_gb", where)
-
-    cards = body.get("cards")
-    if not isinstance(cards, list) or not cards:
-        raise Refusal("{}.cards".format(where), "required, a non-empty list")
-    read_cards = []
-    for n, card in enumerate(cards):
-        card_where = "{}.cards[{}]".format(where, n)
-        if not isinstance(card, dict):
-            raise Refusal(card_where, "must be an object")
-        read_cards.append({"gpu_name": _gpu_name(card, card_where),
-                           "vram_total_gb": _positive_number(card, "vram_total_gb", card_where)})
+    host_ram_gb = _optional_number(body, "host_ram_gb", where)
 
     if "worker_commit" not in body:
         raise Refusal("{}.worker_commit".format(where), "required (null allowed)")
@@ -197,26 +168,37 @@ def read_tier(body, index):
                                       or not _FULL_SHA.match(worker_commit)):
         raise Refusal("{}.worker_commit".format(where), "must be a full 40-hex sha, or null")
 
-    idle = _object(body, "idle", where, nullable=True)
-    if idle is not None:
-        idle_where = "{}.idle".format(where)
-        idle = {"gpu_name": _gpu_name(idle, idle_where),
-                **{k: _optional_number(idle, k, idle_where)
+    cards = body.get("cards")
+    if not isinstance(cards, list) or not cards:
+        raise Refusal("{}.cards".format(where), "required, a non-empty ordered list")
+    read_cards = []
+    for n, entry in enumerate(cards):
+        card_where = "{}.cards[{}]".format(where, n)
+        if not isinstance(entry, dict):
+            raise Refusal(card_where, "must be an object")
+        gpu_name = entry.get("gpu_name")
+        if not isinstance(gpu_name, str) or not gpu_name:
+            raise Refusal("{}.gpu_name".format(card_where), "required, a non-empty string")
+        label = entry.get("label")
+        if label is not None and not isinstance(label, str):
+            raise Refusal("{}.label".format(card_where), "must be a string when present")
+        card = {"gpu_name": gpu_name, "label": label,
+                **{k: _optional_number(entry, k, card_where)
                    for k in ("vram_total_gb", "vram_free_gb", "host_ram_gb")}}
-
-    last_run = _object(body, "last_run", where, nullable=True)
-    if last_run is not None:
-        last_where = "{}.last_run".format(where)
-        last_run = {"gpu_name": _gpu_name(last_run, last_where),
-                    **{k: _optional_number(last_run, k, last_where)
-                       for k in ("vram_total_gb", "vram_free_gb")}}
+        # **Host RAM is per card, and neither source refuses THAT CARD by name** (§4): the host
+        # slice decides the chunk, and there is nothing conservative to assume.
+        card["host_ram_used_gb"] = card["host_ram_gb"] or host_ram_gb
+        if card["host_ram_used_gb"] is None:
+            raise Refusal("{}.host_ram_gb".format(card_where),
+                          "no host RAM for this card: neither the card nor the tier carries one")
+        read_cards.append(card)
 
     return {"tier": body["tier"], "host_ram_gb": host_ram_gb, "cards": read_cards,
-            "worker_commit": worker_commit, "idle": idle, "last_run": last_run}
+            "worker_commit": worker_commit}
 
 
 # ------------------------------------------------------------------------------------------------
-# §4: resolving the four hardware fields from what CF sent.
+# §4a-i: each card's VRAM, the first source that covers THAT card.
 # ------------------------------------------------------------------------------------------------
 
 def nearest_measured(nominal_gb, table_cards):
@@ -225,55 +207,57 @@ def nearest_measured(nominal_gb, table_cards):
                                               table_cards[name]["vram_total_gb"], name))
 
 
-def _both(reading):
-    return (reading is not None and reading.get("vram_total_gb") is not None
-            and reading.get("vram_free_gb") is not None)
+def _worst_measured(names, table_cards):
+    """The worst card the table measures among `names`, or None where it measures none."""
+    measured = [name for name in names if name in table_cards]
+    if not measured:
+        return None
+    return min(measured, key=lambda name: (table_cards[name]["vram_total_gb"], name))
 
 
-def resolve_hardware(tier, table_cards, index):
-    where = "tiers[{}]".format(index)
-    idle, last_run = tier["idle"], tier["last_run"]
+def resolve_card(card, siblings, table_cards, where):
+    """The four fields to plan this card against, and where each came from (§4, §4a-i)."""
+    name = card["gpu_name"]
+    total, free = card["vram_total_gb"], card["vram_free_gb"]
 
-    host_ram_gb = (idle or {}).get("host_ram_gb") or tier["host_ram_gb"]
-
-    if idle is not None:
-        card, card_source = idle["gpu_name"], "idle"
-        # Nominal memory from cards[] (the least, where the name repeats), else the idle
-        # worker's own total; neither is a refusal, but only if resolution gets that far (§4).
-        named = [c["vram_total_gb"] for c in tier["cards"] if c["gpu_name"] == card]
-        nominal = min(named) if named else idle.get("vram_total_gb")
+    if total is not None and free is not None:
+        # A reading, used as sent. **A free without a total is not one**, and a total without a
+        # free is a nominal — neither is planned against directly.
+        planned_name, vram_source, resolved_from, stats = name, "given", None, None
+    elif name in table_cards:
+        planned_name, vram_source, resolved_from = name, "table", None
+        total, free = table_cards[name]["vram_total_gb"], table_cards[name]["vram_free_gb"]
+        stats = table_cards[name].get("stats")
+    elif total is not None:
+        # A nominal: it SELECTS a measured card and is never planned against.
+        planned_name = nearest_measured(total, table_cards) if table_cards else None
+        if planned_name is None:
+            raise Refusal("service.vram_table",
+                          "the service measures no card, so {!r} cannot be resolved".format(name))
+        vram_source, resolved_from = "nearest_memory", {"card": name, "measured": planned_name}
+        total, free = (table_cards[planned_name]["vram_total_gb"],
+                       table_cards[planned_name]["vram_free_gb"])
+        stats = table_cards[planned_name].get("stats")
     else:
-        # The first card holding the least nominal memory, in the order CF sent. Its nominal is
-        # THAT entry's, never another entry's under the same name.
-        worst = min(tier["cards"], key=lambda c: c["vram_total_gb"])
-        card, nominal, card_source = worst["gpu_name"], worst["vram_total_gb"], "worst_card"
-
-    resolved_from = None
-    if card_source == "idle" and _both(idle):
-        planned_name, total, free, vram_source = card, idle["vram_total_gb"], idle[
-            "vram_free_gb"], "idle"
-    elif _both(last_run) and last_run["gpu_name"] == card:
-        planned_name, total, free, vram_source = card, last_run["vram_total_gb"], last_run[
-            "vram_free_gb"], "last_run"
-    elif card in table_cards:
-        planned_name, vram_source = card, "table"
-        total, free = table_cards[card]["vram_total_gb"], table_cards[card]["vram_free_gb"]
-    else:
-        if nominal is None:
-            raise Refusal("{}.idle.gpu_name".format(where),
-                          "{!r} is not in cards[] and carries no VRAM of its own, so it has no "
-                          "nominal memory to resolve against".format(card))
-        planned_name = nearest_measured(nominal, table_cards)
-        total = table_cards[planned_name]["vram_total_gb"]
-        free = table_cards[planned_name]["vram_free_gb"]
-        vram_source = "nearest_memory"
-        resolved_from = {"card": card, "measured": planned_name}
+        # **`pool_floor`, deliberately pessimistic** (§4a-i): the worst measured card in THIS
+        # list, else the table's worst. An unnamed card is usually better than the list
+        # advertised, so the floor under-promises — the ruled error direction.
+        planned_name = (_worst_measured([c["gpu_name"] for c in siblings], table_cards)
+                        or _worst_measured(list(table_cards), table_cards))
+        if planned_name is None:
+            raise Refusal("service.vram_table",
+                          "the service measures no card, so {!r} cannot be resolved".format(name))
+        vram_source, resolved_from = "pool_floor", {"card": name, "measured": planned_name}
+        total, free = (table_cards[planned_name]["vram_total_gb"],
+                       table_cards[planned_name]["vram_free_gb"])
+        # §3b lists vram_stats on table and nearest_memory; pool_floor names its card instead.
+        stats = None
 
     return {
         "hardware": {"gpu_name": planned_name, "vram_total_gb": total, "vram_free_gb": free,
-                     "host_ram_gb": host_ram_gb},
-        "card_source": card_source,
+                     "host_ram_gb": card["host_ram_used_gb"]},
         "vram_source": vram_source,
+        "vram_stats": stats,
         "resolved_from": resolved_from,
     }
 
@@ -282,9 +266,18 @@ def resolve_hardware(tier, table_cards, index):
 # The core.
 # ------------------------------------------------------------------------------------------------
 
-def _plan_tier(job, resolved):
-    """One tier through `estimator.plan`, unchanged. Returns the core entry's planning fields."""
-    snapshot = resolved["hardware"]
+#: §3d — window, tail and tiling. The chunk and the blocks swapped are scheduling facts and say
+#: nothing about quality, so they are not on the wire.
+QUALITY_FROM_RATIONALE = (
+    ("best_window", "window"), ("ideal_window", "ideal_window"), ("passes", "passes"),
+    ("shortest_pass", "shortest_pass"), ("decode_grid", "decode_grid"),
+    ("decode_tile", "decode_tile"), ("encode_grid", "encode_grid"),
+    ("encode_tile", "encode_tile"),
+)
+
+
+def _plan_card(job, snapshot):
+    """One card through `estimator.plan`, unchanged."""
     worker_job = {
         "target_short_edge_px": job["target"],
         "source_width": job["source_width"],
@@ -294,11 +287,6 @@ def _plan_tier(job, resolved):
         "tile_quality": job["tile_quality"],
         "schedule": job["schedule"],
     }
-    if job["canvas"] is not None:
-        delivered = job["canvas"]
-    else:
-        delivered = estimator.output_dimensions(job["source_width"], job["source_height"],
-                                                job["target"])
     frames = 1 if job["still"] else job["frames"]
     try:
         _chosen, rationale = estimator.plan(worker_job, snapshot)
@@ -306,45 +294,42 @@ def _plan_tier(job, resolved):
         if refusal.code != CAPACITY_EXCEEDED:
             raise
         # §3b: estimator.plan carries no residency on a refusal. The same verdict, read from
-        # planner.plan called with estimator's own arguments (estimator.py, the planner.plan call).
+        # planner.plan called with estimator's own arguments.
         usable = estimator._usable_vram(snapshot)
         verdict = planner.plan(
             (job["source_width"], job["source_height"]), frames, job["target"],
             usable_gb=usable, host_ram_gb=snapshot.get("host_ram_gb"),
             tile_quality=job["tile_quality"], schedule=job["schedule"],
             gpu_name=snapshot.get("gpu_name"))
-        # **The same verdict, checked rather than assumed** — a second call that refused on another
-        # constraint would pair this refusal's reason with that one's residency.
+        # **The same verdict, checked rather than assumed** — a second call that refused on
+        # another constraint would pair this refusal's reason with that one's residency.
         if (verdict.get("action") == "plan"
                 or estimator._refusal_text(verdict.get("reason") or "") != refusal.message):
             raise RuntimeError("planner.plan did not reach the verdict estimator.plan refused on")
         return {
-            "fits": False, "predicted_seconds": None, "reason": refusal.message,
-            # P1a (§3b @5a8652f): both labels as planner.fits reads a refusal (planner.py, fits).
+            "fits": False, "predicted_seconds": None, "prediction_basis": None,
+            "reason": refusal.message,
+            # P1d/P1a (§3b): both labels as planner.fits reads a refusal (planner.py, fits).
             "residency": verdict.get("residency", planner.ROUTE_UP),
-            "output_width": delivered[0], "output_height": delivered[1],
-            "best_window": None, "ideal_window": planner.ideal_window(frames),
-            "binding_phase": None, "anchored": usable <= planner.ANCHORED_MAX_USABLE,
-            "prediction_basis": None,
+            "anchored": usable <= planner.ANCHORED_MAX_USABLE,
+            "binding_phase": None, "quality": None,
             "rationale": None, "planner_verdict": verdict,
         }
     return {
         "fits": True,
         "predicted_seconds": rationale.get("predicted_seconds"),
+        "prediction_basis": rationale.get("prediction_basis"),
         "reason": None,
         "residency": rationale.get("residency"),
-        "output_width": delivered[0], "output_height": delivered[1],
-        "best_window": rationale.get("window"),
-        "ideal_window": rationale.get("ideal_window"),
-        "binding_phase": rationale.get("binding_phase"),
         "anchored": rationale.get("anchored"),
-        "prediction_basis": rationale.get("prediction_basis"),
+        "binding_phase": rationale.get("binding_phase"),
+        "quality": {field: rationale.get(key) for field, key in QUALITY_FROM_RATIONALE},
         "rationale": rationale, "planner_verdict": None,
     }
 
 
 def estimate_core(body, commit, vram_table=None):
-    """Every tier's core entry, in the order sent. Raises `Refusal` for an unusable input.
+    """Every tier's answer, in the order sent, each with one answer per card.
 
     The whole request is read before anything is planned, so a refusal on the last tier costs no
     planning on the first.
@@ -356,50 +341,75 @@ def estimate_core(body, commit, vram_table=None):
     if not isinstance(tiers, list) or not tiers:
         raise Refusal("tiers", "required, a non-empty list")
     read = [read_tier(t, i) for i, t in enumerate(tiers)]
+
     # Tables after the door: a malformed request is refused by name whatever state they are in.
     table_cards = (vram_table or load_vram_table())["cards"]
     history = load_handler_history()
     handler_tree = service_handler_tree(history)
-    resolved = [resolve_hardware(t, table_cards, i) for i, t in enumerate(read)]
+
+    if job["canvas"] is not None:
+        delivered = job["canvas"]
+    else:
+        delivered = estimator.output_dimensions(job["source_width"], job["source_height"],
+                                                job["target"])
 
     entries = []
-    for tier, where in zip(read, resolved):
-        planned = _plan_tier(job, where)
-        if where["vram_source"] == "nearest_memory" and planned["prediction_basis"] == "measured":
-            # §4: the one label the service rewrites. The rate is the measured card's, not this one's.
-            planned["prediction_basis"] = "borrowed"
+    for index, tier in enumerate(read):
+        where = "tiers[{}]".format(index)
+        answers = []
+        for card in tier["cards"]:
+            resolved = resolve_card(card, tier["cards"], table_cards, where)
+            planned = _plan_card(job, resolved["hardware"])
+            if resolved["resolved_from"] and planned["prediction_basis"] == "measured":
+                # §4a-i: the one field the service rewrites, wherever the planned card is not the
+                # card CF named. The rate is the measured card's, not this one's.
+                planned["prediction_basis"] = "borrowed"
+            answers.append(dict(
+                planned,
+                gpu_name=card["gpu_name"],
+                label=card["label"],
+                hardware_used=dict(resolved["hardware"]),
+                vram_source=resolved["vram_source"],
+                vram_stats=resolved["vram_stats"],
+                resolved_from=resolved["resolved_from"],
+            ))
+        worker_commit = tier["worker_commit"]
         # §5: matched on handler/'s tree. A commit the table does not hold is unknown, never a
         # mismatch.
-        worker_tree = (None if tier["worker_commit"] is None
-                       else history["commits"].get(tier["worker_commit"]))
-        entries.append(dict(
-            planned,
-            tier=tier["tier"],
-            planned_short_edge_px=job["target"],
-            hardware_used=dict(where["hardware"]),
-            card_source=where["card_source"],
-            vram_source=where["vram_source"],
-            resolved_from=where["resolved_from"],
-            registry_version=planner.REGISTRY_VERSION,
-            commit=commit,
-            handler_tree=handler_tree,
-            worker_handler_tree=worker_tree,
-            handler_match=(None if worker_tree is None or handler_tree is None
-                           else worker_tree == handler_tree),
-        ))
+        worker_tree = (None if worker_commit is None
+                       else history["commits"].get(worker_commit))
+        entries.append({
+            "tier": tier["tier"],
+            "cards": answers,
+            "fits_any": any(a["fits"] for a in answers),
+            "fits_all": all(a["fits"] for a in answers),
+            "output_width": delivered[0],
+            "output_height": delivered[1],
+            "planned_short_edge_px": job["target"],
+            "registry_version": planner.REGISTRY_VERSION,
+            "commit": commit,
+            "handler_tree": handler_tree,
+            "worker_handler_tree": worker_tree,
+            "handler_match": (None if worker_tree is None or handler_tree is None
+                              else worker_tree == handler_tree),
+        })
     return entries
 
 
 #: §3b, and nothing else goes on the wire.
-WIRE_FIELDS = ("tier", "fits", "predicted_seconds", "reason", "residency", "output_width",
-               "output_height", "best_window", "ideal_window", "binding_phase", "anchored",
-               "prediction_basis", "hardware_used", "card_source", "vram_source", "resolved_from",
-               "registry_version", "commit", "handler_tree", "worker_handler_tree",
-               "handler_match")
+TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
+                    "registry_version", "commit", "handler_tree", "worker_handler_tree",
+                    "handler_match")
+CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis",
+                    "reason", "residency", "anchored", "binding_phase", "quality",
+                    "hardware_used", "vram_source", "vram_stats", "resolved_from")
 
 
 def project(entry):
-    return {field: entry[field] for field in WIRE_FIELDS}
+    wire = {field: entry[field] for field in TIER_WIRE_FIELDS}
+    wire["cards"] = [{field: answer[field] for field in CARD_WIRE_FIELDS}
+                     for answer in entry["cards"]]
+    return wire
 
 
 def version(commit, vram_table=None):
