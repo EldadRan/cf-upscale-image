@@ -37,6 +37,9 @@ def route(method, path, body, commit):
             entries = ps.estimate_core(request, commit=commit)
         except ps.Refusal as refusal:
             return 400, {"refused": {"field": refusal.field, "message": refusal.message}}
+        except ps.TableUnusable as broken:
+            # The service's own committed table, not the caller's request: 503, never a 400.
+            return 503, {"error": "service tables unusable", "detail": str(broken)}
         return 200, {"tiers": [ps.project(e) for e in entries]}
     return 404, {"error": "not found"}
 

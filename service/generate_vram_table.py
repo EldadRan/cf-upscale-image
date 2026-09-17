@@ -126,6 +126,11 @@ def build(runs_dir):
                 "free_min_gb": min(frees),
                 "free_max_gb": max(frees),
                 "n": len(frees),
+                # **How many readings the PLANNED figure rests on** (§4a, ruled on C15): the
+                # statistics range over every reading, the figure over the readings at the
+                # minimum total alone. Without this, a free_min below the planned figure — the
+                # day a lower free appears at a higher total — reads as a contradiction.
+                "n_at_total": len(at_total),
             },
         }
 

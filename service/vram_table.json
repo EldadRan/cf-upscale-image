@@ -32,7 +32,8 @@
         "free_mean_gb": 44.3016,
         "free_min_gb": 43.72,
         "free_max_gb": 47.05,
-        "n": 49
+        "n": 49,
+        "n_at_total": 2
       }
     },
     "NVIDIA B200": {
@@ -44,7 +45,8 @@
         "free_mean_gb": 177.53,
         "free_min_gb": 177.52,
         "free_max_gb": 177.54,
-        "n": 2
+        "n": 2,
+        "n_at_total": 2
       }
     },
     "NVIDIA H200": {
@@ -56,7 +58,8 @@
         "free_mean_gb": 139.0683,
         "free_min_gb": 139.06,
         "free_max_gb": 139.08,
-        "n": 23
+        "n": 23,
+        "n_at_total": 21
       }
     },
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
@@ -68,7 +71,8 @@
         "free_mean_gb": 94.21,
         "free_min_gb": 93.74,
         "free_max_gb": 94.29,
-        "n": 8
+        "n": 8,
+        "n_at_total": 5
       }
     }
   }

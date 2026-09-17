@@ -163,6 +163,16 @@ class PerCard(unittest.TestCase):
                                         cards=[dict(c) for c in self.CARDS])]))
         self.assertEqual([c["gpu_name"] for c in entry["cards"]],
                          [c["gpu_name"] for c in self.CARDS])
+        # **Each answer is planned against ITS OWN card** — the echoed name alone is built in the
+        # same loop as the answer, so it cannot show a misalignment (review F5).
+        self.assertEqual([c["hardware_used"]["gpu_name"] for c in entry["cards"]],
+                         [H200, A40, B200, A40])
+        self.assertEqual([c["vram_source"] for c in entry["cards"]],
+                         ["table", "table", "table", "nearest_memory"])
+        self.assertEqual([c["hardware_used"]["vram_total_gb"] for c in entry["cards"]],
+                         [TABLE[H200]["vram_total_gb"], TABLE[A40]["vram_total_gb"],
+                          TABLE[B200]["vram_total_gb"], TABLE[A40]["vram_total_gb"]])
+        self.assertEqual(entry["cards"][3]["resolved_from"], {"card": MIG, "measured": A40})
 
     def test_labels_echoed(self):
         cards = [card(A40, label="idle"), card(H200, label="catalog"), card(B200)]
@@ -186,14 +196,14 @@ class PerCard(unittest.TestCase):
         self.assertIs(none["fits_any"], False)
         self.assertIs(none["fits_all"], False)
 
-    def test_a_card_that_cannot_be_planned_is_an_entry_that_says_why(self):
+    def test_a_refused_card_still_answers(self):
         entry = one(request(job(target_short_edge_px=4320),
                             [tier(host_ram_gb=377.0, cards=[card(A40), card(B200)])]))
         self.assertEqual(len(entry["cards"]), 2)
         self.assertFalse(entry["cards"][0]["fits"])
         self.assertIsNotNone(entry["cards"][0]["reason"])
         self.assertIsNone(entry["cards"][0]["predicted_seconds"])
-        self.assertIsNone(entry["cards"][0]["quality"])
+        self.assertIsNotNone(entry["cards"][0]["quality"]["ideal_window"])
 
     def test_tier_fields_named_once(self):
         entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
@@ -207,6 +217,73 @@ class PerCard(unittest.TestCase):
                                                               cards=[card(B200)])]), commit=None)
         self.assertEqual([e["tier"] for e in entries], ["t1", "t2"])
         self.assertEqual([c["gpu_name"] for e in entries for c in e["cards"]], [A40, B200])
+
+
+class RateFrom(unittest.TestCase):
+    """Whose measurement the time is (§4a-ii): null where it is this card's own."""
+
+    def test_one_number_on_three_cards_says_where_it_came_from(self):
+        cards = [card(A40), card(H200), card(B200)]
+        entry = one(request(tiers=[tier(host_ram_gb=377.0, cards=cards)]))
+        seconds = [c["predicted_seconds"] for c in entry["cards"]]
+        self.assertEqual(len(set(seconds)), 1, "the case exists because the numbers are equal")
+        rates = [c["rate_from"] for c in entry["cards"]]
+        self.assertIsNone(rates[0], "the A40 owns the rows this rate came from")
+        for got, name in zip(entry["cards"][1:], (H200, B200)):
+            self.assertIsNotNone(got["rate_from"], name)
+            self.assertEqual(got["rate_from"]["running_on"], name)
+            self.assertEqual(got["rate_from"]["rows_measured_on"], [A40])
+            self.assertEqual(got["prediction_basis"], "borrowed", name)
+        self.assertNotEqual(rates, [None, None, None])
+
+    def test_rate_from_is_the_workers_own_keys(self):
+        got = answer(request(tiers=[tier(host_ram_gb=377.0, cards=[card(B200)])]))
+        self.assertEqual(got["rate_from"], got["rationale"]["timing_from_another_card"])
+
+    def test_tiling_half(self):
+        # `high` tiling has no rows at all, on any card: the rate is the default-tiling rows'.
+        got = answer(request(job(tile_quality="high"), [tier(cards=[card(A40)])]))
+        self.assertEqual(got["rate_from"]["tiling"],
+                         got["rationale"]["timing_from_another_tiling"])
+        self.assertNotIn("running_on", got["rate_from"])
+        self.assertEqual(got["prediction_basis"], "borrowed")
+
+    def test_both_halves_at_once(self):
+        got = answer(request(job(tile_quality="high"),
+                             [tier(host_ram_gb=377.0, cards=[card(B200)])]))
+        self.assertEqual(got["rate_from"]["running_on"], B200)
+        self.assertEqual(got["rate_from"]["rows_measured_on"], [A40])
+        self.assertEqual(got["rate_from"]["tiling"]["running_at"], "high")
+
+    def test_borrowed_in_either_sense(self):
+        # Memory borrowed, time this card's own: the A40's rows priced a MIG resolved to the A40.
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
+        self.assertEqual(got["prediction_basis"], "borrowed")
+        self.assertIsNotNone(got["resolved_from"])
+        self.assertIsNone(got["rate_from"])
+
+    def test_refused_card_has_no_rate(self):
+        got = answer(request(job(target_short_edge_px=4320)))
+        self.assertFalse(got["fits"])
+        self.assertIsNone(got["rate_from"])
+
+
+class RefusedQuality(unittest.TestCase):
+    """A refused card still carries ideal_window, and nulls for the rest (§3b)."""
+
+    def test_ideal_window_survives_a_refusal(self):
+        got = answer(request(job(target_short_edge_px=4320)))
+        self.assertFalse(got["fits"])
+        self.assertEqual(got["quality"]["ideal_window"], planner.ideal_window(90))
+        others = {k: v for k, v in got["quality"].items() if k != "ideal_window"}
+        self.assertEqual(set(others.values()), {None}, others)
+        self.assertEqual(sorted(got["quality"]), sorted(f for f, _ in QUALITY_FROM_RATIONALE))
+
+    def test_a_still_refusal_reports_its_own_ideal(self):
+        got = answer(request(job(frames=1, is_still=True, target_short_edge_px=8000),
+                             [tier(cards=[card(A40)])]))
+        self.assertFalse(got["fits"])
+        self.assertEqual(got["quality"]["ideal_window"], planner.ideal_window(1))
 
 
 class Quality(unittest.TestCase):
@@ -251,10 +328,15 @@ class VramOrder(unittest.TestCase):
         self.assertEqual(got["hardware_used"]["vram_free_gb"], TABLE[A40]["vram_free_gb"])
 
     def test_table_before_nearest(self):
-        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.7)])]))
+        # A nominal that points AWAY from the card's own table row: nearest-first would plan the
+        # H200's 139.8, so the figures separate the two orderings, not just the label (review F4).
+        self.assertEqual(ps.nearest_measured(140.0, TABLE), H200)
+        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=140.0)])]))
         self.assertEqual(got["vram_source"], "table")
         self.assertEqual(got["hardware_used"]["gpu_name"], A40)
         self.assertEqual(got["hardware_used"]["vram_total_gb"], TABLE[A40]["vram_total_gb"])
+        self.assertIsNone(got["resolved_from"])
+        self.assertEqual(got["prediction_basis"], got["rationale"]["prediction_basis"])
 
     def test_total_without_free_is_a_nominal_never_planned_against(self):
         got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
@@ -337,6 +419,8 @@ class VramStats(unittest.TestCase):
         got = answer(request(tiers=[tier(cards=[card(A40)])]))
         self.assertEqual(got["vram_source"], "table")
         self.assertEqual(got["vram_stats"], TABLE[A40]["stats"])
+        self.assertEqual(got["vram_stats"]["n_at_total"], TABLE[A40]["readings_at_total"])
+        self.assertLess(got["vram_stats"]["n_at_total"], got["vram_stats"]["n"])
         self.assertEqual(got["hardware_used"]["vram_free_gb"], TABLE[A40]["vram_free_gb"])
         self.assertNotEqual(got["hardware_used"]["vram_free_gb"],
                             got["vram_stats"]["free_mean_gb"])
@@ -346,20 +430,53 @@ class VramStats(unittest.TestCase):
         got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
         self.assertEqual(got["vram_stats"], TABLE[A40]["stats"])
 
+    def test_stats_are_copies_not_the_tables_own_object(self):
+        table = ps.load_vram_table()
+        entry = one(request(tiers=[tier(cards=[card(A40), card(A40)])]),)
+        first, second = (c["vram_stats"] for c in entry["cards"])
+        self.assertEqual(first, TABLE[A40]["stats"])
+        self.assertIsNot(first, second)
+        self.assertIsNot(first, table["cards"][A40]["stats"])
+
     def test_no_stats_where_the_figure_is_not_the_tables(self):
         got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.43,
                                                      vram_free_gb=44.08)])]))
         self.assertIsNone(got["vram_stats"])
 
-    def test_stats_are_generated_and_the_plan_uses_the_minimum(self):
+    def test_stats_recomputed_from_the_corpus(self):
+        # **Recomputed here, not compared with itself**: min over a superset of the readings the
+        # figure comes from is below it for ANY implementation, right or wrong (review F3).
+        if SERVICE not in sys.path:
+            sys.path.insert(0, SERVICE)
+        import generate_vram_table as gen
+        readings = gen.read_corpus(RUNS)
+        by_card = {}
+        for rid, (gpu_name, total, free, _utc) in readings.items():
+            if rid not in gen.LEAK_EXCLUDED:
+                by_card.setdefault(gpu_name, []).append((total, free))
+        self.assertEqual(sorted(by_card), sorted(TABLE))
+        for name, rows in by_card.items():
+            frees = [f for _t, f in rows]
+            lowest_total = min(t for t, _ in rows)
+            row = TABLE[name]
+            self.assertEqual(row["vram_total_gb"], lowest_total, name)
+            self.assertEqual(row["vram_free_gb"],
+                             min(f for t, f in rows if t == lowest_total), name)
+            self.assertEqual(row["stats"], {
+                "free_mean_gb": round(sum(frees) / len(frees), 4),
+                "free_min_gb": min(frees),
+                "free_max_gb": max(frees),
+                "n": len(frees),
+                "n_at_total": len([t for t, _ in rows if t == lowest_total]),
+            }, name)
+            # The two answer different questions (§4a): the spread ranges over every reading, the
+            # planned figure rests on the readings at the minimum total alone.
+            self.assertLessEqual(row["stats"]["n_at_total"], row["stats"]["n"], name)
+
+    def test_the_committed_table_is_the_generators(self):
         out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_vram_table.py"),
                               "--check", RUNS], capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        for name, row in TABLE.items():
-            self.assertEqual(sorted(row["stats"]),
-                             ["free_max_gb", "free_mean_gb", "free_min_gb", "n"], name)
-            self.assertLessEqual(row["stats"]["free_min_gb"], row["vram_free_gb"], name)
-            self.assertLessEqual(row["vram_free_gb"], row["stats"]["free_mean_gb"], name)
 
 
 class HostRam(unittest.TestCase):
@@ -422,12 +539,22 @@ class Refusals(unittest.TestCase):
     def test_still_with_frames(self):
         refused_field(self, request(job(frames=90, is_still=True)), "job.frames")
 
-    def test_no_measured_card_at_all(self):
-        # Only reachable with an empty VRAM table: with a table, pool_floor always answers.
-        with self.assertRaises(ps.Refusal) as caught:
+    def test_an_empty_table_is_not_the_callers_fault(self):
+        # A table that measures no card is a DEPLOY fault: it stops the request loudly, it is
+        # never a 400 naming a field CF never sent, and it stops before anything is planned.
+        from service import app
+        with self.assertRaises(ps.TableUnusable):
             ps.estimate_core(request(tiers=[tier(cards=[card(MIG)])]), commit=None,
                              vram_table={"cards": {}, "corpus": {}})
-        self.assertEqual(caught.exception.field, "service.vram_table")
+        real = ps.load_vram_table
+        ps.load_vram_table = lambda *a, **k: {"cards": {}, "corpus": {}}
+        try:
+            status, payload = app.route("POST", "/estimate",
+                                        json.dumps(request()).encode("utf-8"), commit=None)
+        finally:
+            ps.load_vram_table = real
+        self.assertEqual(status, 503)
+        self.assertNotIn("refused", payload)
 
 
 class Residency(unittest.TestCase):
@@ -714,9 +841,9 @@ class Projection(unittest.TestCase):
     TIER_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
                    "registry_version", "commit", "handler_tree", "worker_handler_tree",
                    "handler_match")
-    CARD_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis", "reason",
-                   "residency", "anchored", "binding_phase", "quality", "hardware_used",
-                   "vram_source", "vram_stats", "resolved_from")
+    CARD_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis",
+                   "rate_from", "reason", "residency", "anchored", "binding_phase", "quality",
+                   "hardware_used", "vram_source", "vram_stats", "resolved_from")
 
     def _through_http(self, body):
         from service import app
@@ -733,11 +860,16 @@ class Projection(unittest.TestCase):
                                 worker_commit=SAME_TREE_COMMIT)]),
             request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT),
                            tier(tier="t2", cards=[card(B200)], host_ram_gb=377.0)]),
+            request(job(target_short_edge_px=4320), [tier(cards=[card(A40)])]),
+            request(tiers=[tier(cards=[card(MIG), card(A40, vram_total_gb=44.7),
+                                       card(A40, vram_total_gb=44.43, vram_free_gb=44.08)])]),
         ]
-        matches = set()
+        matches, sources = set(), set()
         for body in cases:
-            cores = ps.estimate_core(copy.deepcopy(body), commit=SHA_A)
-            wire = self._through_http(body)["tiers"]
+            # HTTP first, on the pristine body: a core that mutated the caller's request would
+            # otherwise be invisible to the one case positioned to see it (review F9).
+            wire = self._through_http(copy.deepcopy(body))["tiers"]
+            cores = ps.estimate_core(body, commit=SHA_A)
             self.assertEqual(len(wire), len(cores))
             for core, entry in zip(cores, wire):
                 self.assertEqual(sorted(entry), sorted(self.TIER_FIELDS + ("cards",)))
@@ -750,10 +882,12 @@ class Projection(unittest.TestCase):
                     self.assertEqual(sorted(got), sorted(self.CARD_FIELDS))
                     self.assertNotIn("rationale", got)
                     self.assertNotIn("planner_verdict", got)
+                    sources.add(got["vram_source"])
                     for field in self.CARD_FIELDS:
                         self.assertIs(type(got[field]), type(answered[field]), field)
                         self.assertEqual(got[field], answered[field], field)
         self.assertEqual(matches, {None, True, False})
+        self.assertEqual(sources, {"given", "table", "nearest_memory", "pool_floor"})
 
     def test_refusal_on_the_wire_names_the_field(self):
         from service import app

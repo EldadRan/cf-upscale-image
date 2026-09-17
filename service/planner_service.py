@@ -35,6 +35,12 @@ HANDLER_HISTORY_PATH = os.path.join(HERE, "handler_history.json")
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
+class TableUnusable(RuntimeError):
+    """The service's own committed table cannot answer. **A deploy fault, never the caller's** —
+    §4's refusals are input faults, and a 400 naming `service.vram_table` would tell CF it sent
+    something wrong about a file CF has never seen."""
+
+
 class Refusal(Exception):
     """An input the service cannot use, named. Never defaulted (§4)."""
 
@@ -207,6 +213,13 @@ def nearest_measured(nominal_gb, table_cards):
                                               table_cards[name]["vram_total_gb"], name))
 
 
+def _copy_stats(row):
+    """A COPY of the table row's statistics. A live reference would be process-global shared
+    mutable state the moment anyone caches the table, which `vram_table=` exists to allow."""
+    stats = row.get("stats")
+    return dict(stats) if isinstance(stats, dict) else None
+
+
 def _worst_measured(names, table_cards):
     """The worst card the table measures among `names`, or None where it measures none."""
     measured = [name for name in names if name in table_cards]
@@ -215,7 +228,7 @@ def _worst_measured(names, table_cards):
     return min(measured, key=lambda name: (table_cards[name]["vram_total_gb"], name))
 
 
-def resolve_card(card, siblings, table_cards, where):
+def resolve_card(card, siblings, table_cards):
     """The four fields to plan this card against, and where each came from (§4, §4a-i)."""
     name = card["gpu_name"]
     total, free = card["vram_total_gb"], card["vram_free_gb"]
@@ -227,26 +240,20 @@ def resolve_card(card, siblings, table_cards, where):
     elif name in table_cards:
         planned_name, vram_source, resolved_from = name, "table", None
         total, free = table_cards[name]["vram_total_gb"], table_cards[name]["vram_free_gb"]
-        stats = table_cards[name].get("stats")
+        stats = _copy_stats(table_cards[name])
     elif total is not None:
         # A nominal: it SELECTS a measured card and is never planned against.
-        planned_name = nearest_measured(total, table_cards) if table_cards else None
-        if planned_name is None:
-            raise Refusal("service.vram_table",
-                          "the service measures no card, so {!r} cannot be resolved".format(name))
+        planned_name = nearest_measured(total, table_cards)
         vram_source, resolved_from = "nearest_memory", {"card": name, "measured": planned_name}
         total, free = (table_cards[planned_name]["vram_total_gb"],
                        table_cards[planned_name]["vram_free_gb"])
-        stats = table_cards[planned_name].get("stats")
+        stats = _copy_stats(table_cards[planned_name])
     else:
         # **`pool_floor`, deliberately pessimistic** (§4a-i): the worst measured card in THIS
         # list, else the table's worst. An unnamed card is usually better than the list
         # advertised, so the floor under-promises — the ruled error direction.
         planned_name = (_worst_measured([c["gpu_name"] for c in siblings], table_cards)
                         or _worst_measured(list(table_cards), table_cards))
-        if planned_name is None:
-            raise Refusal("service.vram_table",
-                          "the service measures no card, so {!r} cannot be resolved".format(name))
         vram_source, resolved_from = "pool_floor", {"card": name, "measured": planned_name}
         total, free = (table_cards[planned_name]["vram_total_gb"],
                        table_cards[planned_name]["vram_free_gb"])
@@ -274,6 +281,16 @@ QUALITY_FROM_RATIONALE = (
     ("decode_tile", "decode_tile"), ("encode_grid", "encode_grid"),
     ("encode_tile", "encode_tile"),
 )
+
+
+def _quality_of_refusal(frames):
+    """A refused card still says what the CLIP could use (§3b, ruled on C16).
+
+    `ideal_window` is a property of the clip rather than of the card, so a tier walk that refuses
+    everywhere still learns it; the rest of §3d needs a plan and stays null.
+    """
+    return {field: (planner.ideal_window(frames) if field == "ideal_window" else None)
+            for field, _key in QUALITY_FROM_RATIONALE}
 
 
 def _plan_card(job, snapshot):
@@ -312,7 +329,8 @@ def _plan_card(job, snapshot):
             # P1d/P1a (§3b): both labels as planner.fits reads a refusal (planner.py, fits).
             "residency": verdict.get("residency", planner.ROUTE_UP),
             "anchored": usable <= planner.ANCHORED_MAX_USABLE,
-            "binding_phase": None, "quality": None,
+            "binding_phase": None, "quality": _quality_of_refusal(frames),
+            "rate_from": None,
             "rationale": None, "planner_verdict": verdict,
         }
     return {
@@ -324,8 +342,28 @@ def _plan_card(job, snapshot):
         "anchored": rationale.get("anchored"),
         "binding_phase": rationale.get("binding_phase"),
         "quality": {field: rationale.get(key) for field, key in QUALITY_FROM_RATIONALE},
+        # §4a-ii: whose measurement the time is. The worker's own two keys, carried through
+        # unchanged — null means the rate is this card's own rows.
+        "rate_from": _rate_from(rationale),
         "rationale": rationale, "planner_verdict": None,
     }
+
+
+def _rate_from(rationale):
+    """`timing_from_another_card`, plus the tiling where that differs too (§4a-ii).
+
+    **THE SAME NUMBER COMES BACK ON EVERY CARD IN A TIER** when only one card has rows in the
+    pixel band — `estimator._attach_timing` falls back to `same_card or comparable` — and three
+    identical numbers side by side look like three measurements. This is what says they are not.
+    """
+    other_card = rationale.get("timing_from_another_card")
+    other_tiling = rationale.get("timing_from_another_tiling")
+    if not other_card and not other_tiling:
+        return None
+    rate_from = dict(other_card or {})
+    if other_tiling:
+        rate_from["tiling"] = dict(other_tiling)
+    return rate_from
 
 
 def estimate_core(body, commit, vram_table=None):
@@ -344,6 +382,9 @@ def estimate_core(body, commit, vram_table=None):
 
     # Tables after the door: a malformed request is refused by name whatever state they are in.
     table_cards = (vram_table or load_vram_table())["cards"]
+    if not table_cards:
+        # Before any card is planned: every fallback below ends in a measured card.
+        raise TableUnusable("the service's VRAM table measures no card")
     history = load_handler_history()
     handler_tree = service_handler_tree(history)
 
@@ -354,15 +395,17 @@ def estimate_core(body, commit, vram_table=None):
                                                 job["target"])
 
     entries = []
-    for index, tier in enumerate(read):
-        where = "tiers[{}]".format(index)
+    for tier in read:
         answers = []
         for card in tier["cards"]:
-            resolved = resolve_card(card, tier["cards"], table_cards, where)
+            resolved = resolve_card(card, tier["cards"], table_cards)
             planned = _plan_card(job, resolved["hardware"])
             if resolved["resolved_from"] and planned["prediction_basis"] == "measured":
-                # §4a-i: the one field the service rewrites, wherever the planned card is not the
-                # card CF named. The rate is the measured card's, not this one's.
+                # §4a-i: the one field the service rewrites, and only for the MEMORY sense. The
+                # time sense needs no rewrite — the worker already labels a rate from another
+                # card or another tiling `borrowed` itself, and `rate_from` beside it says which
+                # card and which tiling. A condition on rate_from here would never fire, and an
+                # unfirable condition is one no witness can hold.
                 planned["prediction_basis"] = "borrowed"
             answers.append(dict(
                 planned,
@@ -401,7 +444,7 @@ TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_heig
                     "registry_version", "commit", "handler_tree", "worker_handler_tree",
                     "handler_match")
 CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis",
-                    "reason", "residency", "anchored", "binding_phase", "quality",
+                    "rate_from", "reason", "residency", "anchored", "binding_phase", "quality",
                     "hardware_used", "vram_source", "vram_stats", "resolved_from")
 
 
