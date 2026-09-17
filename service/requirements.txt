@@ -1,0 +1,4 @@
+# The CF planner service's own dependencies (cf-planner.md §2).
+#
+# None: the service is standard-library Python, and the worker planning modules it imports need
+# nothing beyond it. The worker's own dependency list is never installed here.

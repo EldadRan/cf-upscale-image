@@ -1,0 +1,15 @@
+{
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "service/Dockerfile",
+    "watchPatterns": [
+      "service/**",
+      "handler/*.py",
+      "handler/calibration.json"
+    ]
+  },
+  "deploy": {
+    "startCommand": "python3 -m service.app",
+    "healthcheckPath": "/version"
+  }
+}

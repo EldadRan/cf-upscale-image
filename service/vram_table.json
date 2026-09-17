@@ -1,0 +1,51 @@
+{
+  "generated_by": "service/generate_vram_table.py — never hand-edited",
+  "rule": "per gpu_name: minimum vram_total_gb over included readings, then minimum vram_free_gb at that total (cf-planner.md §4a)",
+  "corpus": {
+    "source": "cf-upscale-project/records/runs",
+    "records": 89,
+    "included": 82,
+    "excluded": [
+      "01REAL20260823T18121000",
+      "01REAL20260823T18170000",
+      "01REAL20260823T18215100",
+      "01REAL20260823T19044600",
+      "01REAL20260823T22425500",
+      "01REAL20260823T22484100",
+      "01REAL20260823T22541500"
+    ],
+    "gap_allowed": [
+      "01REAL20260820T09291300"
+    ],
+    "first_record": "01REAL20260819T14575300",
+    "last_record": "01REAL20260831T20142700",
+    "first_utc": "2026-08-19T15:55:10.771399+00:00",
+    "last_utc": "2026-08-31T20:25:28.898034+00:00"
+  },
+  "cards": {
+    "NVIDIA A40": {
+      "vram_total_gb": 44.34,
+      "vram_free_gb": 43.72,
+      "readings": 49,
+      "readings_at_total": 2
+    },
+    "NVIDIA B200": {
+      "vram_total_gb": 178.35,
+      "vram_free_gb": 177.52,
+      "readings": 2,
+      "readings_at_total": 2
+    },
+    "NVIDIA H200": {
+      "vram_total_gb": 139.8,
+      "vram_free_gb": 139.06,
+      "readings": 23,
+      "readings_at_total": 21
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+      "vram_total_gb": 94.97,
+      "vram_free_gb": 93.74,
+      "readings": 8,
+      "readings_at_total": 5
+    }
+  }
+}
