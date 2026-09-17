@@ -178,6 +178,34 @@ class Residency(unittest.TestCase):
         self.assertIsNotNone(core["anchored"])
         self.assertEqual(core["anchored"], fits["anchored"])
 
+    def test_refusal_anchored_at_both_sides_of_the_span(self):
+        # Review W1 on P1a: the A40 is anchored either way. The H200's table figures sit on the
+        # boundary (total above ANCHORED_MAX_USABLE, usable at or below it), the B200 beyond it.
+        for card, expected in (("NVIDIA H200", True), ("NVIDIA B200", False)):
+            nominal = TABLE[card]["vram_total_gb"]
+            core = one(request(tiers=[tier(host_ram_gb=8.0,
+                                           cards=[{"gpu_name": card, "vram_total_gb": nominal}])]))
+            self.assertFalse(core["fits"], card)
+            self.assertEqual(core["vram_source"], "table", card)
+            hw = core["hardware_used"]
+            fits = planner.fits((1920, 1080), 90, 1480, estimator._usable_vram(hw),
+                                host_ram_gb=hw["host_ram_gb"], tile_quality="default",
+                                gpu_name=hw["gpu_name"])
+            self.assertFalse(fits["fits"], card)
+            self.assertIs(core["anchored"], expected, card)
+            self.assertEqual(core["anchored"], fits["anchored"], card)
+            self.assertEqual(core["residency"], fits["residency"], card)
+
+    def test_refusal_anchored_on_the_boundary(self):
+        # A banked H200 reading (free 139.07) leaves usable exactly at ANCHORED_MAX_USABLE, which
+        # planner.fits counts as anchored (<=).
+        idle = {"gpu_name": "NVIDIA H200", "vram_total_gb": 139.8, "vram_free_gb": 139.07}
+        core = one(request(tiers=[tier(host_ram_gb=8.0, idle=idle,
+                                       cards=[{"gpu_name": "NVIDIA H200", "vram_total_gb": 139.8}])]))
+        self.assertFalse(core["fits"])
+        self.assertEqual(estimator._usable_vram(core["hardware_used"]), planner.ANCHORED_MAX_USABLE)
+        self.assertIs(core["anchored"], True)
+
     def test_fit_residency_from_the_plan(self):
         core = one(request())
         self.assertTrue(core["fits"])
