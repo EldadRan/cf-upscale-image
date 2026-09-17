@@ -25,6 +25,8 @@ for _module in (estimator, planner, validation):
             _module.__name__, _module.__file__, worker_path.HANDLER))
 
 VRAM_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vram_table.json")
+HANDLER_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "handler_history.json")
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -44,6 +46,19 @@ class Refusal(Exception):
 def load_vram_table(path=VRAM_TABLE_PATH):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_handler_history(path=HANDLER_HISTORY_PATH):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def service_handler_tree(history):
+    """The handler/ tree this service plans with: the history table's newest entry (§5).
+
+    The kit holds that this is HEAD's tree — no commit after `newest` touches handler/.
+    """
+    return history["commits"][history["newest"]]
 
 
 def service_commit(environ):
@@ -337,6 +352,8 @@ def estimate_core(body, commit, vram_table=None):
     if not isinstance(body, dict):
         raise Refusal("request", "must be a JSON object")
     table_cards = (vram_table or load_vram_table())["cards"]
+    history = load_handler_history()
+    handler_tree = service_handler_tree(history)
     job = read_job(body)
     tiers = body.get("tiers")
     if not isinstance(tiers, list) or not tiers:
@@ -350,7 +367,10 @@ def estimate_core(body, commit, vram_table=None):
         if where["vram_source"] == "nearest_memory" and planned["prediction_basis"] == "measured":
             # §4: the one label the service rewrites. The rate is the measured card's, not this one's.
             planned["prediction_basis"] = "borrowed"
-        worker_commit = tier["worker_commit"]
+        # §5: matched on handler/'s tree. A commit the table does not hold is unknown, never a
+        # mismatch.
+        worker_tree = (None if tier["worker_commit"] is None
+                       else history["commits"].get(tier["worker_commit"]))
         entries.append(dict(
             planned,
             tier=tier["tier"],
@@ -361,8 +381,10 @@ def estimate_core(body, commit, vram_table=None):
             resolved_from=where["resolved_from"],
             registry_version=planner.REGISTRY_VERSION,
             commit=commit,
-            commit_match=(None if worker_commit is None or commit is None
-                          else commit == worker_commit),
+            handler_tree=handler_tree,
+            worker_handler_tree=worker_tree,
+            handler_match=(None if worker_tree is None or handler_tree is None
+                           else worker_tree == handler_tree),
         ))
     return entries
 
@@ -371,7 +393,8 @@ def estimate_core(body, commit, vram_table=None):
 WIRE_FIELDS = ("tier", "fits", "predicted_seconds", "reason", "residency", "output_width",
                "output_height", "best_window", "ideal_window", "binding_phase", "anchored",
                "prediction_basis", "hardware_used", "card_source", "vram_source", "resolved_from",
-               "registry_version", "commit", "commit_match")
+               "registry_version", "commit", "handler_tree", "worker_handler_tree",
+               "handler_match")
 
 
 def project(entry):
@@ -380,8 +403,11 @@ def project(entry):
 
 def version(commit, vram_table=None):
     table = vram_table or load_vram_table()
+    history = load_handler_history()
     return {
         "commit": commit,
+        "handler_tree": service_handler_tree(history),
+        "handler_history_newest": history["newest"],
         "registry_version": planner.REGISTRY_VERSION,
         "calibration_rows": len(estimator.load_calibration()),
         "vram_table_corpus": table["corpus"],

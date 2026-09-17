@@ -428,36 +428,73 @@ class Refusal(unittest.TestCase):
         refused_field(self, body, "job.target_short_edge_px")
 
 
-class Commit(unittest.TestCase):
-    """Mismatch reports false; unknown reports null; a short sha is refused."""
+#: e499dd5 is the image tiers ran before service/ existed: same handler/ tree as HEAD, other commit.
+SAME_TREE_COMMIT = "e499dd51929b3fe25a0b5fdce7aee840d2027789"
+#: 26294cc is e499dd5's parent, and e499dd5 changed handler/estimator.py.
+OTHER_TREE_COMMIT = "26294cc5cb1f90fdaabe84f59223c1215a6f3fc1"
 
-    def test_mismatch(self):
-        core = one(request(tiers=[tier(worker_commit=SHA_B)]), commit=SHA_A)
+
+class Match(unittest.TestCase):
+    """handler_match on handler/'s tree, not the commit (§5)."""
+
+    def test_same_tree_other_commit_matches(self):
+        self.assertNotEqual(SAME_TREE_COMMIT, _git("rev-parse", "HEAD").strip())
+        core = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
+        self.assertEqual(core["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
+        self.assertEqual(core["worker_handler_tree"],
+                         _git("rev-parse", SAME_TREE_COMMIT + ":handler").strip())
+        self.assertIs(core["handler_match"], True)
         self.assertEqual(core["commit"], SHA_A)
-        self.assertIs(core["commit_match"], False)
+        self.assertNotIn("commit_match", core)
 
-    def test_match(self):
-        core = one(request(tiers=[tier(worker_commit=SHA_A)]), commit=SHA_A)
-        self.assertIs(core["commit_match"], True)
+    def test_other_tree_mismatches(self):
+        core = one(request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT)]))
+        self.assertEqual(core["worker_handler_tree"],
+                         _git("rev-parse", OTHER_TREE_COMMIT + ":handler").strip())
+        self.assertNotEqual(core["worker_handler_tree"], core["handler_tree"])
+        self.assertIs(core["handler_match"], False)
 
-    def test_none_sent(self):
-        core = one(request(), commit=SHA_A)
-        self.assertIsNone(core["commit_match"])
+    def test_commit_not_in_table_is_null(self):
+        core = one(request(tiers=[tier(worker_commit=SHA_B)]))
+        self.assertIsNone(core["worker_handler_tree"])
+        self.assertIsNone(core["handler_match"])
+        self.assertIsNotNone(core["handler_tree"])
 
-    def test_unknown_service_commit(self):
-        core = one(request(tiers=[tier(worker_commit=SHA_B)]), commit=None)
-        self.assertIsNone(core["commit"])
-        self.assertIsNone(core["commit_match"])
+    def test_none_sent_is_null(self):
+        core = one(request())
+        self.assertIsNone(core["worker_handler_tree"])
+        self.assertIsNone(core["handler_match"])
 
     def test_short_sha_refused(self):
-        refused_field(self, request(tiers=[tier(worker_commit=SHA_B[:7])]),
+        refused_field(self, request(tiers=[tier(worker_commit=SAME_TREE_COMMIT[:7])]),
                       "tiers[0].worker_commit")
 
-    def test_service_commit_must_be_full(self):
+    def test_service_commit_is_information(self):
         with self.assertRaises(ValueError):
             ps.service_commit({"CF_PLANNER_COMMIT": "abc1234"})
         self.assertEqual(ps.service_commit({"CF_PLANNER_COMMIT": SHA_A}), SHA_A)
         self.assertIsNone(ps.service_commit({}))
+        core = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=None)
+        self.assertIsNone(core["commit"])
+        self.assertIs(core["handler_match"], True)
+
+
+class HistoryTable(unittest.TestCase):
+    """Generated from git, current at HEAD; a hand edit or a missed handler change fails (§5)."""
+
+    def test_table_is_generated(self):
+        out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_handler_history.py"),
+                              "--check"], capture_output=True, text=True, cwd=REPO_ROOT)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_newest_is_current_at_head(self):
+        table = ps.load_handler_history()
+        newest = table["newest"]
+        self.assertEqual(subprocess.run(["git", "-C", REPO_ROOT, "merge-base", "--is-ancestor",
+                                         newest, "HEAD"]).returncode, 0)
+        self.assertEqual(_git("diff", "--name-only", newest, "HEAD", "--", "handler/"), "")
+        self.assertEqual(table["commits"][newest], _git("rev-parse", "HEAD:handler").strip())
+        self.assertEqual(ps.service_handler_tree(table), table["commits"][newest])
 
 
 class Projection(unittest.TestCase):
@@ -466,7 +503,8 @@ class Projection(unittest.TestCase):
     WIRE_FIELDS = ("fits", "predicted_seconds", "reason", "residency", "output_width",
                    "output_height", "best_window", "ideal_window", "binding_phase", "anchored",
                    "prediction_basis", "hardware_used", "card_source", "vram_source",
-                   "resolved_from", "registry_version", "commit", "commit_match")
+                   "resolved_from", "registry_version", "commit", "handler_tree",
+                   "worker_handler_tree", "handler_match")
 
     def _through_http(self, body):
         from service import app
@@ -480,7 +518,7 @@ class Projection(unittest.TestCase):
             request(),
             request(job(target_short_edge_px=4320), [tier(host_ram_gb=16.0)]),
             request(tiers=[tier(cards=[{"gpu_name": Nearest.MIG, "vram_total_gb": 44.5}],
-                                worker_commit=SHA_B)]),
+                                worker_commit=SAME_TREE_COMMIT)]),
         ]
         for body in cases:
             cores = ps.estimate_core(copy.deepcopy(body), commit=SHA_A)
@@ -510,6 +548,9 @@ class Projection(unittest.TestCase):
         self.assertEqual(payload["calibration_rows"], len(estimator.load_calibration()))
         with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as handle:
             self.assertEqual(payload["vram_table_corpus"], json.load(handle)["corpus"])
+        table = ps.load_handler_history()
+        self.assertEqual(payload["handler_tree"], table["commits"][table["newest"]])
+        self.assertEqual(payload["handler_history_newest"], table["newest"])
 
 
 def _git(*args):
