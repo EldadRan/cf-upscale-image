@@ -130,6 +130,8 @@ class Residency(unittest.TestCase):
         self.assertEqual(core["residency"], "route_up")
         self.assertEqual(core["residency"], verdict["residency"])
         self.assertEqual(estimator._refusal_text(verdict["reason"]), core["reason"])
+        self.assertEqual(core["anchored"], estimator._usable_vram(core["hardware_used"])
+                         <= planner.ANCHORED_MAX_USABLE)
 
     def test_diverging_verdict_is_an_error(self):
         # If planner.plan refuses for a different reason than estimator.plan did, the residency
@@ -156,16 +158,25 @@ class Residency(unittest.TestCase):
         finally:
             planner.plan, estimator.plan = real_plan, real_estimate
 
-    def test_vram_refusal_carries_the_verdicts_residency(self):
+    def test_vram_refusal_labels_follow_planner_fits(self):
         # An 8K target on the A40's table figures: the VRAM floor refuses, and that terminal
-        # answer carries no residency, so none is reported.
+        # answer carries no residency. P1a (cf-planner.md §3b @5a8652f): residency and anchored
+        # are what planner.fits answers for the same inputs.
         core = one(request(job(target_short_edge_px=4320)))
         self.assertFalse(core["fits"])
         verdict = core["planner_verdict"]
         self.assertNotEqual(verdict["action"], "plan")
         self.assertNotIn("residency", verdict)
-        self.assertIsNone(core["residency"])
         self.assertEqual(estimator._refusal_text(verdict["reason"]), core["reason"])
+        hw = core["hardware_used"]
+        fits = planner.fits((1920, 1080), 90, 4320, estimator._usable_vram(hw),
+                            host_ram_gb=hw["host_ram_gb"], tile_quality="default",
+                            gpu_name=hw["gpu_name"])
+        self.assertFalse(fits["fits"])
+        self.assertEqual(core["residency"], "route_up")
+        self.assertEqual(core["residency"], fits["residency"])
+        self.assertIsNotNone(core["anchored"])
+        self.assertEqual(core["anchored"], fits["anchored"])
 
     def test_fit_residency_from_the_plan(self):
         core = one(request())

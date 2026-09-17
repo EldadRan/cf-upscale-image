@@ -292,9 +292,10 @@ def _plan_tier(job, resolved):
             raise
         # §3b: estimator.plan carries no residency on a refusal. The same verdict, read from
         # planner.plan called with estimator's own arguments (estimator.py, the planner.plan call).
+        usable = estimator._usable_vram(snapshot)
         verdict = planner.plan(
             (job["source_width"], job["source_height"]), frames, job["target"],
-            usable_gb=estimator._usable_vram(snapshot), host_ram_gb=snapshot.get("host_ram_gb"),
+            usable_gb=usable, host_ram_gb=snapshot.get("host_ram_gb"),
             tile_quality=job["tile_quality"], schedule=job["schedule"],
             gpu_name=snapshot.get("gpu_name"))
         # **The same verdict, checked rather than assumed** — a second call that refused on another
@@ -304,10 +305,12 @@ def _plan_tier(job, resolved):
             raise RuntimeError("planner.plan did not reach the verdict estimator.plan refused on")
         return {
             "fits": False, "predicted_seconds": None, "reason": refusal.message,
-            "residency": verdict.get("residency"),
+            # P1a (§3b @5a8652f): both labels as planner.fits reads a refusal (planner.py, fits).
+            "residency": verdict.get("residency", planner.ROUTE_UP),
             "output_width": delivered[0], "output_height": delivered[1],
             "best_window": None, "ideal_window": planner.ideal_window(frames),
-            "binding_phase": None, "anchored": None, "prediction_basis": None,
+            "binding_phase": None, "anchored": usable <= planner.ANCHORED_MAX_USABLE,
+            "prediction_basis": None,
             "rationale": None, "planner_verdict": verdict,
         }
     return {
