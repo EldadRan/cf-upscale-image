@@ -7,10 +7,14 @@ table, and the service's own `handler_tree` is the table's newest entry.
 **A table cannot hold the commit that adds it**, so `newest` is `main` at generation time and HEAD
 moves past it. The kit holds that gap honest: nothing after `newest` may touch `handler/`.
 
-Usage (from a checkout of cf-upscale-image):
-    python3 service/generate_handler_history.py           write service/handler_history.json
-    python3 service/generate_handler_history.py --check   exit 1 unless the committed table is
-                                                          exactly what `newest`'s history generates
+Usage (from a FULL, non-shallow checkout of cf-upscale-image):
+    python3 service/generate_handler_history.py                 write service/handler_history.json
+    python3 service/generate_handler_history.py --check [PATH]  exit 1 unless the table is exactly
+                                                                what `newest`'s history generates,
+                                                                for `ref` main, on main
+
+**A shallow clone stops both modes.** `rev-list` ends at the shallow boundary, so a table written
+there is silently cut short and a correct one checked there looks wrong.
 """
 
 import json
@@ -27,6 +31,20 @@ REF = "main"
 def _git(*args, stdin=None):
     return subprocess.run(["git", "-C", REPO_ROOT] + list(args), input=stdin,
                           capture_output=True, text=True, check=True).stdout
+
+
+class Stop(Exception):
+    """The checkout cannot answer the question honestly."""
+
+
+def _refuse_shallow():
+    if _git("rev-parse", "--is-shallow-repository").strip() == "true":
+        raise Stop("shallow clone: the history table needs every commit reachable from main")
+
+
+def _is_ancestor(older, newer):
+    return subprocess.run(["git", "-C", REPO_ROOT, "merge-base", "--is-ancestor", older, newer],
+                          capture_output=True).returncode == 0
 
 
 def build(newest):
@@ -54,24 +72,52 @@ def render(history):
     return json.dumps(history, indent=2) + "\n"
 
 
-def main(argv):
-    if "--check" in argv:
-        try:
-            with open(HISTORY_PATH, encoding="utf-8") as handle:
-                committed = handle.read()
-            newest = json.loads(committed)["newest"]
-        except (OSError, ValueError, KeyError) as error:
-            print("handler_history.json unreadable: {}".format(error), file=sys.stderr)
-            return 1
-        if render(build(newest)) != committed:
-            print("handler_history.json differs from what {}'s history generates".format(newest),
-                  file=sys.stderr)
-            return 1
-        print("handler_history.json matches the history of {}".format(newest))
-        return 0
+def check(path):
+    """Why `path` is not the generated table, or None when it is."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            committed = handle.read()
+        history = json.loads(committed)
+        newest = history["newest"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return "unreadable: {}".format(error)
+    if history.get("ref") != REF:
+        return "ref is {!r}, not {!r}".format(history.get("ref"), REF)
+    if not _is_ancestor(newest, REF):
+        return "newest {} is not on {}".format(newest, REF)
+    if render(build(newest)) != committed:
+        return "differs from what {}'s history generates".format(newest)
+    return None
+
+
+def write():
     newest = _git("rev-parse", REF).strip()
+    # **A stale local main is refused** where the last fetch knows better: the table would lack
+    # commits a tier can already be running.
+    upstream = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--verify", "--quiet",
+                               "refs/remotes/origin/" + REF], capture_output=True, text=True)
+    if upstream.returncode == 0 and not _is_ancestor(upstream.stdout.strip(), newest):
+        raise Stop("local {} is behind origin/{}; update it first".format(REF, REF))
     with open(HISTORY_PATH, "w", encoding="utf-8") as handle:
         handle.write(render(build(newest)))
+    return newest
+
+
+def main(argv):
+    try:
+        _refuse_shallow()
+        if argv and argv[0] == "--check":
+            path = argv[1] if len(argv) > 1 else HISTORY_PATH
+            problem = check(path)
+            if problem:
+                print("{}: {}".format(path, problem), file=sys.stderr)
+                return 1
+            print("{} matches the history of its newest entry".format(path))
+            return 0
+        newest = write()
+    except Stop as stop:
+        print("STOP: {}".format(stop), file=sys.stderr)
+        return 2
     print("wrote {} ({} at {})".format(HISTORY_PATH, REF, newest))
     return 0
 

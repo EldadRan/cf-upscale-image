@@ -351,14 +351,15 @@ def estimate_core(body, commit, vram_table=None):
     """
     if not isinstance(body, dict):
         raise Refusal("request", "must be a JSON object")
-    table_cards = (vram_table or load_vram_table())["cards"]
-    history = load_handler_history()
-    handler_tree = service_handler_tree(history)
     job = read_job(body)
     tiers = body.get("tiers")
     if not isinstance(tiers, list) or not tiers:
         raise Refusal("tiers", "required, a non-empty list")
     read = [read_tier(t, i) for i, t in enumerate(tiers)]
+    # Tables after the door: a malformed request is refused by name whatever state they are in.
+    table_cards = (vram_table or load_vram_table())["cards"]
+    history = load_handler_history()
+    handler_tree = service_handler_tree(history)
     resolved = [resolve_hardware(t, table_cards, i) for i, t in enumerate(read)]
 
     entries = []

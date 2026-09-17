@@ -479,6 +479,22 @@ class Match(unittest.TestCase):
         self.assertIs(core["handler_match"], True)
 
 
+class TablesAfterTheDoor(unittest.TestCase):
+    """A malformed request is refused by name whatever state the committed tables are in."""
+
+    def test_refusal_named_with_unreadable_history(self):
+        real = ps.load_handler_history
+
+        def broken(*_args, **_kwargs):
+            raise OSError("no table")
+
+        ps.load_handler_history = broken
+        try:
+            refused_field(self, request(tiers=[tier(cards=[])]), "tiers[0].cards")
+        finally:
+            ps.load_handler_history = real
+
+
 class HistoryTable(unittest.TestCase):
     """Generated from git, current at HEAD; a hand edit or a missed handler change fails (§5)."""
 
@@ -487,12 +503,58 @@ class HistoryTable(unittest.TestCase):
                               "--check"], capture_output=True, text=True, cwd=REPO_ROOT)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
+    def _check(self, path, cwd=None):
+        script = os.path.join(cwd or REPO_ROOT, "service", "generate_handler_history.py")
+        return subprocess.run([sys.executable, script, "--check", path], capture_output=True,
+                              text=True)
+
+    def test_check_fails_on_a_hand_edit(self):
+        import tempfile
+        table = ps.load_handler_history()
+        edits = {
+            "tree changed": lambda t: t["commits"].__setitem__(list(t["commits"])[3], "0" * 40),
+            "commit removed": lambda t: t["commits"].pop(list(t["commits"])[3]),
+            "ref changed": lambda t: t.__setitem__("ref", "other"),
+            "newest off main": lambda t: t.__setitem__("newest", SHA_B),
+        }
+        for label, edit in edits.items():
+            edited = json.loads(json.dumps(table))
+            edit(edited)
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+                handle.write(json.dumps(edited, indent=2) + "\n")
+            try:
+                self.assertEqual(self._check(handle.name).returncode, 1, label)
+            finally:
+                os.remove(handle.name)
+
+    def test_shallow_clone_stops(self):
+        import shutil
+        import tempfile
+        clone = tempfile.mkdtemp(prefix="shallow_")
+        try:
+            subprocess.run(["git", "clone", "-q", "--depth", "3", "file://" + REPO_ROOT, clone],
+                           check=True, capture_output=True)
+            # The generator under test is THIS tree's, run against the shallow clone's history.
+            os.makedirs(os.path.join(clone, "service"), exist_ok=True)
+            script = os.path.join(clone, "service", "generate_handler_history.py")
+            shutil.copy(os.path.join(SERVICE, "generate_handler_history.py"), script)
+            for args in ([], ["--check"]):
+                out = subprocess.run([sys.executable, script] + args, capture_output=True,
+                                     text=True)
+                self.assertEqual(out.returncode, 2, (args, out.stdout, out.stderr))
+                self.assertIn("shallow", out.stderr)
+        finally:
+            shutil.rmtree(clone)
+
     def test_newest_is_current_at_head(self):
         table = ps.load_handler_history()
         newest = table["newest"]
         self.assertEqual(subprocess.run(["git", "-C", REPO_ROOT, "merge-base", "--is-ancestor",
                                          newest, "HEAD"]).returncode, 0)
-        self.assertEqual(_git("diff", "--name-only", newest, "HEAD", "--", "handler/"), "")
+        # EVERY commit after newest, not the net diff: a change and its revert net to nothing and
+        # still ran on some tier (review F1 on P1d).
+        self.assertEqual(_git("log", "--format=%H", "{}..HEAD".format(newest), "--", "handler/"),
+                         "")
         self.assertEqual(table["commits"][newest], _git("rev-parse", "HEAD:handler").strip())
         self.assertEqual(ps.service_handler_tree(table), table["commits"][newest])
 
@@ -519,17 +581,24 @@ class Projection(unittest.TestCase):
             request(job(target_short_edge_px=4320), [tier(host_ram_gb=16.0)]),
             request(tiers=[tier(cards=[{"gpu_name": Nearest.MIG, "vram_total_gb": 44.5}],
                                 worker_commit=SAME_TREE_COMMIT)]),
+            request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT)]),
         ]
+        all_matches = set()
         for body in cases:
             cores = ps.estimate_core(copy.deepcopy(body), commit=SHA_A)
             wire = self._through_http(body)["tiers"]
             self.assertEqual(len(wire), len(cores))
+            seen_match = set()
             for core, entry in zip(cores, wire):
+                seen_match.add(entry["handler_match"])
                 self.assertEqual(sorted(entry), sorted(("tier",) + self.WIRE_FIELDS))
                 self.assertNotIn("rationale", entry)
                 self.assertEqual(entry["tier"], core["tier"])
                 for field in self.WIRE_FIELDS:
+                    self.assertIs(type(entry[field]), type(core[field]), field)
                     self.assertEqual(entry[field], core[field], field)
+            all_matches.update(seen_match)
+        self.assertEqual(all_matches, {None, True, False})
 
     def test_refusal_on_the_wire_names_the_field(self):
         from service import app
@@ -550,6 +619,7 @@ class Projection(unittest.TestCase):
             self.assertEqual(payload["vram_table_corpus"], json.load(handle)["corpus"])
         table = ps.load_handler_history()
         self.assertEqual(payload["handler_tree"], table["commits"][table["newest"]])
+        self.assertEqual(payload["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
         self.assertEqual(payload["handler_history_newest"], table["newest"])
 
 

@@ -80,6 +80,9 @@ def make_handler(commit):
 
 def main():
     commit = ps.service_commit(os.environ)
+    # **Both committed tables load before the port opens**, so a broken deploy fails to start
+    # instead of answering 500 to every request.
+    ps.version(commit)
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(commit))
     print("cf-planner on :{} commit={}".format(port, commit), flush=True)
