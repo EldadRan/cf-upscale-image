@@ -16,5 +16,7 @@ HANDLER = os.path.abspath(os.environ.get("CF_PLANNER_HANDLER") or os.path.join(
 if not os.path.isfile(os.path.join(HANDLER, "estimator.py")):
     raise ImportError("no worker handler at {} (estimator.py missing)".format(HANDLER))
 
-if HANDLER not in sys.path:
-    sys.path.insert(0, HANDLER)
+# **First, even where it is already on the path** — behind another handler tree it would lose.
+while HANDLER in sys.path:
+    sys.path.remove(HANDLER)
+sys.path.insert(0, HANDLER)

@@ -36,6 +36,15 @@ with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as _handle
     TABLE = json.load(_handle)["cards"]
 
 
+#: Wire field -> the rationale key it is the worker's output of.
+PROJECTED_FROM_RATIONALE = (
+    ("predicted_seconds", "predicted_seconds"), ("residency", "residency"),
+    ("best_window", "window"), ("ideal_window", "ideal_window"),
+    ("binding_phase", "binding_phase"), ("anchored", "anchored"),
+    ("prediction_basis", "prediction_basis"),
+)
+
+
 def job(**overrides):
     body = {"source_width": 1920, "source_height": 1080, "frames": 90, "is_still": False,
             "target_short_edge_px": 1480, "tile_quality": "default", "schedule": "max_window"}
@@ -102,6 +111,10 @@ class Parity(unittest.TestCase):
             len(compared), list(self.HANDLER_ADDED), only_fresh))
         self.assertEqual(core["predicted_seconds"], 897.1)
         self.assertEqual(recorded["predicted_seconds"], 897.1)
+        # Every planning field the wire carries is the worker's own, key for key (review F2, F3).
+        for field, key in PROJECTED_FROM_RATIONALE:
+            self.assertEqual(core[field], recorded[key], field)
+        self.assertEqual(core["prediction_basis"], "measured")
 
 
 class Residency(unittest.TestCase):
@@ -116,6 +129,32 @@ class Residency(unittest.TestCase):
         self.assertNotEqual(verdict["action"], "plan")
         self.assertEqual(core["residency"], "route_up")
         self.assertEqual(core["residency"], verdict["residency"])
+        self.assertEqual(estimator._refusal_text(verdict["reason"]), core["reason"])
+
+    def test_diverging_verdict_is_an_error(self):
+        # If planner.plan refuses for a different reason than estimator.plan did, the residency
+        # read is not from the same verdict, and the service must not answer (review F4).
+        # Only the service's own call diverges: estimator.plan's internal planner calls are real.
+        real_plan, real_estimate = planner.plan, estimator.plan
+        state = {"estimator_done": False}
+
+        def estimate_then_flag(*args, **kwargs):
+            try:
+                return real_estimate(*args, **kwargs)
+            finally:
+                state["estimator_done"] = True
+
+        def other_reason(*args, **kwargs):
+            answer = real_plan(*args, **kwargs)
+            return dict(answer, reason="a different constraint") if state["estimator_done"] \
+                else answer
+
+        planner.plan, estimator.plan = other_reason, estimate_then_flag
+        try:
+            with self.assertRaises(RuntimeError):
+                one(request(tiers=[tier(host_ram_gb=8.0)]))
+        finally:
+            planner.plan, estimator.plan = real_plan, real_estimate
 
     def test_vram_refusal_carries_the_verdicts_residency(self):
         # An 8K target on the A40's table figures: the VRAM floor refuses, and that terminal
@@ -126,6 +165,7 @@ class Residency(unittest.TestCase):
         self.assertNotEqual(verdict["action"], "plan")
         self.assertNotIn("residency", verdict)
         self.assertIsNone(core["residency"])
+        self.assertEqual(estimator._refusal_text(verdict["reason"]), core["reason"])
 
     def test_fit_residency_from_the_plan(self):
         core = one(request())
@@ -149,6 +189,31 @@ class NoTorch(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("loaded-heavy []", out.stdout)
         self.assertIn("torch-installed False", out.stdout)
+
+    def test_worker_is_the_resolved_handler(self):
+        from service import worker_path
+        for module in (estimator, planner):
+            self.assertEqual(os.path.dirname(os.path.abspath(module.__file__)),
+                             worker_path.HANDLER, module.__name__)
+
+    def test_resolved_handler_wins_over_an_earlier_path_entry(self):
+        import shutil
+        import tempfile
+        decoy = tempfile.mkdtemp(prefix="decoy_handler_")
+        probe = (
+            "import sys; sys.path.insert(0, {decoy!r}); sys.path.insert(1, {handler!r})\n"
+            "sys.path.insert(0, {root!r})\n"
+            "import service.planner_service, estimator\n"
+            "print(estimator.__file__)\n"
+        ).format(decoy=decoy, handler=os.path.join(REPO_ROOT, "handler"), root=REPO_ROOT)
+        try:
+            with open(os.path.join(decoy, "estimator.py"), "w") as handle:
+                handle.write("DECOY = True\n")
+            out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+        finally:
+            shutil.rmtree(decoy)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(os.path.dirname(out.stdout.strip()), os.path.join(REPO_ROOT, "handler"))
 
     def test_dependency_list_names_no_handler_requirements(self):
         with open(os.path.join(SERVICE, "requirements.txt"), encoding="utf-8") as handle:
@@ -219,6 +284,13 @@ class VramOrder(unittest.TestCase):
         self.assertEqual(core["vram_source"], "last_run")
         self.assertEqual(core["hardware_used"]["vram_free_gb"], 47.05)
 
+    def test_basis_not_rewritten_off_nearest(self):
+        for t in (tier(), tier(idle=dict(self.IDLE)), tier(last_run=dict(self.LAST))):
+            core = one(request(tiers=[t]))
+            self.assertNotEqual(core["vram_source"], "nearest_memory")
+            self.assertEqual(core["prediction_basis"], core["rationale"]["prediction_basis"])
+            self.assertEqual(core["prediction_basis"], "measured")
+
     def test_last_run_before_table(self):
         core = one(request(tiers=[tier(last_run=dict(self.LAST))]))
         self.assertEqual(core["vram_source"], "last_run")
@@ -244,6 +316,15 @@ class VramOrder(unittest.TestCase):
         self.assertEqual(core["hardware_used"]["host_ram_gb"], 51.22)
 
 
+class TableGenerated(unittest.TestCase):
+    """vram_table.json is the generator's output over the corpus, never hand-edited (§4a)."""
+
+    def test_committed_table_matches_corpus(self):
+        out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_vram_table.py"),
+                              "--check", RUNS], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+
 class Nearest(unittest.TestCase):
     """An unmeasured gpu_name resolves to the nearest measured card by memory."""
 
@@ -256,8 +337,8 @@ class Nearest(unittest.TestCase):
         self.assertEqual(core["resolved_from"], {"card": self.MIG, "measured": "NVIDIA A40"})
         self.assertEqual(core["hardware_used"]["gpu_name"], "NVIDIA A40")
         self.assertEqual(core["hardware_used"]["vram_free_gb"], TABLE["NVIDIA A40"]["vram_free_gb"])
-        self.assertIn(core["rationale"].get("prediction_basis"), ("measured", "borrowed"))
-        self.assertNotEqual(core["prediction_basis"], "measured")
+        self.assertEqual(core["rationale"]["prediction_basis"], "measured")
+        self.assertEqual(core["prediction_basis"], "borrowed")
 
     def test_tie_takes_lower_memory(self):
         low, high = TABLE["NVIDIA A40"]["vram_total_gb"], TABLE[
@@ -268,6 +349,19 @@ class Nearest(unittest.TestCase):
                      TABLE["NVIDIA RTX PRO 6000 Blackwell Server Edition"]}
         chosen = ps.nearest_measured(midpoint, table)
         self.assertEqual(chosen, "NVIDIA A40")
+
+    def test_idle_card_with_own_total_resolves(self):
+        idle = {"gpu_name": self.MIG, "vram_total_gb": 94.0}
+        core = one(request(tiers=[tier(idle=idle)]))
+        self.assertEqual(core["vram_source"], "nearest_memory")
+        self.assertEqual(core["resolved_from"]["measured"],
+                         "NVIDIA RTX PRO 6000 Blackwell Server Edition")
+
+    def test_duplicate_name_nominal_is_the_worst_entry(self):
+        cards = [{"gpu_name": self.MIG, "vram_total_gb": 94.0},
+                 {"gpu_name": self.MIG, "vram_total_gb": 44.5}]
+        core = one(request(tiers=[tier(cards=cards)]))
+        self.assertEqual(core["resolved_from"]["measured"], "NVIDIA A40")
 
     def test_idle_card_without_nominal_refused(self):
         idle = {"gpu_name": self.MIG}

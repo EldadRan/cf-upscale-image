@@ -12,12 +12,17 @@ import json
 import os
 import re
 
-from service import worker_path  # noqa: F401  (puts handler/ on the import path)
+from service import worker_path  # puts handler/ first on the import path
 
 import estimator  # noqa: E402
 import planner  # noqa: E402
 import validation  # noqa: E402
 from errors import CAPACITY_EXCEEDED, WorkerError  # noqa: E402
+
+for _module in (estimator, planner, validation):
+    if os.path.dirname(os.path.abspath(_module.__file__)) != worker_path.HANDLER:
+        raise ImportError("{} loaded from {}, not the resolved worker at {}".format(
+            _module.__name__, _module.__file__, worker_path.HANDLER))
 
 VRAM_TABLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vram_table.json")
 
@@ -218,10 +223,15 @@ def resolve_hardware(tier, table_cards, index):
 
     if idle is not None:
         card, card_source = idle["gpu_name"], "idle"
+        # Nominal memory from cards[] (the least, where the name repeats), else the idle
+        # worker's own total; neither is a refusal, but only if resolution gets that far (§4).
+        named = [c["vram_total_gb"] for c in tier["cards"] if c["gpu_name"] == card]
+        nominal = min(named) if named else idle.get("vram_total_gb")
     else:
-        # The first card holding the least nominal memory, in the order CF sent.
-        card = min(tier["cards"], key=lambda c: c["vram_total_gb"])["gpu_name"]
-        card_source = "worst_card"
+        # The first card holding the least nominal memory, in the order CF sent. Its nominal is
+        # THAT entry's, never another entry's under the same name.
+        worst = min(tier["cards"], key=lambda c: c["vram_total_gb"])
+        card, nominal, card_source = worst["gpu_name"], worst["vram_total_gb"], "worst_card"
 
     resolved_from = None
     if card_source == "idle" and _both(idle):
@@ -234,7 +244,6 @@ def resolve_hardware(tier, table_cards, index):
         planned_name, vram_source = card, "table"
         total, free = table_cards[card]["vram_total_gb"], table_cards[card]["vram_free_gb"]
     else:
-        nominal = next((c["vram_total_gb"] for c in tier["cards"] if c["gpu_name"] == card), None)
         if nominal is None:
             raise Refusal("{}.idle.gpu_name".format(where),
                           "{!r} is not in cards[] and carries no VRAM of its own, so it has no "
@@ -288,8 +297,11 @@ def _plan_tier(job, resolved):
             usable_gb=estimator._usable_vram(snapshot), host_ram_gb=snapshot.get("host_ram_gb"),
             tile_quality=job["tile_quality"], schedule=job["schedule"],
             gpu_name=snapshot.get("gpu_name"))
-        if verdict.get("action") == "plan":
-            raise RuntimeError("estimator.plan refused and planner.plan planned the same inputs")
+        # **The same verdict, checked rather than assumed** — a second call that refused on another
+        # constraint would pair this refusal's reason with that one's residency.
+        if (verdict.get("action") == "plan"
+                or estimator._refusal_text(verdict.get("reason") or "") != refusal.message):
+            raise RuntimeError("planner.plan did not reach the verdict estimator.plan refused on")
         return {
             "fits": False, "predicted_seconds": None, "reason": refusal.message,
             "residency": verdict.get("residency"),
