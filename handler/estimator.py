@@ -742,6 +742,25 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
             "strip is either inside the rate or outside it depending on nothing a reader can see")
     else:
         rationale["rows_unconvertible"] = 0
+
+    # **A CARD THE TABLE HAS NEVER SEEN GETS NO RATE — A NAMED ABSENCE, NEVER A BARE NULL**
+    # (J5, ruled 2026-09-18: ABSENT BEATS WRONG). The fallback below would price it at the
+    # slowest rate measured on OTHER cards — safe against our own data, and optimistic exactly
+    # when the card is slower than anything measured, which is the MIG partition RunPod placed on
+    # low. **Only a NAMED card absent from the whole table**: a card measured at other sizes still
+    # borrows within its pixel window and says so, and an unreadable card (no name) keeps the
+    # path it had. The progress ETA's observed-rate fallback is what makes absence affordable, and
+    # the first delivered run on the card writes the rows that end it.
+    running_on = snapshot.get("gpu_name")
+    measured_on = sorted({r.get("gpu_name") for r in calibration if r.get("gpu_name")})
+    if running_on and running_on not in measured_on:
+        rationale["timing_unavailable"] = {
+            "running_on": running_on,
+            "cards_with_rows": measured_on,
+            "why": ("no calibration row was measured on this card; another card's rate is not "
+                    "this card's, so no prediction is made rather than a borrowed one"),
+        }
+        return
     if not comparable:
         per_frame = _approximate_seconds_per_frame(
             calibration, chosen["name"], output_pixels, job.get("estimated_frames"))
@@ -756,7 +775,6 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     # inheriting another's rate accepts a job it cannot finish and is hard-killed at
     # `executionTimeout` with every second billed — which is the failure the deadline factor
     # exists to prevent, and which is calibrated per card.
-    running_on = snapshot.get("gpu_name")
     same_card = [r for r in comparable if running_on and r.get("gpu_name") == running_on]
     timing_rows = same_card or comparable
     rows = [r for r in timing_rows if r.get("output_pixels")]
