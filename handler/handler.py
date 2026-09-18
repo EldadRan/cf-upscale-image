@@ -863,6 +863,14 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         # Only meaningful for a container that has a moov atom to move.
         "faststart": probe.is_faststart(master_path) if not still else None,
         "channels": 4 if keep_alpha else 3,
+        # **J6: what was APPLIED, beside what was measured** — the writer's own encode and the
+        # plan's tiling. In the manifest too, which stores this block; its request-valued crf,
+        # tile_quality and schedule stay, because what was ASKED is a different fact. Null on a
+        # still, as codec_tag_string is.
+        # The tiling is the planner's own resolved value (estimator.plan's rationale), which is
+        # what priced and built the decode grid; the OOM ladder holds it fixed.
+        "encode": (dict(result["encode"], tile_quality=(rationale or {}).get("tile_quality"))
+                   if result.get("encode") else None),
     })
 
     # ── derives ──────────────────────────────────────────────────────────────────────────────
@@ -2289,6 +2297,10 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # the writer after its context manager has exited, which is where the drain sampling
             # finishes; reading it earlier would return the fed part of the encode only.
             "encoder_peak_rss_gb": getattr(writer_cm, "encoder_peak_rss_gb", None),
+            # **J6: the encode the writer APPLIED**, read off the writer that built the ffmpeg
+            # command. A still's writer builds no video command and carries none.
+            "encode": (writer_cm.applied_encode()
+                       if hasattr(writer_cm, "applied_encode") else None),
             "actual_size": getattr(pipeline.run, "last_output_size", None)}
 
 

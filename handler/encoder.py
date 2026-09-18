@@ -428,6 +428,14 @@ class MasterWriter:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))
         self.frames_written += 1
 
+    def applied_encode(self):
+        """**What this writer gave ffmpeg** (J6) — the same fields `_build_command` reads, read
+        off the writer that built the command and never reconstructed from the request. A
+        caller can confirm what it asked for from its own request; this is what it GOT."""
+        return {"codec": self._codec, "preset": self._preset, "crf": self._crf,
+                "keyframes": self._keyframes, "head_keyframes": bool(self._head_keyframes),
+                "x265_params": self.x265_params_applied}
+
     def _x265_value(self):
         """`pools=4:frame-threads=16` from the levers that are set, or None — and None whenever
         the codec is not h265, so no lever can reach an x264 command. **Absent means today**:
