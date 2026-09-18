@@ -413,7 +413,11 @@ class MaxTarget(unittest.TestCase):
         for listed in cases:
             estimator._terminal_options = lambda *a, **k: [dict(o) for o in listed]
             try:
-                with self.assertRaises(RuntimeError, msg=repr(listed)):
+                # **Its own raise, not any RuntimeError** (review, P2): the verdict check and
+                # TableUnusable are RuntimeErrors too.
+                with self.assertRaisesRegex(
+                        RuntimeError, "reduce_target_resolution|re-derive|changed shape",
+                        msg=repr(listed)):
                     answer(request(job(target_short_edge_px=4320)))
             finally:
                 estimator._terminal_options = saved
@@ -431,7 +435,7 @@ class MaxTarget(unittest.TestCase):
                 raise
         estimator.plan = stripped
         try:
-            with self.assertRaises(RuntimeError):
+            with self.assertRaisesRegex(RuntimeError, "carries no options list"):
                 answer(request(job(target_short_edge_px=4320)))
         finally:
             estimator.plan = real
