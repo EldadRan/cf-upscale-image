@@ -436,7 +436,18 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
     # runs dry the OTHER grid is tried — an assumption running out is not the hardware running
     # out. A NAMED phase never falls through: an indicted sampler stays terminal at w1.
     named_phase = phase
-    phase_assumed = frames == 1 and phase not in planner.PHASE_LEVER
+    # **Three states, recorded on every walk** (ruled on Q-a): the phase was NAMED by a failure
+    # line, INFERRED from the last banner, or ABSENT. phasewatch.blame says an inference is
+    # "wrong for a failure arriving between phases", and for a still stepping the window on one
+    # terminates the job — so FOR A STILL anything but a named phase is an assumption and tries
+    # the grids. A video is unchanged: there an inferred sampler's window step is real.
+    if phase not in planner.PHASE_LEVER:
+        phase_confidence = "absent"
+    elif (shortfall or {}).get("confidence") == "named":
+        phase_confidence = "named"
+    else:
+        phase_confidence = "inferred"
+    phase_assumed = frames == 1 and phase_confidence != "named"
     tried = []
     for candidate in (("vae_decode", "vae_encode") if phase_assumed else (phase,)):
         tried.append(candidate)
@@ -461,6 +472,7 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
         # corpus can tell a guessed walk from a measured one.
         "bound_gb": round(usable, 2), "phase": named_phase, "lever": lever, "basis": basis,
         "phase_assumed": phase_assumed,
+        "phase_confidence": phase_confidence,
         "levers_tried": [planner.PHASE_LEVER[c] for c in tried] if phase_assumed else None,
         "exited_sideways": lever in ("decode_grid", "encode_grid"),
         "carried_free_levers": ("swap_io_components"

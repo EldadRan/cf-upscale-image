@@ -1291,6 +1291,8 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             # must tell a walk on an assumed phase from one on a measured phase.
             if (walk or {}).get("phase_assumed"):
                 shortfall = dict(shortfall or {}, phase_assumed=True)
+            if (walk or {}).get("phase_confidence"):
+                shortfall = dict(shortfall or {}, phase_confidence=walk["phase_confidence"])
             refusal = _refuse_retry(request, plan, nxt_row, shortfall, machine, source_path,
                                     exc, estimated_frames=estimated_frames,
                                     # **Told, not counted** (W2 Q2): the reason the
@@ -1424,12 +1426,13 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
         # **A still is never told about a window** (W2 R1(a)). It has no temporal context, so a
         # window floor is a claim it cannot have. It hears what was tried and what is terminal:
         # the walk's own reason, which names the lever and why it cannot move.
+        # **In the still's own words, from the lever — never the planner's reason text**, which
+        # argues in windows, chunks and frame counts (ruled on Q-b): a still has no temporal
+        # context, and a sentence that gives it one is the defect whatever its wording.
         return WorkerError(
             errors.CAPACITY_EXCEEDED,
             "out of memory on a still, and this card has no configuration left for it: {}. A "
-            "larger card is the remedy.".format(
-                (walk or {}).get("reason") or (walk or {}).get("basis")
-                or "no smaller configuration of this image fits"),
+            "larger card is the remedy.".format(_still_terminal_reason(walk)),
             remedy=errors.Remedy.LARGER_GPU,
             shortfall=shortfall,
         )
@@ -1500,6 +1503,22 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
 #: each step is a real quality loss, and the levers above it are cheaper. Not reset by progress --
 #: see `_Ratchet.__init__`.
 WINDOW_STEP_BUDGET = 3
+
+def _still_terminal_reason(walk):
+    """Why a still is terminal, in terms a still has: what was tried, nothing temporal."""
+    walk = walk or {}
+    if walk.get("phase_assumed"):
+        return ("the phase of this OOM was {}, so the decode and encode tiles were both tried "
+                "as an assumption, and no smaller tile of either fits".format(
+                    "never named" if walk.get("phase_confidence") == "absent"
+                    else "only inferred, not named"))
+    return {
+        "window": "the sampler needs more memory than this card has, at its smallest setting",
+        "chunk": "the post-processing step has no smaller setting that fits",
+        "decode_grid": "no smaller decode tile fits",
+        "encode_grid": "no smaller encode tile fits",
+    }.get(walk.get("lever"), "no smaller configuration of this image fits")
+
 
 def _ratchet_stop_reason(published):
     """The reason the stream's ratchet gave up, from its `stopped` record, or None if it did not
