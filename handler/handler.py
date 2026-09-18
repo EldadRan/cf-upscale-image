@@ -874,15 +874,16 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     progress.phase("upload", pct=90, force=True)
     client = storage.client_for(request["output"])
     artefacts = []
+    # **Probed BEFORE the upload** (R5, review): the master is complete on disk once the model
+    # has returned, and J13a's tag has to reach the record even when the upload is what fails —
+    # that record is the only artefact such a run leaves.
+    measured = probe.probe_output(master_path)
+    if trace is not None and trace.get("output") is not None:
+        trace["output"]["codec_tag_string"] = measured.get("codec_tag_string")
     master_key = storage.upload(client, request["output"], master, master_path,
                                 keys.content_type(master), transfers=transfers)
     artefacts.append(master)
 
-    measured = probe.probe_output(master_path)
-    # **R5: J13a's tag reaches the record too**, and it can only be read off the master once it
-    # exists, so it lands on the trace here rather than with the rest of the output block above.
-    if trace is not None and trace.get("output") is not None:
-        trace["output"]["codec_tag_string"] = measured.get("codec_tag_string")
     output_entry = dict(measured)
     output_entry.update({
         "key": master_key,
