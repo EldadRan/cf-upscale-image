@@ -621,8 +621,6 @@ def _validate_output(output):
         _as_str(_require(output, field, "in 'output'"), "output." + field)
     if output.get("session_token") is not None:
         _as_str(output["session_token"], "output.session_token")
-    if output.get("name") is not None:
-        _as_str(output["name"], "output.name")
     prefix = output["prefix"]
     # Every file goes under the prefix and the keys are the worker's within it. A prefix that
     # does not end in `/` would make `prefix + name` a sibling of the prefix rather than a child
