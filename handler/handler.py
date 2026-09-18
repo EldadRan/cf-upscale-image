@@ -1292,7 +1292,11 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                                     # **Told, not counted** (W2 Q2): the reason the
                                     # ratchet published, not a count of its steps.
                                     window_steps_spent=_ratchet_stop_reason(ratcheted)
-                                    == "window_step_budget")
+                                    == "window_step_budget",
+                                    # Steps taken and NO stop reason: the ratchet did not give
+                                    # up — the OOM came from outside its reach (review, W2 Q2).
+                                    recovered_in_place=bool(_real_steps(ratcheted))
+                                    and _ratchet_stop_reason(ratcheted) is None)
             if refusal is not None:
                 raise refusal
 
@@ -1357,7 +1361,7 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
 
 
 def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
-                  estimated_frames=None, window_steps_spent=False):
+                  estimated_frames=None, window_steps_spent=False, recovered_in_place=False):
     """Whether to give up, and **why, in a form CF can act on**.
 
     "Did not retry" is not a result. The question CF is actually asking is whether sending this
@@ -1393,6 +1397,20 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
             "out of memory at a window of {}; allow_oom_retry is false so nothing was "
             "re-attempted".format(_effective_window(plan)),
             remedy=errors.Remedy.LARGER_GPU if shortfall else errors.Remedy.RETRY_SAME,
+            shortfall=shortfall,
+        )
+
+    if next_row is None and recovered_in_place:
+        # **Neither the budget nor the floor** (review, W2 Q2): the stream recovered in place, did
+        # not give up, and an OOM arrived outside the ratchet's reach. Claiming "nothing above the
+        # floor fits" would be false — the stream had just run above it. Same code and remedy.
+        return WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "out of memory after the stream had already recovered in place mid-clip, outside "
+            "the recovery's reach, so the clip was not restarted: frames were already written, "
+            "and restarting would re-run them. Nothing here establishes what does or does not "
+            "fit; a larger card is the remedy that needs no second pass.",
+            remedy=errors.Remedy.LARGER_GPU,
             shortfall=shortfall,
         )
 
@@ -1463,11 +1481,6 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
 #: see `_Ratchet.__init__`.
 WINDOW_STEP_BUDGET = 3
 
-#: The step kinds `_Ratchet` counts against `WINDOW_STEP_BUDGET`. `same_window` is the free
-#: in-place retry and is not a window step.
-_BUDGETED_STEPS = ("replan", "step_down")
-
-
 def _ratchet_stop_reason(published):
     """The reason the stream's ratchet gave up, from its `stopped` record, or None if it did not
     stop — an OOM that arrived after the stream is not a ratchet stop and says neither (W2 Q2)."""
@@ -1478,12 +1491,6 @@ def _ratchet_stop_reason(published):
 def _real_steps(published):
     """The steps a stream actually took — a `stopped` record is not a step."""
     return [r for r in published or [] if r.get("kind") != "stopped"]
-
-
-def _window_steps_spent(steps):
-    """Whether a ratchet's published steps used its whole window-step budget (J9)."""
-    return sum(1 for step in steps or [] if step.get("kind") in _BUDGETED_STEPS) \
-        >= WINDOW_STEP_BUDGET
 
 
 def _first_phase_closes_the_strip(on_batch, into=None):
