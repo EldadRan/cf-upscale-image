@@ -538,6 +538,12 @@ def plan(job, snapshot, calibration=None, force_rung=None):
         index = force_rung
         chosen = dict(RUNGS[index])
         chosen["target_short_edge_px"] = job["target_short_edge_px"]
+        # **The tiling mode, as `config_of_plan` sets it** (W4 R2). This branch skips it, so W2
+        # Q6's fix never reached a forced run: its attempts recorded tile_quality null, and those
+        # are calibration runs — the records most read as measurements. The rung's own tile sizes
+        # stand; this is the mode the job was planned under, which the rationale already carries
+        # and an OOM re-plan of this config reads back through `plan_of_config`.
+        chosen["tile_quality"] = tile_quality
         answer = None
         why = "forced to rung '{}' — pinned for calibration, not chosen from the formulas".format(
             RUNGS[index]["name"])
