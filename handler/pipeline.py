@@ -410,6 +410,12 @@ def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alph
     a chunk holding the whole clip is the designed normal and the per-chunk cadence reported
     `0/N` for the entire run (F-2026-08-18-11).
     """
+    # **This run owns the ratchet's list for the whole call** (J9, ruled 2026-09-18). It was
+    # published only on success, so the OOM path read the last SUCCESSFUL run's steps: a fresh
+    # worker whose stream recovered in place restarted the clip, and a warm one read another
+    # job's steps. Cleared here, before anything that can raise, and published in the finally.
+    _stream.last_ratchet = []
+    run.last_ratchet = []
     # **A chunk size of zero is the OOM**, not a default. Upstream reads 0 as "load every frame
     # at once", which is what makes a long clip fail on a card that would have handled it in
     # pieces. The estimator always chooses a positive value; this refuses rather than falling
@@ -491,9 +497,11 @@ def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alph
         # frame the OOM happened on — and it would answer "yes, plenty", failing a job that
         # delivered every frame.
         run.last_capture = getattr(_stream, "last_capture", capture)
-        run.last_ratchet = list(getattr(_stream, "last_ratchet", []))
         return written
     finally:
+        # **On the failure path too** (J9): the OOM that escapes a spent ratchet is the case
+        # that most needs this run's steps.
+        run.last_ratchet = list(getattr(_stream, "last_ratchet", []))
         if original_reader is not None:
             cli._read_frames_from_cap = original_reader
         colorfix.uninstall(colour_restore)

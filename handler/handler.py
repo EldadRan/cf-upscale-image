@@ -1075,6 +1075,9 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
         # never compare equal — and a counter would collide across jobs on a warm worker, which
         # is exactly the boundary this exists to catch.
         pipeline.run.attempt_token = object()
+        # **A new attempt begins with no ratchet steps** (J9): an attempt that fails before
+        # `pipeline.run` would otherwise read the previous attempt's or job's list.
+        pipeline.run.last_ratchet = []
         # **`batch_size` and the window it implies, because neither has ever left this process.**
         # The attempt carried `chunk_size` alone, so the temporal window -- `min(batch, chunk)`,
         # the dominant quality lever on video -- was not derivable from any response. A reader
