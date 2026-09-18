@@ -1286,6 +1286,9 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                     # stops at 0 or below, and the shortfall keeps the true figure.
                     "run.".format(spent, last_attempt_s, max(0.0, stop_at_s),
                                   min(estimator.WRITE_RESERVE_S, budget_s), budget_s),
+                    # **Every deadline_exceeded carries it** (api.md §4d, J8): the one remedy CF
+                    # can grant by resending, and this refusal reached CF without it.
+                    remedy=errors.Remedy.LONGER_DEADLINE,
                     shortfall=dict(shortfall or {},
                                    seconds_spent=round(spent, 1),
                                    seconds_per_attempt=round(last_attempt_s, 1),
