@@ -315,7 +315,12 @@ def plan_of_config(config, job):
         "enc_tile": enc_tile,
         "dec": _grid_name(out_w, out_h, dec_tile, 128) if dec_tile else "untiled",
         "dec_tile": dec_tile,
-        "tile_quality": config.get("tile_quality", "default"),
+        # **A forced rung's `"rung"` re-plans as `default`** (W4 R2): it names the grid that ran,
+        # not a mode the planner can honour, and `planner.correct` copies this onto the config it
+        # returns — which the planner, not a rung, then decides. Default is what a forced config
+        # re-planned under before R2, when its tiling read null.
+        "tile_quality": ("default" if config.get("tile_quality") == "rung"
+                         else config.get("tile_quality", "default")),
         "prices": {
             "vae_encode": round(planner.encode_price(enc_mp, r_mp, window), 2),
             "dit_sample": round(planner.dit_price(r_mp, window), 2),

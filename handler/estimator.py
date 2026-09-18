@@ -218,7 +218,16 @@ DEFAULT_TILE_QUALITY = "default"
 
 
 def _row_tile_quality(row):
-    return row.get("tile_quality") or DEFAULT_TILE_QUALITY
+    """The tiling a row is SELECTED under — a selection key, not a claim about its grid.
+
+    **A forced rung's `"rung"` selects as `default`** (W4 R2, option (b) ruled 2026-09-18). Its
+    grid came from `RUNGS[index]` and may or may not be the default grid; reading it as `default`
+    here is the STATUS QUO carried forward deliberately — a forced row banked null before R2 and
+    null already read as `default` — NOT an assertion that the two grids match. Forced runs built
+    23 of the table's 44 rows, so leaving them unmatched would quietly retire them.
+    """
+    tiling = row.get("tile_quality") or DEFAULT_TILE_QUALITY
+    return DEFAULT_TILE_QUALITY if tiling == FORCED_TILING else tiling
 
 
 #: **A row banked as PURE RECORD is not a prediction** (CF, 2026-08-28; `time-model.md` §0c). Two
@@ -380,6 +389,11 @@ PLATFORM_EXECUTION_CEILING_MS = 604_800_000
 WRITE_RESERVE_S = 60
 
 
+#: **The `tile_quality` a forced rung's config carries** (W4 R2): the rung's own grid ran, so
+#: neither mode is true of it. Debug-only — `force_rung` is gated.
+FORCED_TILING = "rung"
+
+
 def stop_at_seconds(budget_s):
     """Where the worker stops, from handler entry: the budget less the write reserve.
 
@@ -538,12 +552,12 @@ def plan(job, snapshot, calibration=None, force_rung=None):
         index = force_rung
         chosen = dict(RUNGS[index])
         chosen["target_short_edge_px"] = job["target_short_edge_px"]
-        # **The tiling mode, as `config_of_plan` sets it** (W4 R2). This branch skips it, so W2
-        # Q6's fix never reached a forced run: its attempts recorded tile_quality null, and those
-        # are calibration runs — the records most read as measurements. The rung's own tile sizes
-        # stand; this is the mode the job was planned under, which the rationale already carries
-        # and an OOM re-plan of this config reads back through `plan_of_config`.
-        chosen["tile_quality"] = tile_quality
+        # **`"rung"`: the tiling that RAN was the rung's, not a mode** (W4 R2, F2 ruled
+        # 2026-09-18). This branch skips `config_of_plan`, so its attempts recorded null — but
+        # the asked mode would be false too: `RUNGS[index]` fixes the grid and ignores it. A
+        # distinct value says a rung decided it and cannot be read as either mode.
+        # `solver.plan_of_config` prices it as `default` on a re-plan.
+        chosen["tile_quality"] = FORCED_TILING
         answer = None
         why = "forced to rung '{}' — pinned for calibration, not chosen from the formulas".format(
             RUNGS[index]["name"])
