@@ -312,7 +312,9 @@ def _codec_tag(video):
     `[0][0][0][0]`** — a PNG reports exactly that — and a still's output block should not carry
     a string that reads like a value (review, J13)."""
     tag = video.get("codec_tag_string")
-    return None if not tag or tag.startswith("[") else tag
+    # **Exactly the all-zero spelling** (review, J13): an MPEG-TS stream's `[27][0][0][0]` is a real
+    # tag in ffprobe's bracket notation, and must not read as "none".
+    return None if not tag or tag == "[0][0][0][0]" else tag
 
 
 def is_faststart(path):
