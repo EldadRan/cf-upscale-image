@@ -422,7 +422,11 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     estimated_frames = None
     if source["duration_s"] and source["fps"]:
         estimated_frames = int(round(source["duration_s"] * source["fps"]))
-    progress = progress_module.Progress(job=job, estimated_frames=estimated_frames,
+    # **A still is one frame for the ETA** (J10): Progress has no ETA without a count, and a
+    # still's container has no duration to count from. Time only — `estimated_frames` itself
+    # stays the metadata's None for every other reader.
+    progress = progress_module.Progress(job=job,
+                                        estimated_frames=1 if still else estimated_frames,
                                         debug=request.get("debug"))
 
     # **An exact canvas changes what the model is asked for, not just what is delivered.** The

@@ -748,8 +748,8 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
         if per_frame is not None:
             rationale["seconds_per_frame"] = round(per_frame, 4)
             rationale["prediction_basis"] = "approximate"
-            if job.get("estimated_frames"):
-                rationale["predicted_seconds"] = round(per_frame * job["estimated_frames"], 1)
+            if _timed_frames(job):
+                rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
         return
 
     # **Time is matched on the card and memory never was.** A 1.5x slower card silently
@@ -811,8 +811,20 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
             "running_on": running_on,
             "rows_measured_on": sorted({r["gpu_name"] for r in rows if r.get("gpu_name")}),
         }
-    if job.get("estimated_frames"):
-        rationale["predicted_seconds"] = round(per_frame * job["estimated_frames"], 1)
+    if _timed_frames(job):
+        rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
+
+
+def _timed_frames(job):
+    """How many frames the TIME prediction multiplies by (J10, ruled 2026-09-18).
+
+    **A still is one frame — for time only.** Its container carries no duration or fps, so
+    `estimated_frames` is None and a still got no prediction on any run, though its rate is fine.
+    **Keyed on `still`, never a bare `or 1`**: a durationless VIDEO stays unpredicted rather than
+    being priced as one frame. Nothing else reads this — the job's `estimated_frames`, the rate
+    selection, the frames refusal, the solver and the record all keep the metadata's None.
+    """
+    return job.get("estimated_frames") or (1 if job.get("still") else None)
 
 
 #: How far past the remaining deadline an *approximate* prediction has to reach before it refuses.
