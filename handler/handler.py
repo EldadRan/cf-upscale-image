@@ -1246,7 +1246,8 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                     relax_swap=not request.get("pin"))
             record["walk"] = walk
             refusal = _refuse_retry(request, plan, nxt_row, shortfall, machine, source_path,
-                                    exc, estimated_frames=estimated_frames)
+                                    exc, estimated_frames=estimated_frames,
+                                    window_steps_spent=_window_steps_spent(ratcheted))
             if refusal is not None:
                 raise refusal
 
@@ -1311,7 +1312,7 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
 
 
 def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
-                  estimated_frames=None):
+                  estimated_frames=None, window_steps_spent=False):
     """Whether to give up, and **why, in a form CF can act on**.
 
     "Did not retry" is not a result. The question CF is actually asking is whether sending this
@@ -1347,6 +1348,21 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
             "out of memory at a window of {}; allow_oom_retry is false so nothing was "
             "re-attempted".format(_effective_window(plan)),
             remedy=errors.Remedy.LARGER_GPU if shortfall else errors.Remedy.RETRY_SAME,
+            shortfall=shortfall,
+        )
+
+    if next_row is None and window_steps_spent:
+        # **The budget ran out, not the configurations** (J9, `api.md` §4e). The stream stops
+        # after `WINDOW_STEP_BUDGET` window steps whatever still fits, because each is a real
+        # quality loss — so "nothing fits above the floor" would be false here. Same code and
+        # remedy by ruling; only the sentence is different, and true.
+        return WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "out of memory, and the window was already narrowed {} times mid-clip — the most "
+            "this worker steps before stopping, because each step is a real loss of quality. "
+            "Configurations above the quality floor were not all tried; a larger card is the "
+            "remedy that needs none of them.".format(WINDOW_STEP_BUDGET),
+            remedy=errors.Remedy.LARGER_GPU,
             shortfall=shortfall,
         )
 
@@ -1397,6 +1413,16 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
 #: each step is a real quality loss, and the levers above it are cheaper. Not reset by progress --
 #: see `_Ratchet.__init__`.
 WINDOW_STEP_BUDGET = 3
+
+#: The step kinds `_Ratchet` counts against `WINDOW_STEP_BUDGET`. `same_window` is the free
+#: in-place retry and is not a window step.
+_BUDGETED_STEPS = ("replan", "step_down")
+
+
+def _window_steps_spent(steps):
+    """Whether a ratchet's published steps used its whole window-step budget (J9)."""
+    return sum(1 for step in steps or [] if step.get("kind") in _BUDGETED_STEPS) \
+        >= WINDOW_STEP_BUDGET
 
 
 def _first_phase_closes_the_strip(on_batch, into=None):
