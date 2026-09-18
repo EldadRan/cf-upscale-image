@@ -354,7 +354,9 @@ def card_rates(calibration):
     and a post-strip row converted exactly), carrying a card, a size, a positive frame count and
     a known window — a row with no window cannot say which regime it ran in.
 
-    `tilings` is which `tile_quality` values fed the rate, for the label only; the rate itself is
+    `tilings` maps each `tile_quality` that fed the rate to the SECONDS it contributed — the
+    rate's own weight, so "dominant" means dominant in the number that priced the job (F1, ruled
+    2026-09-19). For the label only; the rate itself is
     not partitioned on tiling (see the caller).
     """
     sums = {}
@@ -374,11 +376,12 @@ def card_rates(calibration):
             continue
         key = (row["gpu_name"], UNBATCHED if _ran_unbatched(row) else BATCHED)
         entry = sums.setdefault(key, {"mpx_frames": 0.0, "seconds": 0.0, "rows": 0,
-                                      "tilings": set()})
+                                      "tilings": {}})
         entry["mpx_frames"] += pixels / 1e6 * frames
         entry["seconds"] += seconds * frames
         entry["rows"] += 1
-        entry["tilings"].add(_row_tile_quality(row))
+        tiling = _row_tile_quality(row)
+        entry["tilings"][tiling] = entry["tilings"].get(tiling, 0.0) + seconds * frames
     return {key: {"gpu_name": key[0], "mpx_per_s": entry["mpx_frames"] / entry["seconds"],
                   "rows": entry["rows"], "tilings": entry["tilings"]}
             for key, entry in sums.items() if entry["seconds"] > 0}
@@ -870,6 +873,16 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
                 rationale["prediction_basis"] = "approximate"
                 if _timed_frames(job):
                     rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
+                return
+            # **A NAMED ABSENCE, never a bare null** (F4, ruled 2026-09-19): no card has a rate in
+            # this regime and nothing scales to it, so say so the way every other absence does.
+            rationale["timing_unavailable"] = {
+                "running_on": running_on,
+                "cards_with_rows": measured_on,
+                "regime": regime,
+                "why": ("no card in the table has a usable row in this job's regime ({}), and "
+                        "no row scales to it, so no prediction is made".format(regime)),
+            }
             return
         lender = min(in_regime, key=lambda card: in_regime[card]["mpx_per_s"])
         rate = in_regime[lender]
@@ -882,12 +895,19 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     # three ways, and a term that looked justified has failed leave-one-out four times. **But the
     # ledger records `high` DOUBLING an 8K job** (F-2026-08-20-40), and this rate does not know
     # about tiling — **so a `high` job at a large output WILL BE UNDER-PREDICTED until there are
-    # rows to say otherwise.** The label below says only when NO row of the job's tiling fed the
-    # rate. **It does not protect the case the ledger records**: one `high` row among a card's
-    # rows is enough to read `measured`, and on the committed table an 8K `high` H200 job prices
-    # at ~20.5 s/frame against its own 46.5 s/frame row. Filed to the gate, not decided here.
+    # rows to say otherwise.** On the committed table an 8K `high` H200 job prices at ~20.5
+    # s/frame against its own 46.5 s/frame row, the rate being 87% default by weight.
+    #
+    # **So the LABEL is held to the weight, not to presence** (F1, ruled 2026-09-19). `measured`
+    # requires the job's tiling to carry strictly more of the rate's seconds than any other
+    # tiling; otherwise `borrowed`, and `timing_from_another_tiling` says what the rate weighed.
+    # A single `high` row among default ones used to be enough to read `measured`.
     job_tiling = rationale.get("tile_quality") or DEFAULT_TILE_QUALITY
-    borrowed_tiling = job_tiling not in rate["tilings"]
+    weights = rate["tilings"]
+    own_weight = weights.get(job_tiling, 0.0)
+    borrowed_tiling = not all(own_weight > weight
+                              for tiling, weight in weights.items() if tiling != job_tiling) \
+        or own_weight <= 0.0
     # **`borrowed` outranks `measured`, because it is the weaker claim** (formulas §9): `measured`
     # claims only what THIS card measured at this tiling.
     rationale["prediction_basis"] = (
@@ -895,7 +915,10 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     if borrowed_tiling:
         rationale["timing_from_another_tiling"] = {
             "running_at": job_tiling,
-            "rows_measured_at": sorted(rate["tilings"]),
+            "rows_measured_at": sorted(weights),
+            # The share of the rate's seconds each tiling carried — what it actually weighed.
+            "weighed": {tiling: round(weight / sum(weights.values()), 3)
+                        for tiling, weight in sorted(weights.items())},
             "why_it_matters": ("tile_quality moves the decode grid, and the rate does not know "
                                "about tiling; a high-tiling 8K job measured 2x its "
                                "default-tiling prediction (F-2026-08-20-40)"),
