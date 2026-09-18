@@ -316,6 +316,40 @@ class RateFrom(unittest.TestCase):
         self.assertIsNone(got["rate_from"])
 
 
+class AbsenceNamesTheSentCard(unittest.TestCase):
+    """W5 F4 (ruled 2026-09-19): an absence the worker raises under a SUBSTITUTED card's name is
+    re-pointed at the card CF sent, with the worker's own reason and regime kept.
+
+    Unreachable on the committed tables, which cover the same cards, so the calibration is
+    patched: the L40S is MEASURED (batched rows only) and absent from the VRAM table, so a nominal
+    resolves its memory to the A40; and no card has a window-1 row or a still to scale, so a still
+    reaches the worker's no-rows-in-regime absence — raised under the A40's name.
+    """
+
+    L40S = "NVIDIA L40S"
+
+    def test_the_absence_names_the_card_cf_sent(self):
+        self.assertNotIn(self.L40S, TABLE)
+        rows = [{"gpu_name": name, "output_pixels": 3686400, "frames": 48, "window": 21,
+                 "seconds_per_frame": 6.0, "rung": "balanced"} for name in (A40, self.L40S)]
+        saved = estimator.load_calibration
+        estimator.load_calibration = lambda *a, **k: [dict(r) for r in rows]
+        try:
+            got = answer(request(job(frames=1, is_still=True, source_width=749, source_height=500,
+                                     target_short_edge_px=1920),
+                                 [tier(cards=[card(self.L40S, vram_total_gb=44.5)])]))
+        finally:
+            estimator.load_calibration = saved
+        self.assertEqual(got["resolved_from"], {"card": self.L40S, "measured": A40})
+        self.assertIsNone(got["predicted_seconds"])
+        absent = got["timing_unavailable"] or {}
+        self.assertEqual(absent.get("running_on"), self.L40S,
+                         "CF asked about the L40S and was told about the A40")
+        # The worker's reason stands: this is F4's absence, not J5's.
+        self.assertEqual(absent.get("regime"), estimator.UNBATCHED)
+        self.assertIn("regime", absent.get("why", ""))
+
+
 class RefusedQuality(unittest.TestCase):
     """A refused card still carries ideal_window, and nulls for the rest (§3b)."""
 

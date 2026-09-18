@@ -10,7 +10,9 @@ placement risk, is CF's policy.
 **Every number is the worker's own output.** What this module adds is where each input came from.
 It rewrites two things, both about the card CF NAMED rather than the one planned: the TIME of a
 card whose sent name has no priceable rows is withheld — predicted_seconds, prediction_basis and
-rate_from null, timing_unavailable naming it (J5, f05b28d; memory and time are different facts);
+rate_from null, timing_unavailable naming it (J5, f05b28d; memory and time are different facts),
+and any absence the worker raised under a substituted card's name — W5 F4's no-rows-in-regime —
+is re-pointed at CF's card with the worker's own reason kept;
 and `prediction_basis` goes from `measured` to `borrowed` wherever the planned card is not the one
 CF named — `nearest_memory` and `pool_floor` (§4a-i). **The second is unreachable while the VRAM
 table and the calibration table cover the same cards**, which the kit asserts, and is kept for the
@@ -465,6 +467,11 @@ def estimate_core(body, commit, vram_table=None):
             resolved = resolve_card(card, tier["cards"], table_cards)
             planned = _plan_card(job, resolved["hardware"])
             own = planned.get("timing_unavailable") or {}
+            # **Every absence is judged on the name CF SENT** — two causes, one block. J5: CF's
+            # card has no priceable rows, so its time is withheld whatever the substitute has.
+            # W5 F4 (ruled 2026-09-19): the worker found no rows in the job's regime on any card
+            # and said so under the snapshot's name, which after §4a-i is the SUBSTITUTE's — CF
+            # asked about X and would be told nothing is known about Y.
             if planned["fits"] and card["gpu_name"] not in priced_cards \
                     and own.get("running_on") != card["gpu_name"]:
                 # **Time is judged on the name CF SENT, not the one memory was resolved to.**
@@ -484,6 +491,9 @@ def estimate_core(body, commit, vram_table=None):
                                            "named; memory was resolved from another card, and "
                                            "memory says nothing about speed"),
                                })
+            elif own and own.get("running_on") != card["gpu_name"]:
+                # The worker's own reason and regime stand — only the card is CF's.
+                planned = dict(planned, timing_unavailable=dict(own, running_on=card["gpu_name"]))
             if resolved["resolved_from"] and planned["prediction_basis"] == "measured":
                 # §4a-i: the one field the service rewrites, and only for the MEMORY sense. The
                 # time sense needs no rewrite — the worker already labels a rate from another
