@@ -106,6 +106,10 @@ def _git(*args):
 def _same_tree_commit():
     """A commit on main, not HEAD, whose `handler/` tree is HEAD's — read from the table.
 
+    **Called per test, never at import** (review, W1): a stale table must fail the tests that
+    need it and leave `HistoryTable` to name the cause, not error the whole module before any
+    test runs.
+
     **Derived, not pinned.** It was pinned to e499dd5 when P1 was written, and the first wave to
     touch `handler/` after it (W1 J7) made that commit's tree someone else's. Every wave that
     touches `handler/` regenerates the table, so the table always holds one: its `newest`, when
@@ -118,10 +122,9 @@ def _same_tree_commit():
     for sha, handler_tree in commits.items():
         if sha != head and handler_tree == tree:
             return sha
-    raise AssertionError("no commit in handler_history.json shares HEAD's handler/ tree")
-
-
-SAME_TREE_COMMIT = _same_tree_commit()
+    raise AssertionError(
+        "no commit in handler_history.json other than HEAD shares HEAD's handler/ tree — the "
+        "table is stale or uncommitted; regenerate it and commit it (HistoryTable names which)")
 
 
 class Parity(unittest.TestCase):
@@ -226,7 +229,7 @@ class PerCard(unittest.TestCase):
         self.assertIsNotNone(entry["cards"][0]["quality"]["ideal_window"])
 
     def test_tier_fields_named_once(self):
-        entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
+        entry = one(request(tiers=[tier(worker_commit=_same_tree_commit())]), commit=SHA_A)
         for field in ("output_width", "output_height", "registry_version", "commit",
                       "handler_tree", "worker_handler_tree", "handler_match"):
             self.assertIn(field, entry)
@@ -550,7 +553,7 @@ class Refusals(unittest.TestCase):
         refused_field(self, body, "job.target_short_edge_px")
 
     def test_short_worker_commit(self):
-        refused_field(self, request(tiers=[tier(worker_commit=SAME_TREE_COMMIT[:7])]),
+        refused_field(self, request(tiers=[tier(worker_commit=_same_tree_commit()[:7])]),
                       "tiers[0].worker_commit")
 
     def test_empty_tiers(self):
@@ -741,11 +744,11 @@ class Match(unittest.TestCase):
     """handler_match on handler/'s tree, not the commit (§5)."""
 
     def test_same_tree_other_commit_matches(self):
-        self.assertNotEqual(SAME_TREE_COMMIT, _git("rev-parse", "HEAD").strip())
-        entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=SHA_A)
+        self.assertNotEqual(_same_tree_commit(), _git("rev-parse", "HEAD").strip())
+        entry = one(request(tiers=[tier(worker_commit=_same_tree_commit())]), commit=SHA_A)
         self.assertEqual(entry["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
         self.assertEqual(entry["worker_handler_tree"],
-                         _git("rev-parse", SAME_TREE_COMMIT + ":handler").strip())
+                         _git("rev-parse", _same_tree_commit() + ":handler").strip())
         self.assertIs(entry["handler_match"], True)
         self.assertEqual(entry["commit"], SHA_A)
         self.assertNotIn("commit_match", entry)
@@ -773,7 +776,7 @@ class Match(unittest.TestCase):
             ps.service_commit({"CF_PLANNER_COMMIT": "abc1234"})
         self.assertEqual(ps.service_commit({"CF_PLANNER_COMMIT": SHA_A}), SHA_A)
         self.assertIsNone(ps.service_commit({}))
-        entry = one(request(tiers=[tier(worker_commit=SAME_TREE_COMMIT)]), commit=None)
+        entry = one(request(tiers=[tier(worker_commit=_same_tree_commit())]), commit=None)
         self.assertIsNone(entry["commit"])
         self.assertIs(entry["handler_match"], True)
 
@@ -877,7 +880,7 @@ class Projection(unittest.TestCase):
             request(),
             request(job(target_short_edge_px=4320), [tier(host_ram_gb=16.0)]),
             request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5), card(A40, label="idle")],
-                                worker_commit=SAME_TREE_COMMIT)]),
+                                worker_commit=_same_tree_commit())]),
             request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT),
                            tier(tier="t2", cards=[card(B200)], host_ram_gb=377.0)]),
             request(job(target_short_edge_px=4320), [tier(cards=[card(A40)])]),
