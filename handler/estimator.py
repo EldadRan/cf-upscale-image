@@ -713,6 +713,14 @@ def _attach_reload_cost(rationale, snapshot):
             rationale["predicted_seconds"] + reloads * seconds, 1)
 
 
+def cards_with_priceable_rows(calibration):
+    """The cards the table can price time for: a row that converts to one unit (`_in_one_unit`)
+    and carries a size. J5's test of "measured", shared with the planner service."""
+    rows = (_in_one_unit(row) for row in calibration or [])
+    return sorted({row["gpu_name"] for row in rows
+                   if row is not None and row.get("gpu_name") and row.get("output_pixels")})
+
+
 def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels):
     """The ETA and the deadline guard's input — **time only, and from the table only.**
 
@@ -722,6 +730,38 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     borrowed from another row is an OOM, while a rate borrowed from another row is a labelled
     estimate, and only one of those is worth the risk.
     """
+    skipped = _unconvertible(calibration)
+    if skipped:
+        rationale["rows_unconvertible"] = len(skipped)
+        rationale["rows_unconvertible_why"] = (
+            "carry seconds_per_frame_post_strip without both strip_seconds and frames, so the "
+            "strip is either inside the rate or outside it depending on nothing a reader can see")
+    else:
+        rationale["rows_unconvertible"] = 0
+
+    # **Before the empty-table return** (review, J5): no table means no card is measured, and
+    # the absence is still named rather than bare.
+    # **A CARD THE TABLE HAS NEVER SEEN GETS NO RATE — A NAMED ABSENCE, NEVER A BARE NULL**
+    # (J5, ruled 2026-09-18: ABSENT BEATS WRONG). The fallback below would price it at the
+    # slowest rate measured on OTHER cards — safe against our own data, and optimistic exactly
+    # when the card is slower than anything measured, which is the MIG partition RunPod placed on
+    # low. **Only a NAMED card absent from the whole table**: a card measured at other sizes still
+    # borrows within its pixel window and says so, and an unreadable card (no name) keeps the
+    # path it had. The progress ETA's observed-rate fallback is what makes absence affordable, and
+    # the first delivered run on the card writes the rows that end it.
+    running_on = snapshot.get("gpu_name")
+    # **Rows the rate can actually be priced from** (review, J5): a pure-record, unconvertible or
+    # geometry-less row does not make a card measured — _timing_rows would not use it, and the
+    # card would fall straight back to the pooled borrow this block exists to stop.
+    measured_on = cards_with_priceable_rows(calibration)
+    if running_on and running_on not in measured_on:
+        rationale["timing_unavailable"] = {
+            "running_on": running_on,
+            "cards_with_rows": measured_on,
+            "why": ("no calibration row was measured on this card; another card's rate is not "
+                    "this card's, so no prediction is made rather than a borrowed one"),
+        }
+        return
     if not calibration:
         return
     window = rationale.get("temporal_window")
@@ -734,33 +774,7 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     # a table that never held one — and then nothing in the worker called it, so in production a
     # half-6e row was still dropped in exactly that silence. `0` is written as readily as a
     # number, because the absence of the key would be the same silence one level up.
-    skipped = _unconvertible(calibration)
-    if skipped:
-        rationale["rows_unconvertible"] = len(skipped)
-        rationale["rows_unconvertible_why"] = (
-            "carry seconds_per_frame_post_strip without both strip_seconds and frames, so the "
-            "strip is either inside the rate or outside it depending on nothing a reader can see")
-    else:
-        rationale["rows_unconvertible"] = 0
 
-    # **A CARD THE TABLE HAS NEVER SEEN GETS NO RATE — A NAMED ABSENCE, NEVER A BARE NULL**
-    # (J5, ruled 2026-09-18: ABSENT BEATS WRONG). The fallback below would price it at the
-    # slowest rate measured on OTHER cards — safe against our own data, and optimistic exactly
-    # when the card is slower than anything measured, which is the MIG partition RunPod placed on
-    # low. **Only a NAMED card absent from the whole table**: a card measured at other sizes still
-    # borrows within its pixel window and says so, and an unreadable card (no name) keeps the
-    # path it had. The progress ETA's observed-rate fallback is what makes absence affordable, and
-    # the first delivered run on the card writes the rows that end it.
-    running_on = snapshot.get("gpu_name")
-    measured_on = sorted({r.get("gpu_name") for r in calibration if r.get("gpu_name")})
-    if running_on and running_on not in measured_on:
-        rationale["timing_unavailable"] = {
-            "running_on": running_on,
-            "cards_with_rows": measured_on,
-            "why": ("no calibration row was measured on this card; another card's rate is not "
-                    "this card's, so no prediction is made rather than a borrowed one"),
-        }
-        return
     if not comparable:
         per_frame = _approximate_seconds_per_frame(
             calibration, chosen["name"], output_pixels, job.get("estimated_frames"))

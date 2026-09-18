@@ -2299,8 +2299,9 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             "encoder_peak_rss_gb": getattr(writer_cm, "encoder_peak_rss_gb", None),
             # **J6: the encode the writer APPLIED**, read off the writer that built the ffmpeg
             # command. A still's writer builds no video command and carries none.
-            "encode": (writer_cm.applied_encode()
-                       if hasattr(writer_cm, "applied_encode") else None),
+            # **Keyed on the still, not on the method** (review, J6): a video writer without it
+            # fails loudly rather than reading as a still.
+            "encode": None if still else writer_cm.applied_encode(),
             "actual_size": getattr(pipeline.run, "last_output_size", None)}
 
 

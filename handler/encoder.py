@@ -433,7 +433,10 @@ class MasterWriter:
         off the writer that built the command and never reconstructed from the request. A
         caller can confirm what it asked for from its own request; this is what it GOT."""
         return {"codec": self._codec, "preset": self._preset, "crf": self._crf,
-                "keyframes": self._keyframes, "head_keyframes": bool(self._head_keyframes),
+                "keyframes": self._keyframes,
+                # **As applied** (review, J6): `keyframes: all` returns `-g 1` before the head
+                # term is added, so ffmpeg was never given it.
+                "head_keyframes": bool(self._head_keyframes) and self._keyframes != "all",
                 "x265_params": self.x265_params_applied}
 
     def _x265_value(self):
