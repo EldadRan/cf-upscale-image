@@ -170,13 +170,24 @@ SMALL_READ_TIMEOUT_S = 20
 SMALL_ATTEMPT_S = SMALL_CONNECT_TIMEOUT_S + SMALL_READ_TIMEOUT_S
 
 
-def put_small(url, body, content_type, deadline_at=None, clock=time.time):
+def put_small(url, body, content_type, deadline_at=None, clock=time.time, owed_after=0):
     """PUT one small object to a presigned URL: once, and a second time only where there is room.
 
     **The one question both post-stop writes ask** (§4d clause 3(b)). The retry is gated on the
     real clock, read at the moment it would be spent: a second attempt only where the time still
-    left before `deadline_at` — handler entry plus `execution_timeout_ms` — covers a whole
-    `SMALL_ATTEMPT_S`. No deadline means none was given, and the retry stands.
+    left before `deadline_at` — handler entry plus `execution_timeout_ms` — covers this retry
+    AND every first attempt still owed after it, `(1 + owed_after) x SMALL_ATTEMPT_S`. No
+    deadline means none was given, and the retry stands.
+
+    **A RESERVE SHARED BY SEVERAL WRITES CANNOT BE SPENT BY A PER-WRITE DECISION.** The bundle
+    and the record share `WRITE_RESERVE_S`; gating each retry on its own attempt alone let the
+    bundle's retry spend the record's first attempt, 75 s against 60. **`owed_after` is passed
+    by the caller that knows the sequence — the handler — and never inferred here.** A third
+    small write added later must join this count, or it reintroduces that defect exactly while
+    looking correct at its own call site.
+
+    **The first attempt is unconditional**, so a stop that fires late still eats the reserve:
+    this bounds the decision to spend again, not the lag before the first PUT (clause 7).
 
     Returns `(ok, error, attempts)`. **Raises nothing**; the callers' posture is that a record or
     a bundle must never cost a job.
@@ -197,11 +208,13 @@ def put_small(url, body, content_type, deadline_at=None, clock=time.time):
             error = exc
         if attempts >= 2:
             return False, error, attempts
-        if deadline_at is not None and deadline_at - clock() < SMALL_ATTEMPT_S:
+        if deadline_at is not None and \
+                deadline_at - clock() < (1 + owed_after) * SMALL_ATTEMPT_S:
             return False, error, attempts
 
 
-def put_diagnostics(diagnostics_url, body, content_type="application/json", deadline_at=None):
+def put_diagnostics(diagnostics_url, body, content_type="application/json", deadline_at=None,
+                    owed_after=0):
     """PUT the diagnostics bundle to CF's presigned URL. **Never raises.**
 
     A single presigned PUT rather than a second scoped credential, deliberately: it is one
@@ -216,6 +229,7 @@ def put_diagnostics(diagnostics_url, body, content_type="application/json", dead
     if not diagnostics_url:
         return False
     try:
-        return put_small(diagnostics_url, body, content_type, deadline_at=deadline_at)[0]
+        return put_small(diagnostics_url, body, content_type, deadline_at=deadline_at,
+                         owed_after=owed_after)[0]
     except Exception:  # noqa: BLE001 — see the docstring; this must never fail the job
         return False

@@ -244,7 +244,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     return diagnostics.redact(json.dumps(body, indent=2, default=str, sort_keys=True))
 
 
-def write(document, url, log=print, label="run-record", deadline_at=None):
+def write(document, url, log=print, label="run-record", deadline_at=None, owed_after=0):
     """PUT the record to the caller's presigned URL. **Never raises, never fails a job.**
 
     Returns True if it landed, False otherwise. Three outcomes, all reported and none fatal:
@@ -274,7 +274,8 @@ def write(document, url, log=print, label="run-record", deadline_at=None):
         import storage  # noqa: PLC0415
 
         ok, error, attempts = storage.put_small(
-            url, document.encode("utf-8"), "application/json", deadline_at=deadline_at)
+            url, document.encode("utf-8"), "application/json", deadline_at=deadline_at,
+            owed_after=owed_after)
         if not ok:
             raise error
         log("[{}] wrote {:,} bytes{}".format(

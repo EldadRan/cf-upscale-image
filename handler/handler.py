@@ -306,7 +306,9 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
         # if validation itself failed — in which case there is no URL to have been given, and the
         # skip path says so.
         runrecord.write(document, (request or {}).get(runrecord.REQUEST_FIELD),
-                        deadline_at=_writes_deadline(request, started))
+                        deadline_at=_writes_deadline(request, started),
+                        # The last write of the job: nothing is owed after it (§4d 3(b)).
+                        owed_after=0)
     except Exception as exc:  # noqa: BLE001 — a record must never cost a delivered master
         print("[run-record] NOT assembled ({}: {}). The job is unaffected.".format(
             type(exc).__name__, str(exc)[:200]))
@@ -2238,7 +2240,10 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
         # whose `diagnostics` could not be minted at submit.
         storage.put_diagnostics(
             request.get("diagnostics") or diagnostics.reserve(), body,
-            deadline_at=_writes_deadline(request, started))
+            deadline_at=_writes_deadline(request, started),
+            # **The record is written after this, in `handle`'s `finally`** (§4d clause 3(b)), so
+            # its first attempt is owed out of the same reserve — where there is a record to write.
+            owed_after=1 if (request or {}).get(runrecord.REQUEST_FIELD) else 0)
     except Exception:  # noqa: BLE001 — see the docstring
         pass
 
