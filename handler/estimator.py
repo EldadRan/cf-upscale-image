@@ -331,6 +331,59 @@ def _unconvertible(calibration):
             and _in_one_unit(r) is None]
 
 
+#: The two regimes a rate is derived in (W5 P3). **Window 1 is a different machine**: it pays the
+#: whole per-frame setup on every frame where a window of N amortises it.
+BATCHED = "batched"
+UNBATCHED = "unbatched"
+
+
+def _ran_unbatched(row):
+    """**The one discriminator between the two regimes**, for `_timing_rows` and `card_rates`
+    alike: a row that ran at window 1. Keyed on the window and not the rung name — `floor` is how
+    it is usually reached, but a forced `batch_size=1` at any rung costs exactly the same."""
+    return row.get("window") == 1
+
+
+def card_rates(calibration):
+    """`{(gpu_name, regime): {gpu_name, mpx_per_s, rows, tilings}}` — **derived, never stored**
+    (W5 P3, ruled 2026-09-18).
+
+    A card's rate in a regime is `sum(output Mpx x frames) / sum(seconds)` over its usable rows:
+    the frame-weighted mean, so a long run counts for its length and a banked row moves the rate
+    the day it lands. **Usable** is a row `_in_one_unit` can price (so never a pure-record row,
+    and a post-strip row converted exactly), carrying a card, a size, a positive frame count and
+    a known window — a row with no window cannot say which regime it ran in.
+
+    `tilings` is which `tile_quality` values fed the rate, for the label only; the rate itself is
+    not partitioned on tiling (see the caller).
+    """
+    sums = {}
+    for raw in calibration or []:
+        row = _in_one_unit(raw)
+        if row is None or not row.get("gpu_name") or row.get("window") is None:
+            continue
+        pixels, frames = row.get("output_pixels"), row.get("frames")
+        if not _positive_number(pixels) or not _positive_number(frames):
+            continue
+        # **Each row's own rate must be a real positive time** (review, P3): `_in_one_unit`
+        # accepts a negative strip, which converts to a rate at or below zero and would INFLATE
+        # the card's speed, and an `Infinity` (json.load accepts it) would zero the rate and
+        # divide by it downstream. Such a row is malformed, not slow.
+        seconds = row["seconds_per_frame"]
+        if not _positive_number(seconds) or not math.isfinite(seconds):
+            continue
+        key = (row["gpu_name"], UNBATCHED if _ran_unbatched(row) else BATCHED)
+        entry = sums.setdefault(key, {"mpx_frames": 0.0, "seconds": 0.0, "rows": 0,
+                                      "tilings": set()})
+        entry["mpx_frames"] += pixels / 1e6 * frames
+        entry["seconds"] += seconds * frames
+        entry["rows"] += 1
+        entry["tilings"].add(_row_tile_quality(row))
+    return {key: {"gpu_name": key[0], "mpx_per_s": entry["mpx_frames"] / entry["seconds"],
+                  "rows": entry["rows"], "tilings": entry["tilings"]}
+            for key, entry in sums.items() if entry["seconds"] > 0}
+
+
 def _timing_rows(calibration, output_pixels, window, unbatched=None):
     """Rows to borrow a per-frame time from when the configuration has no rung name.
 
@@ -372,7 +425,7 @@ def _timing_rows(calibration, output_pixels, window, unbatched=None):
     # 3.2x. This is a partition into batched and unbatched, which is a difference in kind.
     if unbatched is None:
         return rows
-    return [r for r in rows if (r.get("window") == 1) == bool(unbatched)]
+    return [r for r in rows if _ran_unbatched(r) == bool(unbatched)]
 
 
 #: RunPod's own hard ceiling on `executionTimeout`, in milliseconds — seven days. Not this
@@ -737,11 +790,13 @@ def _attach_reload_cost(rationale, snapshot):
 
 
 def cards_with_priceable_rows(calibration):
-    """The cards the table can price time for: a row that converts to one unit (`_in_one_unit`)
-    and carries a size. J5's test of "measured", shared with the planner service."""
-    rows = (_in_one_unit(row) for row in calibration or [])
-    return sorted({row["gpu_name"] for row in rows
-                   if row is not None and row.get("gpu_name") and row.get("output_pixels")})
+    """The cards the table can price time for — J5's test of "measured", shared with the planner
+    service. **Defined BY `card_rates`** (W5 P3): a card is measured exactly when it has a rate in
+    some regime. A looser test let a card pass as measured with no usable rate row — a row with
+    no window or no frame count — and then priced nothing and named nothing, which is the silent
+    null J5 exists to end.
+    """
+    return sorted({card for card, _regime in card_rates(calibration)})
 
 
 def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels):
@@ -787,84 +842,68 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
         return
     if not calibration:
         return
-    window = rationale.get("temporal_window")
-    # The plan's own window decides which kind of row may price it. A still always plans 1; a
-    # video that plans 1 is the floor rung, and costs the same way for the same reason.
-    comparable = _timing_rows(calibration, output_pixels, window,
-                              unbatched=(window == 1))
-    # **The skipped rows are RECORDED, which is the half `_unconvertible` existed for and did not
-    # do.** It was written with a docstring saying a skip nobody counts is indistinguishable from
-    # a table that never held one — and then nothing in the worker called it, so in production a
-    # half-6e row was still dropped in exactly that silence. `0` is written as readily as a
-    # number, because the absence of the key would be the same silence one level up.
-
-    if not comparable:
-        per_frame = _approximate_seconds_per_frame(
-            calibration, chosen["name"], output_pixels, job.get("estimated_frames"))
-        if per_frame is not None:
-            rationale["seconds_per_frame"] = round(per_frame, 4)
-            rationale["prediction_basis"] = "approximate"
-            if _timed_frames(job):
-                rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
-        return
-
-    # **Time is matched on the card and memory never was.** A 1.5x slower card silently
-    # inheriting another's rate accepts a job it cannot finish and is hard-killed at
-    # `executionTimeout` with every second billed — which is the failure the deadline factor
-    # exists to prevent, and which is calibrated per card.
-    same_card = [r for r in comparable if running_on and r.get("gpu_name") == running_on]
-    timing_rows = same_card or comparable
-    rows = [r for r in timing_rows if r.get("output_pixels")]
-    if not rows:
-        return
-
-    # **And matched on the tiling, for the same reason** (F-2026-08-20-40). `tile_quality` moves
-    # the decode grid, not the geometry: at 8K the default grid is 6x4 tiles at 1392 px and
-    # `high` is 3x2 at 2648, which is seven decode passes of ~900 s each against ~120 s. The
-    # entire 2x wall lives there. A default-tiling row priced that job at 4147.4 s against 8255 s
-    # actually spent — **and wore `prediction_basis: "measured"` while doing it**, the strongest
-    # label §9 allows, on a configuration nothing in the table had ever run.
+    # **THE SIMPLE RATE REPLACES THE LOOKUP** (W5 P3, ruled 2026-09-18). One rate per card per
+    # regime, DERIVED from the table on every call — `card_rates` — so a banked row improves the
+    # prediction with no release and there is no second artefact to keep true. Measured over
+    # W3's eleven delivered runs: the lookup (pixel band, then `max()`) was 147% mean absolute
+    # error and over on 10 of 11; one rate per card was 15%.
     #
-    # §9's span rule already governs this: a coefficient prices only configurations within span of
-    # the plane it was measured on, and a new plane class is admissible under a pooled fallback
-    # *flagged as such*. The flag was the missing half. So the rows are preferred by tiling like
-    # they are by card, and where none match the prediction still happens — an ETA is better than
-    # no ETA — but it is labelled `borrowed` and says what it borrowed from.
-    job_tiling = rationale.get("tile_quality") or DEFAULT_TILE_QUALITY
-    same_tiling = [r for r in rows if _row_tile_quality(r) == job_tiling]
-    borrowed_tiling = not same_tiling
-    if same_tiling:
-        rows = same_tiling
+    # **The regime is the plan's own window, through the SAME discriminator `_timing_rows` uses**
+    # (`_ran_unbatched`). A still always plans 1; a video that plans 1 is the floor rung and pays
+    # the full per-frame setup the same way. The two rates differ by 0.23-0.39x across cards, so
+    # the regime is two rates and never one rate with a multiplier.
+    regime = UNBATCHED if rationale.get("temporal_window") == 1 else BATCHED
+    rates = card_rates(calibration)
+    rate = rates.get((running_on, regime)) if running_on else None
+    borrowed_card = rate is None
+    if borrowed_card:
+        # **A MEASURED card with no rows in THIS regime, or a card that could not be read,
+        # borrows within the measured set, labelled** — J5 withholds time only from a named card
+        # the table has never seen, and that returned above. The SLOWEST card measured in the
+        # regime, so the borrow errs long, as the lookup's `max()` did.
+        in_regime = {card: r for (card, reg), r in rates.items() if reg == regime}
+        if not in_regime:
+            per_frame = _approximate_seconds_per_frame(
+                calibration, chosen["name"], output_pixels, job.get("estimated_frames"))
+            if per_frame is not None:
+                rationale["seconds_per_frame"] = round(per_frame, 4)
+                rationale["prediction_basis"] = "approximate"
+                if _timed_frames(job):
+                    rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
+            return
+        lender = min(in_regime, key=lambda card: in_regime[card]["mpx_per_s"])
+        rate = in_regime[lender]
 
-    per_frame = max(r["seconds_per_frame"] * (output_pixels / float(r["output_pixels"]))
-                    for r in rows)
+    per_frame = (output_pixels / 1e6) / rate["mpx_per_s"]
     rationale["seconds_per_frame"] = round(per_frame, 4)
-    # **`borrowed` outranks `measured` in the labelling, because it is the weaker claim.** A rate
-    # taken from another tiling is not a measurement of this configuration in any sense, and the
-    # deadline guard reads this field to decide how much rope a prediction gets — the one that
-    # was 2x wrong must not be trusted like the one that was not.
-    # **A rate from another card is not a measurement of this one either** (F-2026-08-20-40,
-    # fourth face). `timing_from_another_card` has flagged this since the field existed, and the
-    # basis went on saying `measured` beside it — which is the same vocabulary violation the
-    # tiling case was ruled on, one axis over. Formulas §9: `measured` claims only what THIS run
-    # measured on the job in front of it.
-    #
-    # It surfaced on a 48-class card that is not an A40: no rows for it, so every row in the
-    # table became comparable, and the plan reported a borrowed number as a measured one.
+
+    # **NO TILING PARTITION ON THE RATE, BY RULING — AND IT UNDER-PREDICTS `high`.** `high` has
+    # one video row in the table; partitioning would leave it unusable and split every other card
+    # three ways, and a term that looked justified has failed leave-one-out four times. **But the
+    # ledger records `high` DOUBLING an 8K job** (F-2026-08-20-40), and this rate does not know
+    # about tiling — **so a `high` job at a large output WILL BE UNDER-PREDICTED until there are
+    # rows to say otherwise.** The label below says only when NO row of the job's tiling fed the
+    # rate. **It does not protect the case the ledger records**: one `high` row among a card's
+    # rows is enough to read `measured`, and on the committed table an 8K `high` H200 job prices
+    # at ~20.5 s/frame against its own 46.5 s/frame row. Filed to the gate, not decided here.
+    job_tiling = rationale.get("tile_quality") or DEFAULT_TILE_QUALITY
+    borrowed_tiling = job_tiling not in rate["tilings"]
+    # **`borrowed` outranks `measured`, because it is the weaker claim** (formulas §9): `measured`
+    # claims only what THIS card measured at this tiling.
     rationale["prediction_basis"] = (
-        "borrowed" if (borrowed_tiling or not same_card) else "measured")
+        "borrowed" if (borrowed_tiling or borrowed_card) else "measured")
     if borrowed_tiling:
         rationale["timing_from_another_tiling"] = {
             "running_at": job_tiling,
-            "rows_measured_at": sorted({_row_tile_quality(r) for r in rows}),
-            "why_it_matters": ("tile_quality moves the decode grid, and decode is where a long "
-                               "job's wall clock lives; a high-tiling 8K job measured 2x its "
+            "rows_measured_at": sorted(rate["tilings"]),
+            "why_it_matters": ("tile_quality moves the decode grid, and the rate does not know "
+                               "about tiling; a high-tiling 8K job measured 2x its "
                                "default-tiling prediction (F-2026-08-20-40)"),
         }
-    if not same_card:
+    if borrowed_card:
         rationale["timing_from_another_card"] = {
             "running_on": running_on,
-            "rows_measured_on": sorted({r["gpu_name"] for r in rows if r.get("gpu_name")}),
+            "rows_measured_on": [rate["gpu_name"]],
         }
     if _timed_frames(job):
         rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
