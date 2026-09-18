@@ -267,6 +267,13 @@ class MasterWriter:
         #: a memory ceiling that does not report memory has to be run twice to learn anything, and
         #: each run is fifty minutes of A40. None where it cannot be measured.
         self.encoder_peak_rss_gb = None
+        #: **Seconds the producer spent inside `stdin.write`** (W5 R8) — blocked until ffmpeg had
+        #: read the frame. From cf-rife: *"the most the levers can buy you is the time your
+        #: producer spends blocked on the encoder, plus the drain"*, and the drain is
+        #: `tail_seconds`. **An upper bound on the block, not the block alone**: a frame is far
+        #: larger than the pipe, so even an encoder that is never behind costs the copy through
+        #: it. The peak sample beside the write is outside the timer.
+        self.write_wait_s = 0.0
         self._proc = None
         self._identity = dict(identity or {})
         self._audio_source = audio_source
@@ -422,7 +429,9 @@ class MasterWriter:
         if self._proc is None or self._proc.poll() is not None:
             raise WorkerError(INTERNAL, self._died("ffmpeg exited before the frames did"))
         try:
+            blocked = time.monotonic()
             self._proc.stdin.write(frame_bytes)
+            self.write_wait_s += time.monotonic() - blocked
             self._sample_peak()
         except BrokenPipeError:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))

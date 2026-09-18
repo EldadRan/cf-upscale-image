@@ -1175,6 +1175,8 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                            # subtracting the tail is what makes two runs of the same job
                            # comparable (F-2026-08-20-44).
                            "tail_seconds": outcome.get("tail_seconds"),
+                           # **Beside the drain, because together they bound J13(b)** (W5 R8).
+                           "write_wait_s": outcome.get("write_wait_s"),
                            # Banked per attempt so a codec measurement can be read off the ledger
                            # rather than off a log, and so an OOM ladder's rows each carry the
                            # encoder cost of the rung that produced them.
@@ -1232,6 +1234,9 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                 record["x265_params"] = applied
             record["encoder_peak_rss_gb"] = getattr(
                 (encoder_out or {}).get("writer"), "encoder_peak_rss_gb", None)
+            # **And the block, on a failure too** (W5 R8), for the same reason: the writer holds
+            # what it measured whatever ended the attempt.
+            record["write_wait_s"] = _write_wait((encoder_out or {}).get("writer"))
             if not estimator.is_oom(exc):
                 # **A deliberate refusal is not an error, and the corpus has to be able to tell.**
                 # The host guard stops a doomed run on purpose; recording that as `error` would
@@ -1747,6 +1752,15 @@ def _attempt_peak_gb():
     if watch is not None and watch.peak_gb is not None:
         return round(watch.peak_gb, 2)
     return estimator.observed_peak_vram_gb()
+
+
+def _write_wait(writer):
+    """Seconds a video writer's producer spent blocked on the encoder, or None (W5 R8).
+
+    None for a still, whose writer has no pipe, and where there was no writer at all.
+    """
+    waited = getattr(writer, "write_wait_s", None)
+    return None if waited is None else round(waited, 2)
 
 
 def _record_phases(record, deadline=None):
@@ -2408,6 +2422,9 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
             # whole job silently includes it, and the B200 pair's whole 17.9-to-21.7 s/frame
             # spread was this number differing by 863 s between two otherwise identical runs.
             "tail_seconds": tail_seconds,
+            # **The producer's block on the encoder** (W5 R8): with `tail_seconds`, the most an
+            # encoder lever can win back. Null on a still, whose writer has no pipe.
+            "write_wait_s": _write_wait(writer_cm),
             # **The encoder's own high-water mark, carried out for the same reason `tail_seconds`
             # is: it is measured here and banked two functions away.** `phasewatch` reads
             # `/proc/self`, which is this worker with the model resident, so it can never say what
