@@ -830,6 +830,13 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
                                  # same one the deadline watch uses, started at handler entry.
                                  started=started, deadline=deadline)
 
+    # **J6: what was APPLIED** — the writer's own encode and the plan's tiling, built once here
+    # for the response's output block AND the run-record's. The tiling is the planner's own
+    # resolved value (estimator.plan's rationale), which is what priced and built the decode
+    # grid; the OOM ladder holds it fixed. Null on a still, as codec_tag_string is.
+    applied_encode = (dict(result["encode"], tile_quality=(rationale or {}).get("tile_quality"))
+                      if result.get("encode") else None)
+
     # **What was delivered, on the trace, for the run-record** (F-2026-08-19-36). Size and frame
     # counts only — the key and the bucket are the customer's, and a corpus does not need them to
     # price a card.
@@ -840,6 +847,12 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             "frames_written": result.get("written_out"),
             "frames_decoded": result.get("decoded_in"),
             "seconds": round(result["seconds"], 1) if result.get("seconds") else None,
+            # **R5: the corpus reads the RECORD, not the manifest.** J6 was ruled into the
+            # response and the manifest, and the manifest dies with the artefacts at 7 days while
+            # the record lives 90 — so a measurement wave could not see which run used which
+            # encode. Set here, before the upload, so a run whose upload fails still says it.
+            # A copy, so nothing done to the response's block later reaches the record.
+            "encode": dict(applied_encode) if applied_encode else None,
         }
 
     # **The checkpoint's own reading, recorded whether or not it stopped anything.** A job that
@@ -866,6 +879,10 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     artefacts.append(master)
 
     measured = probe.probe_output(master_path)
+    # **R5: J13a's tag reaches the record too**, and it can only be read off the master once it
+    # exists, so it lands on the trace here rather than with the rest of the output block above.
+    if trace is not None and trace.get("output") is not None:
+        trace["output"]["codec_tag_string"] = measured.get("codec_tag_string")
     output_entry = dict(measured)
     output_entry.update({
         "key": master_key,
@@ -874,14 +891,11 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         # Only meaningful for a container that has a moov atom to move.
         "faststart": probe.is_faststart(master_path) if not still else None,
         "channels": 4 if keep_alpha else 3,
-        # **J6: what was APPLIED, beside what was measured** — the writer's own encode and the
-        # plan's tiling. In the manifest too, which stores this block; its request-valued crf,
-        # tile_quality and schedule stay, because what was ASKED is a different fact. Null on a
-        # still, as codec_tag_string is.
-        # The tiling is the planner's own resolved value (estimator.plan's rationale), which is
-        # what priced and built the decode grid; the OOM ladder holds it fixed.
-        "encode": (dict(result["encode"], tile_quality=(rationale or {}).get("tile_quality"))
-                   if result.get("encode") else None),
+        # **J6: what was APPLIED, beside what was measured** — built above, and the same object
+        # the run-record carries (R5). In the manifest too, which stores this block; its
+        # request-valued crf, tile_quality and schedule stay, because what was ASKED is a
+        # different fact.
+        "encode": applied_encode,
     })
 
     # ── derives ──────────────────────────────────────────────────────────────────────────────
