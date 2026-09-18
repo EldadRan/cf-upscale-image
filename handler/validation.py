@@ -190,6 +190,12 @@ REQUIRED_TOP_LEVEL = ("request_id", "request_date", "source_url", "output", "par
 #: reaching production by accident and none stops a caller who decides to. `debug` costs nothing
 #: to keep honest -- no key, no rotation, no lookup, nothing that can go stale -- and it carries
 #: one idea, *this is not a production run*, which is already what debug logging means.
+#: **x265 refuses a lookahead not above the preset's consecutive B-frames** — 3 at ultrafast, 4
+#: at medium, 8 at slower and veryslow — and it refuses at the first frame, after the model has
+#: run. 9 opens under every admitted preset (measured 2026-09-18 on Homebrew ffmpeg + libx265;
+#: the image's build is not measured). Refused at the door, not discovered mid-job (review, J13).
+X265_RC_LOOKAHEAD_MIN = 9
+
 #: The x265 threading levers (J13(b)), refused on any request that does not encode h265.
 X265_LEVER_FIELDS = ("force_x265_pools", "force_x265_frame_threads", "force_x265_rc_lookahead")
 
@@ -837,21 +843,10 @@ def validate(job_input):
 
     run_record = _as_str(_require(job_input, "run_record", "at the top level"), "run_record")
 
-    # **An x265 lever on a request that is not h265 would do nothing, silently** (J13(b)). Refuse,
-    # never ignore — the encoder builds no x265 flag for x264, and a caller measuring threading
-    # on the wrong codec would bank a row describing a configuration that never ran.
-    if codec_config["codec"] != "h265":
-        for field in X265_LEVER_FIELDS:
-            if job_input.get(field) is not None:
-                raise WorkerError(
-                    FIELD_NOT_SUPPORTED,
-                    "{} tunes x265 and this request encodes {}; it would change nothing, so it "
-                    "is refused rather than ignored".format(field, codec_config["codec"]))
-
     # Flattened for the handler's use. The **wire** shape is nested; this is the normalised form
     # everything downstream reads, so the nesting exists exactly once — here — rather than being
     # threaded through every caller.
-    return {
+    request = {
         "request_id": request_id,
         "request_date": request_date,
         "source_url": _as_str(job_input["source_url"], "source_url"),
@@ -942,7 +937,7 @@ def validate(job_input):
             minimum=1),
         "force_x265_rc_lookahead": _positive_int_or_none(
             job_input.get("force_x265_rc_lookahead"), "force_x265_rc_lookahead", 250,
-            minimum=1),
+            minimum=X265_RC_LOOKAHEAD_MIN),
         "force_swap_io_components": _bool_or_none(
             job_input.get("force_swap_io_components"), "force_swap_io_components"),
         "pin": (False if job_input.get("pin") is None
@@ -957,3 +952,18 @@ def validate(job_input):
         # answering a different question from the one the run would ask.
         "plan_only": bool(job_input.get("plan_only")),
     }
+
+    # **An x265 lever on a request that is not h265 would do nothing, silently** (J13(b)). Refuse,
+    # never ignore — the encoder builds no x265 flag for x264, and a caller measuring threading
+    # on the wrong codec would bank a row describing a configuration that never ran.
+    # **After every field has been read and ranged** (review, J13): a malformed lever or a
+    # missing required field is reported as itself, not as "wrong codec".
+    if codec_config["codec"] != "h265":
+        for field in X265_LEVER_FIELDS:
+            if job_input.get(field) is not None:
+                raise WorkerError(
+                    FIELD_NOT_SUPPORTED,
+                    "{} tunes x265 and this request encodes {}; it would change nothing, so it "
+                    "is refused rather than ignored".format(field, codec_config["codec"]))
+
+    return request

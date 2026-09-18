@@ -225,7 +225,7 @@ def probe_source(path):
         # the case a bound on the carried track has to be measured against.
         "video_duration_s": (float(video["duration"]) if video.get("duration") else None),
         "codec": video.get("codec_name"),
-        "codec_tag_string": video.get("codec_tag_string"),
+        "codec_tag_string": _codec_tag(video),
         "has_audio": audio is not None,
         # **Whether the source carries an alpha channel**, which decides whether this job is a
         # 4-channel job end to end: the read, the model's alpha path, the writer's pixel format,
@@ -303,8 +303,16 @@ def probe_output(path):
         "codec": video.get("codec_name"),
         # **The tag, beside the codec** (J13(a)): hev1 and hvc1 are the same codec and only one
         # plays on a Mac, so a check on `codec` alone passes on an unplayable master.
-        "codec_tag_string": video.get("codec_tag_string"),
+        "codec_tag_string": _codec_tag(video),
     }
+
+
+def _codec_tag(video):
+    """The stream's four-character tag, or None where there is none. **ffprobe spells "no tag" as
+    `[0][0][0][0]`** — a PNG reports exactly that — and a still's output block should not carry
+    a string that reads like a value (review, J13)."""
+    tag = video.get("codec_tag_string")
+    return None if not tag or tag.startswith("[") else tag
 
 
 def is_faststart(path):

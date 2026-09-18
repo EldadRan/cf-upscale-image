@@ -1187,6 +1187,11 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             # working set" with the ceiling "inferred from a kernel kill". That run is a FAILURE,
             # and banking the peak only where the attempt succeeded would have left it exactly as
             # unreadable as it was before.
+            # **The applied x265 string on a failed attempt too** (review, J13): a levered run
+            # that dies — the host pressure `pools` is there to measure — is the one to keep.
+            applied = getattr((encoder_out or {}).get("writer"), "x265_params_applied", None)
+            if applied:
+                record["x265_params"] = applied
             record["encoder_peak_rss_gb"] = getattr(
                 (encoder_out or {}).get("writer"), "encoder_peak_rss_gb", None)
             if not estimator.is_oom(exc):
