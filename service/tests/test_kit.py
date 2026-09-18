@@ -33,9 +33,8 @@ import planner  # noqa: E402
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
-#: e499dd5 is the image tiers ran before service/ existed: same handler/ tree as HEAD, other commit.
-SAME_TREE_COMMIT = "e499dd51929b3fe25a0b5fdce7aee840d2027789"
-#: 26294cc is e499dd5's parent, and e499dd5 changed handler/estimator.py.
+#: 26294cc is e499dd5's parent, and e499dd5 changed handler/estimator.py — so its tree is not
+#: HEAD's on any later commit either.
 OTHER_TREE_COMMIT = "26294cc5cb1f90fdaabe84f59223c1215a6f3fc1"
 
 with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as _handle:
@@ -102,6 +101,27 @@ def refused_field(test, body, field):
 def _git(*args):
     return subprocess.run(["git", "-C", REPO_ROOT] + list(args), capture_output=True,
                           text=True, check=True).stdout
+
+
+def _same_tree_commit():
+    """A commit on main, not HEAD, whose `handler/` tree is HEAD's — read from the table.
+
+    **Derived, not pinned.** It was pinned to e499dd5 when P1 was written, and the first wave to
+    touch `handler/` after it (W1 J7) made that commit's tree someone else's. Every wave that
+    touches `handler/` regenerates the table, so the table always holds one: its `newest`, when
+    HEAD is the regeneration commit after it.
+    """
+    with open(os.path.join(SERVICE, "handler_history.json"), encoding="utf-8") as handle:
+        commits = json.load(handle)["commits"]
+    head = _git("rev-parse", "HEAD").strip()
+    tree = _git("rev-parse", "HEAD:handler").strip()
+    for sha, handler_tree in commits.items():
+        if sha != head and handler_tree == tree:
+            return sha
+    raise AssertionError("no commit in handler_history.json shares HEAD's handler/ tree")
+
+
+SAME_TREE_COMMIT = _same_tree_commit()
 
 
 class Parity(unittest.TestCase):
