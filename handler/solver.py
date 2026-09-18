@@ -352,6 +352,10 @@ def config_of_plan(answer, job, template=None):
         config["vae_encode_tile_size"] = answer["enc_tile"]
     config["dit_offload_device"] = "cpu" if config["blocks_to_swap"] else "none"
     config["target_short_edge_px"] = job["target_short_edge_px"]
+    # **The tiling lives on the config with the rest of the plan** (W2 Q6). It was on the
+    # rationale only, so plan_of_config read it as absent and an OOM re-plan of a `high` job came
+    # back at `default`; and every attempt record's tile_quality was null (54 of 54 rows).
+    config["tile_quality"] = answer.get("tile_quality", "default")
     # **Every configuration carries a name**, because a dozen call sites read `plan["name"]` for
     # a banner, a ledger row or a warning, and a plan without one turns a re-plan into a KeyError
     # at exactly the moment something has already gone wrong.
