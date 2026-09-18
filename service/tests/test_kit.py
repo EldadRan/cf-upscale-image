@@ -739,6 +739,15 @@ class Still(unittest.TestCase):
         self.assertEqual((entry["output_width"], entry["output_height"]),
                          estimator.output_dimensions(749, 500, 1920))
 
+    def test_still_timing_is_pinned(self):
+        """**W1 J10 must not move the service's answer for a still** (gate, 2026-09-18). The
+        service already sends frames 1 for a still (planner_service.py:307), so the worker-side
+        fix changes nothing here — and a silent move is the regression CF would see first.
+        Pinned at cf-upscale-image bb39a9c, before J10."""
+        got = one(request(job(frames=1, is_still=True, source_width=749, source_height=500,
+                              target_short_edge_px=1920)))["cards"][0]
+        self.assertEqual((got["predicted_seconds"], got["prediction_basis"]), (27.4, "measured"))
+
 
 class Match(unittest.TestCase):
     """handler_match on handler/'s tree, not the commit (§5)."""
