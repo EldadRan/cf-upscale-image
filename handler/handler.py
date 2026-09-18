@@ -227,6 +227,19 @@ def handle(job_input, job=None):
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+def _writes_deadline(request, started):
+    """When the platform ends this container: handler entry plus `execution_timeout_ms`.
+
+    **What `storage.put_small` gates a second attempt on** (§4d clause 3(b)). None where either is
+    missing — a request that failed validation, or a write with no job in scope — and then the
+    retry stands, as it does on any job that gave no budget.
+    """
+    budget_ms = (request or {}).get("execution_timeout_ms")
+    if not budget_ms or started is None:
+        return None
+    return started + budget_ms / 1000.0
+
+
 def _write_run_record_stub(request, machine, rationale, source, job, started):
     """File the **stub** record: what this run is about to attempt (F-2026-08-20-43).
 
@@ -248,7 +261,8 @@ def _write_run_record_stub(request, machine, rationale, source, job, started):
             host_banners=list(_HOST_BANNERS), job=job,
             started_utc=datetime.datetime.fromtimestamp(
                 started, datetime.timezone.utc).isoformat())
-        runrecord.write(document, url, label="run-record/stub")
+        runrecord.write(document, url, label="run-record/stub",
+                        deadline_at=_writes_deadline(request, started))
     except Exception as exc:  # noqa: BLE001 — a record must never cost a delivered master
         print("[run-record] stub NOT assembled ({}: {}). The job is unaffected.".format(
             type(exc).__name__, str(exc)[:200]))
@@ -291,7 +305,8 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
         # **The address came with the job**, like the bundle's always has. `request` may be None
         # if validation itself failed — in which case there is no URL to have been given, and the
         # skip path says so.
-        runrecord.write(document, (request or {}).get(runrecord.REQUEST_FIELD))
+        runrecord.write(document, (request or {}).get(runrecord.REQUEST_FIELD),
+                        deadline_at=_writes_deadline(request, started))
     except Exception as exc:  # noqa: BLE001 — a record must never cost a delivered master
         print("[run-record] NOT assembled ({}: {}). The job is unaffected.".format(
             type(exc).__name__, str(exc)[:200]))
@@ -1245,18 +1260,24 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             budget_s = (request.get("execution_timeout_ms")
                         or estimator.PLATFORM_EXECUTION_CEILING_MS) / 1000.0
             last_attempt_s = record.get("seconds") or 0.0
-            if spent + last_attempt_s > budget_s:
+            # **Against the stop, not the budget** (§4d, J7): the in-run stops fire
+            # WRITE_RESERVE_S short of it, so a retry that fit the budget alone would be started
+            # only to be stopped.
+            stop_at_s = estimator.stop_at_seconds(budget_s)
+            if spent + last_attempt_s > stop_at_s:
                 raise WorkerError(
                     errors.DEADLINE_EXCEEDED,
                     "out of memory after {:.0f}s, and the attempt that failed took {:.0f}s — "
-                    "another would run past the {:.0f}s this job has. The next configuration "
-                    "was computed and is reported below; resend with a larger "
-                    "execution_timeout_ms to let it run.".format(
-                        spent, last_attempt_s, budget_s),
+                    "another would run past {:.0f}s, where this job stops to keep the last "
+                    "{:.0f}s of its {:.0f}s for the writes. The next configuration was computed "
+                    "and is reported below; resend with a larger execution_timeout_ms to let it "
+                    "run.".format(spent, last_attempt_s, stop_at_s,
+                                  estimator.WRITE_RESERVE_S, budget_s),
                     shortfall=dict(shortfall or {},
                                    seconds_spent=round(spent, 1),
                                    seconds_per_attempt=round(last_attempt_s, 1),
                                    budget_seconds=round(budget_s, 1),
+                                   stop_at_seconds=round(stop_at_s, 1),
                                    next_window=nxt_row["window"],
                                    next_decode_grid=nxt_row["decode_grid"]),
                 )
@@ -2214,7 +2235,8 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
         # case where there is no per-job URL to use — a request that never carried one, or one
         # whose `diagnostics` could not be minted at submit.
         storage.put_diagnostics(
-            request.get("diagnostics") or diagnostics.reserve(), body)
+            request.get("diagnostics") or diagnostics.reserve(), body,
+            deadline_at=_writes_deadline(request, started))
     except Exception:  # noqa: BLE001 — see the docstring
         pass
 

@@ -371,6 +371,22 @@ def _timing_rows(calibration, output_pixels, window, unbatched=None):
 #: refuses an `execution_timeout_ms` above it for the same reason.
 PLATFORM_EXECUTION_CEILING_MS = 604_800_000
 
+#: **What the stop leaves unspent for the writes that come after it** (`api.md` §4d, J7, ruled
+#: 2026-09-18). `execution_timeout_ms` is the endpoint's own `executionTimeout`, unmodified, so a
+#: stop AT the budget is a stop at the platform's kill, and the bundle and the run-record are
+#: written after it. **Sized to the bounded write path, not measured** — no bundle PUT has ever
+#: been timed on its own.
+WRITE_RESERVE_S = 60
+
+
+def stop_at_seconds(budget_s):
+    """Where the worker stops, from handler entry: the budget less the write reserve.
+
+    **A budget at or under the reserve stops at its first hook**, after the load — the rule
+    followed literally. The load strip itself runs before any stop can fire (§4d clause 4).
+    """
+    return budget_s - WRITE_RESERVE_S
+
 
 def fastest_seconds_per_frame(calibration, output_pixels):
     """The quickest per-frame rate ever measured here, scaled to this size. `None` if unmeasured.
@@ -1023,6 +1039,9 @@ class DeadlineWatch:
         #: being implemented as an inversion**, because a change that made "no budget" mean
         #: "refuse" would be catastrophic and silent.
         self.budget_s = (budget_ms / 1000.0) if budget_ms else None
+        #: **What both stops compare against** (§4d, J7): the budget less `WRITE_RESERVE_S`, from
+        #: handler entry. `budget_s` stays the caller's figure, for the messages and `shortfall`.
+        self.stop_at_s = None if self.budget_s is None else stop_at_seconds(self.budget_s)
         self.started = started
         self._clock = clock
         #: phase -> `(last_tile_index, announced_at)`. **Keyed on the phase** because encode and
@@ -1059,23 +1078,46 @@ class DeadlineWatch:
         if self.budget_s is None:
             return
         spent = self.elapsed()
-        if spent < self.budget_s:
+        if spent < self.stop_at_s:
             return
+        if self.budget_s <= WRITE_RESERVE_S:
+            # **§4d clause 9: a budget the reserve swallows whole.** Stopped at the first hook,
+            # after the load — and the message says the work was never attempted, because it
+            # was not: there was no time in this budget to give it.
+            self._refuse(
+                "this job's {:.0f}s deadline is not more than the {:.0f}s kept for writing the "
+                "bundle and the record after a stop, so no time was left for the work and none "
+                "was attempted. It stopped at the first point it could, {:.0f}s in, after the "
+                "model load. Resend with an execution_timeout_ms that covers the job and the "
+                "{:.0f}s besides.".format(self.budget_s, WRITE_RESERVE_S, spent,
+                                          WRITE_RESERVE_S),
+                shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
+                           "elapsed_seconds": round(spent, 1),
+                           "write_reserve_seconds": WRITE_RESERVE_S,
+                           "suggested_execution_timeout_ms": int(
+                               (spent * 2 + WRITE_RESERVE_S) * 1000),
+                           "suggestion_basis": "twice what this job had already spent when it "
+                                               "stopped, plus the write reserve; the worker "
+                                               "does not know what the work would take"})
         self._refuse(
-            "this job has spent {:.0f}s of its {:.0f}s deadline and is stopping rather than "
-            "running past it. Past the deadline the platform ends the container with nothing "
-            "delivered and every second billed, and the worker is never asked — so this is the "
-            "last thing it can say. Nothing here is a prediction: {:.0f}s is what the clock "
-            "read.".format(spent, self.budget_s, spent),
+            "this job has spent {:.0f}s of its {:.0f}s deadline and is stopping {:.0f}s short of "
+            "it, so the bundle and the record are written before the platform ends the "
+            "container. Past the deadline the container ends with nothing delivered and every "
+            "second billed, and the worker is never asked — so this is the last thing it can "
+            "say. Nothing here is a prediction: {:.0f}s is what the clock read.".format(
+                spent, self.budget_s, WRITE_RESERVE_S, spent),
             shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
                        "elapsed_seconds": round(spent, 1),
                        # **What to resend, rather than a caller doubling blindly.** The figure is
                        # deliberately not a prediction of the whole job: nothing here knows what
                        # is left, so it names the budget that would at least have covered what has
                        # already run, and says so.
-                       "suggested_execution_timeout_ms": int(spent * 2000),
-                       "suggestion_basis": "twice what this job had already spent when it stopped;"
-                                           " the worker does not know what remained"})
+                       # **The reserve is added back**, or resending the suggestion would stop
+                       # WRITE_RESERVE_S short of it again.
+                       "suggested_execution_timeout_ms": int((spent * 2 + WRITE_RESERVE_S) * 1000),
+                       "suggestion_basis": "twice what this job had already spent when it stopped,"
+                                           " plus the write reserve; the worker does not know "
+                                           "what remained"})
 
     def tile(self, phase, first, last, total):
         """One tile announcement — `(6, 10, 24)` for `Encoding tiles 6-10 / 24`.
@@ -1127,8 +1169,9 @@ class DeadlineWatch:
             "at_least_seconds_more": round(projected, 1),
             "elapsed_seconds": round(spent, 1),
             "budget_seconds": round(self.budget_s, 1),
+            "stop_at_seconds": round(self.stop_at_s, 1),
         }
-        if spent + projected <= self.budget_s:
+        if spent + projected <= self.stop_at_s:
             return
         # **ONE BLOCK IS NOT ENOUGH TO CONVICT, and this is a deliberate departure from §4d's
         # wording.** The clause says to stop after the first repeated unit. The first unit's
@@ -1147,19 +1190,20 @@ class DeadlineWatch:
         self._refuse(
             "measured on this host: the fastest block in the {} phase ran at {:.1f}s a tile, and "
             "{} tiles remain in this phase alone — at least {:.0f}s more. {:.0f}s of the {:.0f}s "
-            "deadline are already spent, so this is {:.0f}s over before any later phase or the "
-            "upload is counted. Stopped here rather than at the deadline, so the time it would "
+            "deadline are already spent and the last {:.0f}s are kept for the writes, so this is "
+            "{:.0f}s over before any later phase or the upload is counted. Stopped here rather than at the deadline, so the time it would "
             "have taken to find out is not billed. The rate is the FASTEST block this job has "
             "run, not an average and not a number from a table: at any slower rate it is further over."
             .format(phase, fastest, remaining, projected, spent, self.budget_s,
-                    spent + projected - self.budget_s),
+                    WRITE_RESERVE_S, spent + projected - self.stop_at_s),
             shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
                        "elapsed_seconds": round(spent, 1),
                        "at_least_seconds_more": round(projected, 1),
-                       "suggested_execution_timeout_ms": int((spent + projected) * 1000),
+                       "suggested_execution_timeout_ms": int(
+                           (spent + projected + WRITE_RESERVE_S) * 1000),
                        "suggestion_basis": "elapsed plus the remaining tiles of this phase at the "
-                                           "fastest rate measured; later phases are not counted, "
-                                           "so this is a floor"})
+                                           "fastest rate measured, plus the write reserve; later "
+                                           "phases are not counted, so this is a floor"})
 
 
 def refuse_if_the_deadline_cannot_be_met(rationale, budget_ms, elapsed_s, frames):
@@ -1191,6 +1235,8 @@ def refuse_if_the_deadline_cannot_be_met(rationale, budget_ms, elapsed_s, frames
     remaining = (budget_ms / 1000.0) - elapsed_s
     rationale["deadline"] = {
         "budget_seconds": round(budget_ms / 1000.0, 1),
+        # Where the in-run stops fire (§4d, J7) — recorded so a record says which rule ran.
+        "stop_at_seconds": round(stop_at_seconds(budget_ms / 1000.0), 1),
         "elapsed_seconds": round(elapsed_s, 1),
         "remaining_seconds": round(remaining, 1),
         # **Recorded, never consumed.** Kept beside the budget so the series that shows this

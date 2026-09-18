@@ -12,6 +12,7 @@ deterministic, derivable from the request, and identical on a re-run. See `keys.
 """
 
 import os
+import time
 
 import requests
 
@@ -157,7 +158,50 @@ def upload(client, output, name, path, content_type):
     return key
 
 
-def put_diagnostics(diagnostics_url, body, content_type="application/json"):
+#: **The small writes' own timeouts** (`api.md` §4d clause 3, J7): the bundle and the run-record,
+#: after the stop. `CONNECT_TIMEOUT_S`/`READ_TIMEOUT_S` above exist for the master; a 71 KB object
+#: does not need 60 s, and it keeps these whether or not a deadline stopped the job — one write
+#: with two timeout behaviours is what the next reader gets wrong.
+SMALL_CONNECT_TIMEOUT_S = 5
+SMALL_READ_TIMEOUT_S = 20
+#: What one further attempt can cost. **A READ TIMEOUT IS NOT A WALL-CLOCK BOUND** (§4d clause 7):
+#: it limits each socket read, not the PUT, so a peer that dribbles bytes can outlive it. The gate
+#: below bounds the DECISION to spend again, not the attempt already running.
+SMALL_ATTEMPT_S = SMALL_CONNECT_TIMEOUT_S + SMALL_READ_TIMEOUT_S
+
+
+def put_small(url, body, content_type, deadline_at=None, clock=time.time):
+    """PUT one small object to a presigned URL: once, and a second time only where there is room.
+
+    **The one question both post-stop writes ask** (§4d clause 3(b)). The retry is gated on the
+    real clock, read at the moment it would be spent: a second attempt only where the time still
+    left before `deadline_at` — handler entry plus `execution_timeout_ms` — covers a whole
+    `SMALL_ATTEMPT_S`. No deadline means none was given, and the retry stands.
+
+    Returns `(ok, error, attempts)`. **Raises nothing**; the callers' posture is that a record or
+    a bundle must never cost a job.
+    """
+    # Resolved per call rather than at module scope, so a caller that swaps the module in
+    # `sys.modules` — the run-record's own witnesses do — reaches this path too.
+    import requests as http  # noqa: PLC0415
+
+    attempts, error = 0, None
+    while True:
+        attempts += 1
+        try:
+            response = http.put(url, data=body, headers={"Content-Type": content_type},
+                                timeout=(SMALL_CONNECT_TIMEOUT_S, SMALL_READ_TIMEOUT_S))
+            response.raise_for_status()
+            return True, None, attempts
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            error = exc
+        if attempts >= 2:
+            return False, error, attempts
+        if deadline_at is not None and deadline_at - clock() < SMALL_ATTEMPT_S:
+            return False, error, attempts
+
+
+def put_diagnostics(diagnostics_url, body, content_type="application/json", deadline_at=None):
     """PUT the diagnostics bundle to CF's presigned URL. **Never raises.**
 
     A single presigned PUT rather than a second scoped credential, deliberately: it is one
@@ -172,13 +216,6 @@ def put_diagnostics(diagnostics_url, body, content_type="application/json"):
     if not diagnostics_url:
         return False
     try:
-        response = requests.put(
-            diagnostics_url,
-            data=body,
-            headers={"Content-Type": content_type},
-            timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
-        )
-        response.raise_for_status()
-        return True
+        return put_small(diagnostics_url, body, content_type, deadline_at=deadline_at)[0]
     except Exception:  # noqa: BLE001 — see the docstring; this must never fail the job
         return False

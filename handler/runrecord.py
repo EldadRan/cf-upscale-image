@@ -64,10 +64,8 @@ REQUEST_FIELD = "run_record"
 #: and the whole point of a separate kind is that it can be enumerated without meeting bundles.
 PREFIX = "runs/"
 
-#: Long enough that a slow object store does not lose the record, short enough that it cannot
-#: meaningfully extend a job that has already finished its real work.
-CONNECT_TIMEOUT_S = 5
-READ_TIMEOUT_S = 20
+#: **The PUT's timeouts and its one gated retry live in `storage.put_small`**, shared with the
+#: bundle (§4d clause 3). They were 5/20 here first, and that is where the bundle's now come from.
 
 
 #: The configuration fields an attempt carries. Named explicitly rather than taken as "everything
@@ -246,7 +244,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     return diagnostics.redact(json.dumps(body, indent=2, default=str, sort_keys=True))
 
 
-def write(document, url, log=print, label="run-record"):
+def write(document, url, log=print, label="run-record", deadline_at=None):
     """PUT the record to the caller's presigned URL. **Never raises, never fails a job.**
 
     Returns True if it landed, False otherwise. Three outcomes, all reported and none fatal:
@@ -270,16 +268,17 @@ def write(document, url, log=print, label="run-record"):
                 "the record is optional and the job is unaffected.".format(label, REQUEST_FIELD))
             return False
 
-        import requests  # noqa: PLC0415 — already a dependency; imported here to match storage
+        # **Through the bundle's own helper** (§4d clause 3(b)): one question about whether a
+        # second attempt fits, not two implementations of it. Imported here, as `requests` was,
+        # so this module's import list stays what it was.
+        import storage  # noqa: PLC0415
 
-        response = requests.put(
-            url,
-            data=document.encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
-        )
-        response.raise_for_status()
-        log("[{}] wrote {:,} bytes".format(label, len(document)))
+        ok, error, attempts = storage.put_small(
+            url, document.encode("utf-8"), "application/json", deadline_at=deadline_at)
+        if not ok:
+            raise error
+        log("[{}] wrote {:,} bytes{}".format(
+            label, len(document), "" if attempts == 1 else " on attempt {}".format(attempts)))
         return True
     except Exception as exc:  # noqa: BLE001 — see the docstring; this must never fail the job
         # Named, not swallowed. A record that silently never appears is the same class of defect
