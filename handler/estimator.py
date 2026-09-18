@@ -1100,12 +1100,14 @@ class DeadlineWatch:
                                                "stopped, plus the write reserve; the worker "
                                                "does not know what the work would take"})
         self._refuse(
-            "this job has spent {:.0f}s of its {:.0f}s deadline and is stopping {:.0f}s short of "
+            "this job has spent {:.0f}s of its {:.0f}s deadline and is stopping {:.0f}s before "
             "it, so the bundle and the record are written before the platform ends the "
             "container. Past the deadline the container ends with nothing delivered and every "
             "second billed, and the worker is never asked — so this is the last thing it can "
             "say. Nothing here is a prediction: {:.0f}s is what the clock read.".format(
-                spent, self.budget_s, WRITE_RESERVE_S, spent),
+                # **What the clock left, not the reserve constant**: the stop fires at the first
+                # hook past `stop_at_s`, and the gap between hooks is not bounded.
+                spent, self.budget_s, max(0.0, self.budget_s - spent), spent),
             shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
                        "elapsed_seconds": round(spent, 1),
                        # **What to resend, rather than a caller doubling blindly.** The figure is

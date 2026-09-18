@@ -1271,8 +1271,10 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                     "another would run past {:.0f}s, where this job stops to keep the last "
                     "{:.0f}s of its {:.0f}s for the writes. The next configuration was computed "
                     "and is reported below; resend with a larger execution_timeout_ms to let it "
-                    "run.".format(spent, last_attempt_s, stop_at_s,
-                                  estimator.WRITE_RESERVE_S, budget_s),
+                    # **Clamped for the sentence only**: a budget at or under the reserve
+                    # stops at 0 or below, and the shortfall keeps the true figure.
+                    "run.".format(spent, last_attempt_s, max(0.0, stop_at_s),
+                                  min(estimator.WRITE_RESERVE_S, budget_s), budget_s),
                     shortfall=dict(shortfall or {},
                                    seconds_spent=round(spent, 1),
                                    seconds_per_attempt=round(last_attempt_s, 1),
