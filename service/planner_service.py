@@ -449,12 +449,31 @@ def estimate_core(body, commit, vram_table=None):
         delivered = estimator.output_dimensions(job["source_width"], job["source_height"],
                                                 job["target"])
 
+    # J5 (ruled f05b28d): the cards the time table can price, judged by the worker's own
+    # predicate. **MEMORY AND TIME ARE DIFFERENT FACTS WITH DIFFERENT SOURCES.**
+    priced_cards = estimator.cards_with_priceable_rows(estimator.load_calibration())
+
     entries = []
     for tier in read:
         answers = []
         for card in tier["cards"]:
             resolved = resolve_card(card, tier["cards"], table_cards)
             planned = _plan_card(job, resolved["hardware"])
+            if planned["fits"] and card["gpu_name"] not in priced_cards:
+                # **Time is judged on the name CF SENT, not the one memory was resolved to.**
+                # §4a-i substitutes a measured card for MEMORY when CF gives no reading, and the
+                # snapshot then carries the substitute's name — so without this the answer
+                # carried the substitute's SPEED, labelled borrowed: J5's defect wearing §4a-i's
+                # clothes. Memory stays resolved (resolved_from says so); time is withheld
+                # (timing_unavailable says so). CF sees both readings.
+                planned = dict(planned, predicted_seconds=None, prediction_basis=None,
+                               rate_from=None, timing_unavailable={
+                                   "running_on": card["gpu_name"],
+                                   "cards_with_rows": priced_cards,
+                                   "why": ("no calibration row was measured on the card CF "
+                                           "named; memory was resolved from another card, and "
+                                           "memory says nothing about speed"),
+                               })
             if resolved["resolved_from"] and planned["prediction_basis"] == "measured":
                 # §4a-i: the one field the service rewrites, and only for the MEMORY sense. The
                 # time sense needs no rewrite — the worker already labels a rate from another

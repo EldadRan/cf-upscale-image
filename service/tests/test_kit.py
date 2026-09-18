@@ -279,11 +279,13 @@ class RateFrom(unittest.TestCase):
         self.assertEqual(got["rate_from"]["tiling"]["running_at"], "high")
 
     def test_borrowed_in_either_sense(self):
-        # Memory borrowed, time this card's own: the A40's rows priced a MIG resolved to the A40.
+        # Memory borrowed; time NOT borrowed any more (J5, f05b28d): the A40's rows used to price
+        # a MIG resolved to the A40. Memory says nothing about speed, so the time is withheld.
         got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
-        self.assertEqual(got["prediction_basis"], "borrowed")
+        self.assertIsNone(got["prediction_basis"])
         self.assertIsNotNone(got["resolved_from"])
         self.assertIsNone(got["rate_from"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
     def test_refused_card_has_no_rate(self):
         got = answer(request(job(target_short_edge_px=4320)))
@@ -475,6 +477,27 @@ class TimingUnavailable(unittest.TestCase):
         self.assertFalse(got["fits"])
         self.assertIsNone(got["timing_unavailable"])
 
+    def test_memory_substituted_and_time_withheld_are_both_visible(self):
+        """With no VRAM reading, memory resolves to a measured card (§4a-i) — and time is still
+        judged on the name CF SENT: withheld, and said so, beside the memory substitution."""
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
+        self.assertTrue(got["fits"])
+        self.assertIsNotNone(got["resolved_from"])
+        self.assertNotEqual(got["hardware_used"]["gpu_name"], MIG)
+        self.assertIsNone(got["predicted_seconds"])
+        self.assertIsNone(got["prediction_basis"])
+        self.assertIsNone(got["rate_from"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
+        self.assertIsNotNone(got["quality"]["best_window"])
+
+    def test_a_measured_card_resolved_by_memory_keeps_its_time(self):
+        """The other way: a card with priceable rows whose memory was resolved still has its
+        own time — the substitution touches memory only."""
+        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.34)])]))
+        self.assertTrue(got["fits"])
+        self.assertIsNotNone(got["predicted_seconds"])
+        self.assertIsNone(got["timing_unavailable"])
+
     def test_a_measured_card_is_unchanged(self):
         got = answer(request())
         self.assertTrue(got["fits"])
@@ -564,7 +587,10 @@ class PoolFloor(unittest.TestCase):
         # the table's worst and is not in this list.
         self.assertEqual(got["hardware_used"]["gpu_name"], H200)
         self.assertEqual(got["resolved_from"], {"card": MIG, "measured": H200})
-        self.assertEqual(got["prediction_basis"], "borrowed")
+        # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
+        # CF sent; the memory resolution above is unchanged.
+        self.assertIsNone(got["prediction_basis"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
     def test_floor_card_is_borrowed_even_when_the_worker_measured_it(self):
         # The floor lands on the A40, which the table measures at this size, so the worker labels
@@ -574,7 +600,10 @@ class PoolFloor(unittest.TestCase):
         self.assertEqual(got["vram_source"], "pool_floor")
         self.assertEqual(got["hardware_used"]["gpu_name"], A40)
         self.assertEqual(got["rationale"]["prediction_basis"], "measured")
-        self.assertEqual(got["prediction_basis"], "borrowed")
+        # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
+        # CF sent; the memory resolution above is unchanged.
+        self.assertIsNone(got["prediction_basis"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
     def test_tables_worst_where_the_list_measures_none(self):
         got = answer(request(tiers=[tier(cards=[card(MIG), card("NVIDIA MADE UP 9000")])]))
@@ -595,7 +624,10 @@ class Nearest(unittest.TestCase):
         self.assertEqual(got["resolved_from"], {"card": MIG, "measured": A40})
         self.assertEqual(got["hardware_used"]["gpu_name"], A40)
         self.assertEqual(got["rationale"]["prediction_basis"], "measured")
-        self.assertEqual(got["prediction_basis"], "borrowed")
+        # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
+        # CF sent; the memory resolution above is unchanged.
+        self.assertIsNone(got["prediction_basis"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
     def test_nominal_near_a_bigger_card(self):
         got = answer(request(tiers=[tier(host_ram_gb=377.0,
