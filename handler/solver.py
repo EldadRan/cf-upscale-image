@@ -428,6 +428,14 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
     # phase's own repriced peak is the floor of what it needed — it failed at that price, so it
     # needs at least that much — which keeps the correction in one currency either way.
     needed = float(needed) if needed else max(repriced or 0.0, usable) * 1.0001
+    # **A still whose OOM names no phase is read as a decode OOM** (W2 R1(b)). An unknown phase
+    # defaults to the WINDOW lever, which for a still is terminal — so an OOM we could not read
+    # was refused as though the sampler were indicted, when a coarser grid might have survived
+    # it. The decode grid is what a still can vary and what decisions.md 3.19 walked. A NAMED
+    # dit_sample stays the window lever and stays honestly terminal.
+    phase_assumed = frames == 1 and phase not in planner.PHASE_LEVER
+    if phase_assumed:
+        phase = "vae_decode"
     answer = planner.correct(src, frames, target, usable, phase, needed, failed,
                              host_ram_gb=host_ram,
                              tile_quality=failed.get("tile_quality", "default"))
@@ -437,6 +445,8 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
         lever.replace("_", " "), needed, failed["w"])
     why = {
         "bound_gb": round(usable, 2), "phase": phase, "lever": lever, "basis": basis,
+        # Said, not silent: the decode phase was ASSUMED for a still whose OOM named none.
+        "phase_assumed": phase_assumed,
         "exited_sideways": lever in ("decode_grid", "encode_grid"),
         "carried_free_levers": ("swap_io_components"
                                 if failed_config.get("swap_io_components") else None),

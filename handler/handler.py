@@ -1296,7 +1296,8 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                                     # Steps taken and NO stop reason: the ratchet did not give
                                     # up — the OOM came from outside its reach (review, W2 Q2).
                                     recovered_in_place=bool(_real_steps(ratcheted))
-                                    and _ratchet_stop_reason(ratcheted) is None)
+                                    and _ratchet_stop_reason(ratcheted) is None,
+                                    still=still, walk=walk)
             if refusal is not None:
                 raise refusal
 
@@ -1361,7 +1362,8 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
 
 
 def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
-                  estimated_frames=None, window_steps_spent=False, recovered_in_place=False):
+                  estimated_frames=None, window_steps_spent=False, recovered_in_place=False,
+                  still=False, walk=None):
     """Whether to give up, and **why, in a form CF can act on**.
 
     "Did not retry" is not a result. The question CF is actually asking is whether sending this
@@ -1410,6 +1412,20 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
             "the recovery's reach, so the clip was not restarted: frames were already written, "
             "and restarting would re-run them. Nothing here establishes what does or does not "
             "fit; a larger card is the remedy that needs no second pass.",
+            remedy=errors.Remedy.LARGER_GPU,
+            shortfall=shortfall,
+        )
+
+    if next_row is None and still:
+        # **A still is never told about a window** (W2 R1(a)). It has no temporal context, so a
+        # window floor is a claim it cannot have. It hears what was tried and what is terminal:
+        # the walk's own reason, which names the lever and why it cannot move.
+        return WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "out of memory on a still, and nothing left to try on this card: {}. A larger card "
+            "is the remedy.".format(
+                (walk or {}).get("reason") or (walk or {}).get("basis")
+                or "no smaller configuration of this image fits"),
             remedy=errors.Remedy.LARGER_GPU,
             shortfall=shortfall,
         )
