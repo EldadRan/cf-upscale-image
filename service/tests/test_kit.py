@@ -490,13 +490,24 @@ class TimingUnavailable(unittest.TestCase):
         self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
         self.assertIsNotNone(got["quality"]["best_window"])
 
-    def test_a_measured_card_resolved_by_memory_keeps_its_time(self):
-        """The other way: a card with priceable rows whose memory was resolved still has its
-        own time — the substitution touches memory only."""
-        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.34)])]))
-        self.assertTrue(got["fits"])
-        self.assertIsNotNone(got["predicted_seconds"])
-        self.assertIsNone(got["timing_unavailable"])
+    def test_the_workers_own_reason_is_kept_when_nothing_was_substituted(self):
+        """A card sent with a full reading plans under its own name, so the worker's own
+        timing_unavailable is the answer — the service's "memory was resolved" would be false."""
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5,
+                                                     vram_free_gb=44.0)])]))
+        self.assertEqual(got["vram_source"], "given")
+        self.assertNotIn("memory was resolved", got["timing_unavailable"]["why"])
+
+    def test_both_tables_cover_the_same_cards(self):
+        """**The tripwire for the residual** (review, J5): a card the calibration prices but the
+        VRAM table lacks would resolve by memory to ANOTHER card and be priced at that card's
+        speed, labelled borrowed — the substitute's time for a priceable name. While the two
+        tables name the same cards it cannot happen; the day they diverge, this says so."""
+        priced = set(estimator.cards_with_priceable_rows(estimator.load_calibration()))
+        self.assertEqual(priced, set(TABLE),
+                         "calibration prices {} and the VRAM table holds {}; a priced card "
+                         "missing from the VRAM table gets another card's speed".format(
+                             sorted(priced), sorted(TABLE)))
 
     def test_a_measured_card_is_unchanged(self):
         got = answer(request())
@@ -587,6 +598,10 @@ class PoolFloor(unittest.TestCase):
         # the table's worst and is not in this list.
         self.assertEqual(got["hardware_used"]["gpu_name"], H200)
         self.assertEqual(got["resolved_from"], {"card": MIG, "measured": H200})
+        # The worker's own rate_from names the H200 borrowing the A40's rows; withheld time must
+        # carry no one else's rate beside it (review, J5).
+        self.assertIsNotNone(got["rationale"]["timing_from_another_card"])
+        self.assertIsNone(got["rate_from"])
         # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
         # CF sent; the memory resolution above is unchanged.
         self.assertIsNone(got["prediction_basis"])

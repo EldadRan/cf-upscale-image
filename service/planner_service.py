@@ -8,8 +8,13 @@ reorders nothing, chooses no card and ranks nothing: which card CF expects, and 
 placement risk, is CF's policy.
 
 **Every number is the worker's own output.** What this module adds is where each input came from.
-The one field it ever rewrites is `prediction_basis`, from `measured` to `borrowed`, wherever the
-planned card is not the card CF named — `nearest_memory` and `pool_floor` (§4a-i).
+It rewrites two things, both about the card CF NAMED rather than the one planned: the TIME of a
+card whose sent name has no priceable rows is withheld — predicted_seconds, prediction_basis and
+rate_from null, timing_unavailable naming it (J5, f05b28d; memory and time are different facts);
+and `prediction_basis` goes from `measured` to `borrowed` wherever the planned card is not the one
+CF named — `nearest_memory` and `pool_floor` (§4a-i). **The second is unreachable while the VRAM
+table and the calibration table cover the same cards**, which the kit asserts, and is kept for the
+day they diverge.
 """
 
 import json
@@ -459,7 +464,9 @@ def estimate_core(body, commit, vram_table=None):
         for card in tier["cards"]:
             resolved = resolve_card(card, tier["cards"], table_cards)
             planned = _plan_card(job, resolved["hardware"])
-            if planned["fits"] and card["gpu_name"] not in priced_cards:
+            own = planned.get("timing_unavailable") or {}
+            if planned["fits"] and card["gpu_name"] not in priced_cards \
+                    and own.get("running_on") != card["gpu_name"]:
                 # **Time is judged on the name CF SENT, not the one memory was resolved to.**
                 # §4a-i substitutes a measured card for MEMORY when CF gives no reading, and the
                 # snapshot then carries the substitute's name — so without this the answer
@@ -470,6 +477,9 @@ def estimate_core(body, commit, vram_table=None):
                                rate_from=None, timing_unavailable={
                                    "running_on": card["gpu_name"],
                                    "cards_with_rows": priced_cards,
+                                   # Reached only when the worker planned under another
+                                   # card's name — memory was resolved — since a card planned
+                                   # under its own name carries the worker's own reason.
                                    "why": ("no calibration row was measured on the card CF "
                                            "named; memory was resolved from another card, and "
                                            "memory says nothing about speed"),
