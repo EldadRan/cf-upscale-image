@@ -365,6 +365,13 @@ class MaxTarget(unittest.TestCase):
         self.assertEqual(sorted(got["max_target"]),
                          ["best_window", "output_height", "output_width",
                           "target_short_edge_px"])
+        # **The worker's answer for the covering short edge, not a canvas** (review, P2).
+        options = self._workers_walk(got, body_job)
+        edge = int(options[0]["how"].rsplit("=", 1)[1])
+        self.assertEqual(got["max_target"]["target_short_edge_px"], edge)
+        self.assertLess(edge, ps.read_job({"job": body_job})["target"])
+        self.assertEqual((got["max_target"]["output_width"], got["max_target"]["output_height"]),
+                         estimator.output_dimensions(1920, 1080, edge))
 
     def test_on_the_wire_for_every_card(self):
         entry = one(request(job(target_short_edge_px=4320),
@@ -378,18 +385,56 @@ class MaxTarget(unittest.TestCase):
         """The service reads the worker's own option; if its shape moves, the answer must
         fail rather than guess."""
         saved = estimator._terminal_options
-        for option in ({"option": "reduce_target_resolution", "how": "resend smaller",
-                        "cost": "?"},
-                       # A target that parses, and a sentence the service cannot re-derive.
-                       {"option": "reduce_target_resolution",
-                        "how": "resend with target_short_edge_px=1024",
-                        "cost": "delivers 1x1 instead of 2x2, at a window of 999 frames"}):
-            estimator._terminal_options = lambda *a, **k: [dict(option)]
+        # The real sentence for 1024 on this card, so each case below breaks ONE half of it.
+        width, height = estimator.output_dimensions(1920, 1080, 1024)
+        window = planner.plan((1920, 1080), 90, 1024, usable_gb=estimator._usable_vram(
+            answer(request())["hardware_used"]), host_ram_gb=46.57, gpu_name=A40)["w"]
+        true_cost = "delivers {}x{} instead of 2x2, at a window of {} frames".format(
+            width, height, window)
+        cases = (
+            [{"option": "reduce_target_resolution", "how": "resend smaller", "cost": "?"}],
+            # Right dimensions, wrong window — and right window, wrong dimensions.
+            [{"option": "reduce_target_resolution", "how": "resend with target_short_edge_px=1024",
+              "cost": true_cost.replace("window of {}".format(window), "window of 999")}],
+            [{"option": "reduce_target_resolution", "how": "resend with target_short_edge_px=1024",
+              "cost": true_cost.replace("{}x{} ".format(width, height), "1x1 ")}],
+            # A target that does not plan on this card, with the sentence its refused plan WOULD
+            # render — so only the action check can object.
+            [{"option": "reduce_target_resolution", "how": "resend with target_short_edge_px=8192",
+              "cost": "delivers {}x{} instead of 2x2, at a window of {} frames".format(
+                  *estimator.output_dimensions(1920, 1080, 8192),
+                  planner.plan((1920, 1080), 90, 8192, usable_gb=estimator._usable_vram(
+                      answer(request())["hardware_used"]), host_ram_gb=46.57,
+                      gpu_name=A40).get("w"))}],
+            # A renamed option, where the list is not empty.
+            [{"option": "shrink", "how": "resend with target_short_edge_px=1024",
+              "cost": true_cost}],
+        )
+        for listed in cases:
+            estimator._terminal_options = lambda *a, **k: [dict(o) for o in listed]
             try:
-                with self.assertRaises(RuntimeError, msg=option["how"]):
+                with self.assertRaises(RuntimeError, msg=repr(listed)):
                     answer(request(job(target_short_edge_px=4320)))
             finally:
                 estimator._terminal_options = saved
+
+    def test_a_refusal_without_its_options_is_loud(self):
+        """The worker's refusal with its options list removed must fail, not read as "nothing
+        smaller plans"."""
+        real = estimator.plan
+
+        def stripped(*a, **k):
+            try:
+                return real(*a, **k)
+            except estimator.WorkerError as refusal:
+                (refusal.shortfall or {}).pop("options", None)
+                raise
+        estimator.plan = stripped
+        try:
+            with self.assertRaises(RuntimeError):
+                answer(request(job(target_short_edge_px=4320)))
+        finally:
+            estimator.plan = real
 
     def test_step_for_step_even_off_the_default_tiling(self):
         """The walk prices at the default tiling whatever the request says; the service reports

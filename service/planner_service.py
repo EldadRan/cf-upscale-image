@@ -366,8 +366,16 @@ def _max_target(refusal, job, snapshot):
     arguments and checked against the worker's sentence: **a changed option fails the answer
     rather than guessing.** Reported, never taken; an `output_size` request gets a short edge.
     """
-    options = [o for o in (refusal.shortfall or {}).get("options") or []
+    shortfall = refusal.shortfall or {}
+    # **A moved list or a renamed option is loud too** (review, P2): read as null it would say
+    # "nothing smaller plans" on the wire, which is a false answer, not a missing one.
+    if "options" not in shortfall:
+        raise RuntimeError("the worker's capacity refusal carries no options list")
+    options = [o for o in shortfall["options"] or []
                if o.get("option") == "reduce_target_resolution"]
+    if shortfall["options"] and not options:
+        raise RuntimeError("the worker's options carry no reduce_target_resolution: {!r}".format(
+            shortfall["options"]))
     if not options:
         return None
     matched = _REDUCE_HOW.search(options[0].get("how") or "")
