@@ -1124,6 +1124,10 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                   "tile_quality": plan.get("tile_quality")}
         # Per attempt, not per job: a retry must not inherit the peak of the attempt that OOMed.
         estimator.reset_peak_vram()
+        # **The same for the hook-gap record (R7)** — and only the record: the stop rule keeps
+        # the longest gap the whole job has seen, as it keeps the whole job's budget.
+        if deadline is not None:
+            deadline.open_attempt()
         try:
             # **Per attempt, not per job.** A fresh holder each time round the ladder, so a
             # failed rung's encoder peak can never be read onto a later rung's record.
@@ -1165,7 +1169,7 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             # phase boundary, so a single run now says what encode, the sampler, decode and
             # post-processing each cost -- and which of them set the ceiling. A memory sweep that
             # needed one run per point needs one run per four.
-            _record_phases(record)
+            _record_phases(record, deadline=deadline)
             # **A run that ratcheted is not a clean measurement of the rung it started on**, and
             # the calibration table must not learn it as one. Recorded on the attempt so the
             # manifest, the ledger and the diagnostics bundle all carry it, and so a per-frame
@@ -1229,14 +1233,14 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                 # before it are worth keeping; a crash in post-processing still measured encode,
                 # sampling and decode, and those are the numbers a campaign is made of.
                 record["peak_vram_gb"] = _attempt_peak_gb()
-                _record_phases(record)
+                _record_phases(record, deadline=deadline)
                 attempts.append(record)
                 raise
             record["outcome"] = "oom"
             # The peak of the attempt that failed. Not a calibration figure — a rung that OOMed
             # has no honest cost — but it is what says how far over the edge it went.
             record["peak_vram_gb"] = _attempt_peak_gb()
-            _record_phases(record)
+            _record_phases(record, deadline=deadline)
             shortfall = estimator.diagnose_oom(exc, machine)
             # **The phase is the most actionable fact a failure carries, and it used to be
             # discarded.** The vendored code logs `Error in Phase 3 (Decoding)` and then re-raises
@@ -1730,13 +1734,19 @@ def _attempt_peak_gb():
     return estimator.observed_peak_vram_gb()
 
 
-def _record_phases(record):
+def _record_phases(record, deadline=None):
     """Per-phase peak VRAM and which phase set the ceiling, on the attempt that produced them.
 
     **Recorded, never judged.** These are measurements; the decision they inform belongs to the
     estimator and to whoever reads a shortfall. Written onto the attempt so they reach manifest.json
     on success and the diagnostics bundle on a retry, which is the same route `peak_vram_gb` takes.
     """
+    # **The longest stretch this attempt ran with no hook in it** (R7, ruled 2026-09-18). The
+    # first job to test the write reserve overran its budget by the length of one such stretch,
+    # and its record could not say how long any of them were — so the ruling that followed was
+    # made blind. Above the early returns: it is the deadline's reading, not the tap's.
+    if deadline is not None:
+        record["hook_gap"] = deadline.attempt_gap()
     # **Above the early returns, because it is a host fact and not a phase fact.** It was below
     # them first, so a run with no vendored tap — a still, a rung-1 case, anything that never
     # reached the model — recorded no core count, which is exactly the run whose tail time would
@@ -2281,7 +2291,13 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                    # and the clock reaching the budget. Encode is 6+ tiles and
                                    # decode 6-24, so this fires on a single-pass plan where a
                                    # pass-granularity guard never would.
-                                   on_tile=deadline.tile)
+                                   on_tile=deadline.tile,
+                                   # **And at every phase banner** (R7, ruled 2026-09-18). Each
+                                   # phase loads its weights between its banner and its first
+                                   # batch line — up to ~112 s for the DiT — and nothing in there
+                                   # can ask the time. Asking at the banner decides whether to
+                                   # ENTER a phase, against the longest gap this job has seen.
+                                   on_phase=deadline.phase_entered)
             # **Inside the `with`, where it says it is.** The model has finished and the encoder
             # still holds everything it was fed; the drain itself happens on the block's exit.
             _say_host("tail-in", writer)

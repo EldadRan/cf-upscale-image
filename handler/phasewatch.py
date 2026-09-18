@@ -468,7 +468,7 @@ class PhaseWatch(object):
     """
 
     def __init__(self, debug_holder, read_peak=None, reset_peak=None, on_batch=None, on_tile=None,
-                 announce=True, read_reserved=None, read_cpu_stat=None):
+                 announce=True, read_reserved=None, read_cpu_stat=None, on_phase=None):
         #: The object whose `.log` is wrapped — `inference_cli` itself in production, whose
         #: module-level `debug` is the singleton every vendored phase writes through.
         self._holder = debug_holder
@@ -483,6 +483,11 @@ class PhaseWatch(object):
         #: at the end. Optional, because the tap must stay useful to anything that only wants the
         #: peaks.
         self._on_batch = on_batch
+        #: `on_phase(name)`, called at a phase banner BEFORE the phase is opened (R7). **The
+        #: banner is a hook because the load after it is not**: each phase materialises its
+        #: weights between its banner and its first batch line, with nothing in between that can
+        #: ask the time. A refusal raised here leaves the phase unentered.
+        self._on_phase = on_phase
         self._read_reserved = _torch_reserved_gb if read_reserved is None else read_reserved
         #: **Write the readings back into the worker's own log.** Everything this class records
         #: has until now reached only the JSON the handler returns, which means the person
@@ -648,6 +653,14 @@ class PhaseWatch(object):
             # A failure line names the phase that raised and does *not* start a new one.
             self.failed_in = name
             return
+        if self._on_phase is not None:
+            try:
+                self._on_phase(name)
+            except Exception as exc:  # noqa: BLE001 — see the class docstring
+                # **Before the phase is opened, so a refusal leaves it unentered**: the previous
+                # phase stays open and `__exit__` closes it, charging it the time it really ran.
+                if _is_a_refusal(exc):
+                    raise
         self._close_current()
         self.phase = name
         self._phase_opened = time.time()

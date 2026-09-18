@@ -396,7 +396,7 @@ def _open_still_with_alpha(cli, source_path):
 
 def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alpha=False,
         alpha_through_model=False, exact_size=None, ratchet=None, on_batch=None,
-        schedule=None, on_tile=None):
+        schedule=None, on_tile=None, on_phase=None):
     """Stream chunks through the model and into the writer. Returns frames written.
 
     `frame_budget` is what the caller decided to read, not what a container claimed. Passing a
@@ -469,7 +469,10 @@ def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alph
         # refusal raised from it travels the seam `_is_a_refusal` opened.
         watch = PhaseWatch(cli, on_batch=_scheduling_eviction(on_batch, plan, runner_cache,
                                                               debug=cli.debug, schedule=schedule),
-                           on_tile=on_tile)
+                           on_tile=on_tile,
+                           # **The banner, as a hook** (R7): the load after it cannot ask the
+                           # time, so the worker asks before it goes in.
+                           on_phase=on_phase)
         #: **Stamped with the attempt the handler is on.** `run.last_phases` is a function attribute
         #: and nothing clears it, so on a warm worker it survives between jobs — and a run that
         #: raises before reaching here (a still, a refusal, a failure before the stream) would find

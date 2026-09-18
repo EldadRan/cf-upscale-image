@@ -45,6 +45,7 @@ The levers, and why they are ordered this way (`docs/decisions.md` 0.1):
 """
 
 import json
+import math
 import os
 import re
 import time
@@ -382,8 +383,10 @@ WRITE_RESERVE_S = 60
 def stop_at_seconds(budget_s):
     """Where the worker stops, from handler entry: the budget less the write reserve.
 
-    **A budget at or under the reserve stops at its first hook**, after the load — the rule
-    followed literally. The load strip itself runs before any stop can fire (§4d clause 4).
+    **A budget at or under the reserve stops at its first hook** — the rule followed literally.
+    **Since R7 that hook is the first phase banner**, which comes after the checkpoint read and the
+    runner build but BEFORE the VAE's weights are materialised. So a stop can now fire inside what
+    `prepare_s` measures as the load strip; before R7 nothing could (§4d clause 4, filed).
     """
     return budget_s - WRITE_RESERVE_S
 
@@ -1075,6 +1078,12 @@ class DeadlineWatch:
     **The count is exact and the rate is a lower bound, so the projection is a lower bound.** It
     prices the blocks left in the phase that is running and nothing else — not later phases, not
     the upload. A job it stops could not have finished under the work it did not count.
+   
+    **AND A THIRD, BETWEEN THEM: THE LONGEST GAP ALREADY SEEN** (R7, ruled 2026-09-18). Both stops
+    are asked at hooks, and the next hook can be a whole model load away — the first job to test
+    the reserve stopped 11 s past its budget. So every hook, the phase banner included, also asks
+    whether one more gap as long as the longest this job has measured still fits before the stop
+    point. See `_next_gap_would_overrun`.
     """
 
     def __init__(self, budget_ms, started, clock=time.time):
@@ -1102,9 +1111,71 @@ class DeadlineWatch:
         #: The most recent projection, for the record and for the refusal's `shortfall`. Replaced
         #: on every announcement rather than latched.
         self.checkpoint = None
+        #: **The gap rule's memory (R7, ruled 2026-09-18).** When the last hook fired, from
+        #: handler entry, and the longest interval between two hooks this JOB has measured.
+        #: **Seeded with nothing**: `prepare_s` ends at the first batch hook, so it already holds
+        #: the VAE load and says nothing about the DiT's. The first hook measures no gap.
+        #: **Job-wide, not per attempt**, like the budget: a retry's gaps are still time the job
+        #: could not interrupt.
+        self._last_hook_s = None
+        self._longest_gap_s = 0.0
+        #: The phase the last banner opened, so a gap can say where it began. Every gap lies
+        #: inside one phase, because a banner is itself a hook.
+        self._phase = None
+        #: The same measurement per ATTEMPT, for the record — see `open_attempt`.
+        self._attempt_gap = None
 
     def elapsed(self):
         return self._clock() - self.started
+
+    def open_attempt(self):
+        """Start a fresh per-attempt gap record. **The rule's longest gap is not reset.**
+
+        **But the interval back to the previous attempt's last hook is not a gap** (review F2).
+        It holds that attempt's teardown, the OOM diagnosis, the re-plan and this attempt's setup
+        — handler code, not work the job will meet again — and it is the same non-hook setup the
+        rule is unseeded against at the job's start. So each attempt's first hook measures
+        nothing, and no gap is charged to a phase this attempt never ran.
+        """
+        self._last_hook_s = None
+        self._phase = None
+        self._attempt_gap = {"largest_seconds": None, "began_in_phase": None,
+                             "ended_at_seconds": None, "hooks": 0}
+
+    def attempt_gap(self):
+        """The largest hook gap of the attempt now running, for its record (R7).
+
+        `None` when no attempt was opened. `largest_seconds` stays `None` until two hooks have
+        fired — a gap needs both ends, and zero would read as a measurement.
+        """
+        return None if self._attempt_gap is None else dict(self._attempt_gap)
+
+    def _measure_gap(self, spent):
+        """Price the interval since the previous hook and remember the longest. **Every hook.**"""
+        if self._attempt_gap is not None:
+            self._attempt_gap["hooks"] += 1
+        if self._last_hook_s is not None:
+            gap = max(0.0, spent - self._last_hook_s)
+            self._longest_gap_s = max(self._longest_gap_s, gap)
+            record = self._attempt_gap
+            if record is not None and (record["largest_seconds"] is None
+                                       or gap > record["largest_seconds"]):
+                record.update({"largest_seconds": round(gap, 1),
+                               "began_in_phase": self._phase,
+                               "ended_at_seconds": round(spent, 1)})
+        self._last_hook_s = spent
+
+    def phase_entered(self, phase, *_ignored, **_also_ignored):
+        """The phase banner, as a hook (R7). **Called BEFORE the phase is opened.**
+
+        Each phase materialises and moves its weights between its banner and its first batch
+        line, and nothing in between can ask the time — the DiT's load is the gap R7 found.
+        Asking at the banner is what lets the worker decide whether to ENTER a phase, rather than
+        discover mid-load that it should not have. A refusal here leaves the phase unentered, and
+        `_phase` still names the one that actually ran last.
+        """
+        self.budget_spent()
+        self._phase = phase
 
     def _refuse(self, message, shortfall=None):
         raise WorkerError(DEADLINE_EXCEEDED, message, remedy=Remedy.LONGER_DEADLINE,
@@ -1119,10 +1190,14 @@ class DeadlineWatch:
         jobs with neither stop. A guard reachable on one run shape and not another is the shape
         this project keeps paying for.
         """
+        spent = self.elapsed()
+        # **Measured with or without a budget**: the record wants the gaps of every run, and a
+        # job with no budget is the common case the corpus would otherwise never see.
+        self._measure_gap(spent)
         if self.budget_s is None:
             return
-        spent = self.elapsed()
         if spent < self.stop_at_s:
+            self._next_gap_would_overrun(spent)
             return
         if self.budget_s <= WRITE_RESERVE_S:
             # **§4d clause 9: a budget the reserve swallows whole.** Stopped at the first hook,
@@ -1131,8 +1206,7 @@ class DeadlineWatch:
             self._refuse(
                 "this job's {:.0f}s deadline is not more than the {:.0f}s kept for writing the "
                 "bundle and the record after a stop, so no time was left for the work and none "
-                "was attempted. It stopped at the first point it could, {:.0f}s in, after the "
-                "model load. Resend with an execution_timeout_ms that covers the job and the "
+                "was attempted. It stopped at the first point it could, {:.0f}s in. Resend with an execution_timeout_ms that covers the job and the "
                 "{:.0f}s besides.".format(self.budget_s, WRITE_RESERVE_S, spent,
                                           WRITE_RESERVE_S),
                 shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
@@ -1165,6 +1239,48 @@ class DeadlineWatch:
                                            " plus the write reserve; the worker does not know "
                                            "what remained"})
 
+    def _next_gap_would_overrun(self, spent):
+        """**Stop before work that cannot be interrupted** (R7, ruled 2026-09-18).
+
+        The stop point is checked at hooks, and the next hook can be a whole model load away: the
+        first job to test J7 stopped 71 s past its stop point and 11 s past its budget. So at
+        every hook, if the longest gap THIS job has already measured would carry it past the stop
+        point, it stops now rather than finding out at the far side of that gap.
+
+        **Measured here, never predicted** — the same posture as the checkpoint. It fails in the
+        safe direction: a stop that was not needed wastes budget; a stop that comes too late
+        loses the job, the bundle and the record together.
+
+        **What it cannot fix: a single uninterruptible stretch longer than every gap seen
+        before it.** The first gap of its kind is never anticipated, which is why the phase banner
+        is a hook as well — a gap is at most one phase's load or one batch long, never both.
+        """
+        gap = self._longest_gap_s
+        if gap <= 0.0 or spent + gap <= self.stop_at_s:
+            return
+        self._refuse(
+            "this job has spent {:.0f}s of its {:.0f}s deadline, and the longest stretch it has "
+            "already run with no point to stop at was {:.0f}s. Another like it would carry it to "
+            "{:.0f}s, past its {:.0f}s stop point, and leave less than the {:.0f}s it keeps for "
+            "writing the bundle and the record. So it stopped here, {:.0f}s before the deadline, "
+            "rather than go into work it could not stop. Both figures were read off this "
+            "job's own clock.".format(
+                spent, self.budget_s, gap, spent + gap, self.stop_at_s, WRITE_RESERVE_S,
+                self.budget_s - spent),
+            shortfall={"execution_timeout_ms": int(self.budget_s * 1000),
+                       "elapsed_seconds": round(spent, 1),
+                       "longest_gap_seconds": round(gap, 1),
+                       "stop_at_seconds": round(self.stop_at_s, 1),
+                       # **Always above the budget that was refused**: `spent + gap` is past the
+                       # stop point by the test above, so adding the reserve back clears it.
+                       # `ceil`, because `spent + gap` can clear the stop point by under a
+                       # millisecond and `int` would hand back the refused budget (review F4).
+                       "suggested_execution_timeout_ms": int(math.ceil(
+                           (max(spent * 2, spent + gap) + WRITE_RESERVE_S) * 1000)),
+                       "suggestion_basis": "the larger of twice what this job had spent and what "
+                                           "it had spent plus its longest gap, plus the write "
+                                           "reserve; the worker does not know what remained"})
+
     def tile(self, phase, first, last, total):
         """One tile announcement — `(6, 10, 24)` for `Encoding tiles 6-10 / 24`.
 
@@ -1172,9 +1288,13 @@ class DeadlineWatch:
         fifth tile as a range, so the repeated unit this can actually price is a block, and how
         many tiles a block held is the distance to the next announcement.
         """
+        # **A hook with or without a budget** (R7, review F1): `budget_spent` measures the gap
+        # and returns at once when there is no budget. Below the early return, a tiled run with
+        # no budget recorded a whole batch as one gap where a budgeted run of the same shape
+        # recorded one tile block — two different quantities under one field.
+        self.budget_spent()
         if self.budget_s is None:
             return
-        self.budget_spent()
         now = self._clock()
         previous = self._last_tile.get(phase)
         self._last_tile[phase] = (first, last, now)
