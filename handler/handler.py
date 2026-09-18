@@ -1358,10 +1358,14 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
         # remedy by ruling; only the sentence is different, and true.
         return WorkerError(
             errors.CAPACITY_EXCEEDED,
-            "out of memory, and the window was already narrowed {} times mid-clip — the most "
-            "this worker steps before stopping, because each step is a real loss of quality. "
-            "Configurations above the quality floor were not all tried; a larger card is the "
-            "remedy that needs none of them.".format(WINDOW_STEP_BUDGET),
+            # **True on every path** (review, J9): a replan can exit sideways to a finer grid at
+            # the same window, and the steps can have reached the floor, so the sentence claims
+            # neither a narrowing nor an untried configuration — only the limit it stopped on.
+            "out of memory, and the stream had already re-planned {} times mid-clip — the most "
+            "this worker attempts before stopping, because a window step is a real loss of "
+            "quality. It stopped on that limit and has not established that nothing above the "
+            "quality floor fits; a larger card is the remedy that needs no further step."
+            .format(WINDOW_STEP_BUDGET),
             remedy=errors.Remedy.LARGER_GPU,
             shortfall=shortfall,
         )
