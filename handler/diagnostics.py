@@ -358,6 +358,8 @@ _REQUEST_FIELDS = (
     "keyframe_seconds",
     # Named in the same ruling, and levers that move the plan rather than the picture.
     "tile_quality", "schedule",
+    # The x265 threading levers (J13(b)): debug only, and what a measurement wave keys on.
+    "force_x265_pools", "force_x265_frame_threads", "force_x265_rc_lookahead",
 )
 
 

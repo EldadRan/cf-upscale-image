@@ -225,6 +225,7 @@ def probe_source(path):
         # the case a bound on the carried track has to be measured against.
         "video_duration_s": (float(video["duration"]) if video.get("duration") else None),
         "codec": video.get("codec_name"),
+        "codec_tag_string": video.get("codec_tag_string"),
         "has_audio": audio is not None,
         # **Whether the source carries an alpha channel**, which decides whether this job is a
         # 4-channel job end to end: the read, the model's alpha path, the writer's pixel format,
@@ -300,6 +301,9 @@ def probe_output(path):
         "fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
         "codec": video.get("codec_name"),
+        # **The tag, beside the codec** (J13(a)): hev1 and hvc1 are the same codec and only one
+        # plays on a Mac, so a check on `codec` alone passes on an unplayable master.
+        "codec_tag_string": video.get("codec_tag_string"),
     }
 
 

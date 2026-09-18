@@ -45,6 +45,11 @@ DEFAULT_CODEC = "h264"
 #: rather than encoding something nobody asked for.
 CODEC_LIBRARIES = {"h264": "libx264", "h265": "libx265"}
 
+#: **The x265 threading levers** (J13(b), debug only): `(request key, x265 parameter)`. The
+#: flag is built from these named integers and nothing else — never a caller's string.
+X265_LEVERS = (("pools", "pools"), ("frame_threads", "frame-threads"),
+               ("rc_lookahead", "rc-lookahead"))
+
 
 def _peak_rss_gb(pid):
     """The largest resident set this process reached, in GiB, or None where it cannot be read.
@@ -250,7 +255,7 @@ class MasterWriter:
                  audio_source=None, audio_codec=None, audio_limit_s=None,
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=DEFAULT_CODEC,
                  head_keyframes=False, keyframes="default", keyframe_frames=None,
-                 keyframe_seconds=None):
+                 keyframe_seconds=None, x265_params=None):
         self.path = path
         self.width = width
         self.height = height
@@ -287,6 +292,10 @@ class MasterWriter:
         #: index back to the caller in the terms they sent it.
         self._keyframe_frames = list(keyframe_frames or ())
         self._keyframe_seconds = keyframe_seconds
+        self._x265_params = dict(x265_params or {})
+        #: The `-x265-params` value actually built, or None when none was — for the record, so a
+        #: measurement wave can tell which run used which (J13(b)).
+        self.x265_params_applied = self._x265_value()
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -329,6 +338,12 @@ class MasterWriter:
         # what arrives here is always one this map holds.
         command += ["-map", "0:v:0", "-c:v", CODEC_LIBRARIES[self._codec],
                     "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        if self._codec == "h265":
+            # **J13(a): hvc1, not ffmpeg's default hev1**, which Apple's players refuse. h264's
+            # avc1 already plays everywhere, so its command does not move.
+            command += ["-tag:v", "hvc1"]
+        if self.x265_params_applied is not None:
+            command += ["-x265-params", self.x265_params_applied]
 
         # **Five keyframes at the head, and nothing else changes.** `expr:lt(n,5)` makes frames
         # 0-4 I-frames; the encoder's own scene-cut keyframes survive beside them. Without it a
@@ -412,6 +427,16 @@ class MasterWriter:
         except BrokenPipeError:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))
         self.frames_written += 1
+
+    def _x265_value(self):
+        """`pools=4:frame-threads=16` from the levers that are set, or None — and None whenever
+        the codec is not h265, so no lever can reach an x264 command. **Absent means today**:
+        no flag at all, not an empty one."""
+        if self._codec != "h265":
+            return None
+        terms = ["{}={}".format(flag, int(self._x265_params[key])) for key, flag in X265_LEVERS
+                 if self._x265_params.get(key) is not None]
+        return ":".join(terms) or None
 
     def _keyframe_flags(self):
         """The keyframe arguments for this request, or none at all.

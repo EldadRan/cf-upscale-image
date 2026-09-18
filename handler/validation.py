@@ -125,6 +125,11 @@ TOP_LEVEL_FIELDS = {
     # time and nothing else — and it has never moved on its own.
     "force_blocks_to_swap",
     "force_swap_io_components",
+    # **The x265 threading levers** (J13(b)): today's behaviour is the default and these make it
+    # measurable, never adopted. Named integers, built into `-x265-params` by the encoder.
+    "force_x265_pools",
+    "force_x265_frame_threads",
+    "force_x265_rc_lookahead",
     # **A pinned configuration must fail, not ratchet.** Without this every limit-finding run
     # silently becomes a run of something else: the ratchet steps the rung, the job succeeds, and
     # the row banked describes a configuration nobody asked for. That is how 68 of 70 peak
@@ -185,6 +190,9 @@ REQUIRED_TOP_LEVEL = ("request_id", "request_date", "source_url", "output", "par
 #: reaching production by accident and none stops a caller who decides to. `debug` costs nothing
 #: to keep honest -- no key, no rotation, no lookup, nothing that can go stale -- and it carries
 #: one idea, *this is not a production run*, which is already what debug logging means.
+#: The x265 threading levers (J13(b)), refused on any request that does not encode h265.
+X265_LEVER_FIELDS = ("force_x265_pools", "force_x265_frame_threads", "force_x265_rc_lookahead")
+
 DEBUG_ONLY_TOP_LEVEL = frozenset(
     {f for f in TOP_LEVEL_FIELDS if f.startswith("force_")}
     | {"pin", "keep_alpha_in_model", "plan_only"})
@@ -829,6 +837,17 @@ def validate(job_input):
 
     run_record = _as_str(_require(job_input, "run_record", "at the top level"), "run_record")
 
+    # **An x265 lever on a request that is not h265 would do nothing, silently** (J13(b)). Refuse,
+    # never ignore — the encoder builds no x265 flag for x264, and a caller measuring threading
+    # on the wrong codec would bank a row describing a configuration that never ran.
+    if codec_config["codec"] != "h265":
+        for field in X265_LEVER_FIELDS:
+            if job_input.get(field) is not None:
+                raise WorkerError(
+                    FIELD_NOT_SUPPORTED,
+                    "{} tunes x265 and this request encodes {}; it would change nothing, so it "
+                    "is refused rather than ignored".format(field, codec_config["codec"]))
+
     # Flattened for the handler's use. The **wire** shape is nested; this is the normalised form
     # everything downstream reads, so the nesting exists exactly once — here — rather than being
     # threaded through every caller.
@@ -913,6 +932,17 @@ def validate(job_input):
         # calibration row against a configuration they did not run.
         "force_blocks_to_swap": _positive_int_or_none(
             job_input.get("force_blocks_to_swap"), "force_blocks_to_swap", 36),
+        # **x265's own bounds** (J13(b)): frame-threads tops out at 16 and rc-lookahead at 250;
+        # pools at 64, cf-rife's clamp. Never 0 — `threads=0` means "all", which is the
+        # unmeasured thing these exist to replace.
+        "force_x265_pools": _positive_int_or_none(
+            job_input.get("force_x265_pools"), "force_x265_pools", 64, minimum=1),
+        "force_x265_frame_threads": _positive_int_or_none(
+            job_input.get("force_x265_frame_threads"), "force_x265_frame_threads", 16,
+            minimum=1),
+        "force_x265_rc_lookahead": _positive_int_or_none(
+            job_input.get("force_x265_rc_lookahead"), "force_x265_rc_lookahead", 250,
+            minimum=1),
         "force_swap_io_components": _bool_or_none(
             job_input.get("force_swap_io_components"), "force_swap_io_components"),
         "pin": (False if job_input.get("pin") is None

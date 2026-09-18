@@ -1125,6 +1125,11 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             # actually costs, so the calibration table could never fill and every job ran the
             # floor rung for ever. It rides in `attempts`, so it reaches manifest.json on every
             # success and the diagnostics bundle on every retry.
+            # **What x265 was actually given** (J13(b)), on the attempt that ran with it — a
+            # measurement wave reads which run used which from here, not from the request.
+            applied = getattr((encoder_out or {}).get("writer"), "x265_params_applied", None)
+            if applied:
+                record["x265_params"] = applied
             record.update({"outcome": "ok", "seconds": round(time.time() - attempt_started, 1),
                            "peak_vram_gb": _attempt_peak_gb(),
                            # **Beside `seconds`, so a rate can be computed without it.** The
@@ -2019,7 +2024,15 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                              # with a delivered master's worth of work already
                                              # spent. A default that cannot be reached costs
                                              # nothing; the crash it prevents costs a job.
-                                             codec=codec or encoder.DEFAULT_CODEC)
+                                             codec=codec or encoder.DEFAULT_CODEC,
+                                             # J13(b): debug levers, absent on every
+                                             # production request, and then no flag at all.
+                                             x265_params={
+                                                 "pools": request.get("force_x265_pools"),
+                                                 "frame_threads": request.get(
+                                                     "force_x265_frame_threads"),
+                                                 "rc_lookahead": request.get(
+                                                     "force_x265_rc_lookahead")})
         if encoder_out is not None:
             encoder_out["writer"] = writer_cm
         # **The policy the stream consults when a chunk runs out of memory.** Built here because
