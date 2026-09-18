@@ -464,7 +464,7 @@ class PhaseWatch(object):
     """
 
     def __init__(self, debug_holder, read_peak=None, reset_peak=None, on_batch=None, on_tile=None,
-                 announce=True, read_reserved=None):
+                 announce=True, read_reserved=None, read_cpu_stat=None):
         #: The object whose `.log` is wrapped — `inference_cli` itself in production, whose
         #: module-level `debug` is the singleton every vendored phase writes through.
         self._holder = debug_holder
@@ -517,6 +517,15 @@ class PhaseWatch(object):
         #: spread had nowhere to be attributed and was read as host variance.
         self.durations = {}
         self._phase_opened = None
+        #: name -> cgroup `cpu.stat` counters spent inside that phase, summed across re-entries
+        #: like `durations` (J12). **`nr_throttled`/`throttled_usec` are the direct measure of the
+        #: container being stopped**; a field the host cannot say stays None rather than zero.
+        self.cpu_throttle = {}
+        self._phase_cpu = None
+        if read_cpu_stat is None:
+            import hardware  # noqa: PLC0415 — stdlib-only; the cycle stays absent
+            read_cpu_stat = hardware.cpu_stat
+        self._read_cpu_stat = read_cpu_stat
         #: name -> peak *reserved* GB, and name -> the allocator gap at that peak. The gap is what
         #: §5.1 of the planner reads to tell a fragmentation OOM from a real one, and recording it
         #: on successes too is what gives that threshold something to be calibrated against.
@@ -635,6 +644,7 @@ class PhaseWatch(object):
         self._close_current()
         self.phase = name
         self._phase_opened = time.time()
+        self._phase_cpu = self._cpu_reading()
         self.diagnosis["banners"] += 1
         self.entered[name] = self.entered.get(name, 0) + 1
         self._reset()
@@ -648,6 +658,7 @@ class PhaseWatch(object):
             self.durations[self.phase] = round(
                 self.durations.get(self.phase, 0.0) + (time.time() - self._phase_opened), 1)
             self._phase_opened = None
+        self._close_cpu()
         # **THE VOLATILE GPU SAMPLE, taken here and nowhere else** (item 10, CF 2026-08-28).
         #
         # **After the duration stamp above, which is what puts it OUTSIDE `phase_seconds`.** That
@@ -684,6 +695,31 @@ class PhaseWatch(object):
             self.phase, peak,
             "" if reserved is None else "   reserved {:6.2f}   gap {:5.2f}".format(reserved, gap)))
         self._say_host(self.phase)
+
+    def _cpu_reading(self):
+        try:
+            return self._read_cpu_stat()
+        except Exception:  # noqa: BLE001 — an instrument never costs the run
+            return None
+
+    def _close_cpu(self):
+        """Charge the closing phase with the `cpu.stat` counters spent since it opened.
+
+        Summed across re-entries like `durations`. **One interval that could not say makes the
+        phase's figure None**, whole or per field: a sum missing a term is not a smaller sum.
+        """
+        import hardware  # noqa: PLC0415 — stdlib-only; the cycle stays absent
+        opened, self._phase_cpu = self._phase_cpu, None
+        delta = hardware.cpu_stat_delta(opened, self._cpu_reading())
+        first = self.phase not in self.cpu_throttle
+        so_far = self.cpu_throttle.get(self.phase)
+        if delta is None or (not first and so_far is None):
+            self.cpu_throttle[self.phase] = None
+            return
+        self.cpu_throttle[self.phase] = {
+            name: value if first else (
+                None if value is None or so_far.get(name) is None else so_far[name] + value)
+            for name, value in delta.items()}
 
     def _sample_gpu(self):
         """One volatile reading for the phase that is closing. **Never raises, and gives up.**

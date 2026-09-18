@@ -49,8 +49,39 @@ CREDENTIAL_ERROR_CODES = {
 }
 
 
-def fetch_source(source_url, destination):
-    """Stream the presigned GET to disk. No media ever arrives in the payload."""
+def _transfer(transfers, direction, name, started, nbytes, ok):
+    """One object's clock and byte count onto `transfers` (J12). A None list records nothing."""
+    if transfers is None:
+        return
+    transfers.append({"direction": direction, "name": name,
+                      "seconds": round(time.time() - started, 3), "bytes": nbytes, "ok": ok})
+
+
+def _size_or_none(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def fetch_source(source_url, destination, transfers=None):
+    """Stream the presigned GET to disk. No media ever arrives in the payload.
+
+    **Timed and counted onto `transfers`, on failure too** (J12): the fetch that broke a job is
+    the one worth having, and without it the residual `wall_s` minus the phases mixed the fetch,
+    the uploads and everything else into one number nobody could read.
+    """
+    started = time.time()
+    try:
+        destination = _fetch(source_url, destination)
+    except BaseException:
+        _transfer(transfers, "fetch", "source", started, _size_or_none(destination), False)
+        raise
+    _transfer(transfers, "fetch", "source", started, _size_or_none(destination), True)
+    return destination
+
+
+def _fetch(source_url, destination):
     try:
         response = requests.get(
             source_url, stream=True, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S)
@@ -103,8 +134,22 @@ def client_for(output):
     )
 
 
-def upload(client, output, name, path, content_type):
-    """Write one file under the prefix. The key is deterministic, so a re-run overwrites."""
+def upload(client, output, name, path, content_type, transfers=None):
+    """Write one file under the prefix. The key is deterministic, so a re-run overwrites.
+
+    **Timed and counted per object onto `transfers`, failures included** (J12).
+    """
+    started = time.time()
+    try:
+        key = _upload(client, output, name, path, content_type)
+    except BaseException:
+        _transfer(transfers, "upload", name, started, _size_or_none(path), False)
+        raise
+    _transfer(transfers, "upload", name, started, _size_or_none(path), True)
+    return key
+
+
+def _upload(client, output, name, path, content_type):
     import botocore.exceptions
     from boto3.s3.transfer import TransferConfig
 

@@ -165,9 +165,24 @@ def _shadow_estimate(machine, output, rationale, source):
                 "absent_because": "{}: {}".format(type(exc).__name__, exc)}
 
 
+def _transfer_block(transfers):
+    objects = [dict(o) for o in (transfers or [])]
+
+    def total(direction, field, digits):
+        values = [o.get(field) for o in objects if o.get("direction") == direction]
+        # **A direction with an unknown term has an unknown total**, not a smaller one.
+        if not values or any(v is None for v in values):
+            return None
+        return round(sum(values), digits)
+    return {"fetch_s": total("fetch", "seconds", 3), "fetch_bytes": total("fetch", "bytes", 0),
+            "upload_s": total("upload", "seconds", 3),
+            "upload_bytes": total("upload", "bytes", 0), "objects": objects}
+
+
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
-          progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL):
+          progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
+          transfers=None, cpu_stat=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -234,6 +249,13 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         "load_strip": load_strip,
         "host": host_banners,
         "timings": timings,
+        # **The network, per object** (J12): what the residual `wall_s` minus the phases used to
+        # hide. Totals by direction beside the objects, so a slow datacentre reads off one number
+        # and the object that was slow off the list.
+        "transfers": _transfer_block(transfers),
+        # **The job's cgroup `cpu.stat` delta** (J12): `nr_throttled` and `throttled_usec` are the
+        # container being stopped, measured rather than inferred. None where the host cannot say.
+        "cpu_stat": cpu_stat,
         "attempts": attempts or [],
         "warnings": list(warnings or []),
     }

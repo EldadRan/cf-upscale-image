@@ -123,6 +123,9 @@ _HOST_BANNERS = phasewatch.BANNERS
 
 def handle(job_input, job=None):
     started = time.time()
+    # **The job's first `cpu.stat` reading, beside its first clock reading** (J12). The record's
+    # `cpu_stat` is the difference to the one taken when the record is assembled.
+    cpu_at_entry = hardware.cpu_stat()
     machine = hardware.read()
 
     # **How many cores this container may actually use, said out loud before anything else.**
@@ -223,7 +226,7 @@ def handle(job_input, job=None):
                              debug=request.get("debug"))
         finally:
             _write_run_record(outcome, request, machine, attempts, warnings, progress,
-                              trace, job, started)
+                              trace, job, started, cpu_at_entry=cpu_at_entry)
             shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -269,7 +272,7 @@ def _write_run_record_stub(request, machine, rationale, source, job, started):
 
 
 def _write_run_record(outcome, request, machine, attempts, warnings, progress, trace, job,
-                      started):
+                      started, cpu_at_entry=None):
     """Assemble and file the run-record. **Never raises** — see `runrecord`'s own posture.
 
     Wrapped even though `runrecord.write` cannot raise, because *assembling* the body reads a
@@ -301,6 +304,8 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             job=job,
             error=outcome.get("error"),
             warnings=warnings,
+            transfers=(trace or {}).get("transfers"),
+            cpu_stat=hardware.cpu_stat_delta(cpu_at_entry, hardware.cpu_stat()),
         )
         # **The address came with the job**, like the bundle's always has. `request` may be None
         # if validation itself failed — in which case there is no URL to have been given, and the
@@ -317,10 +322,13 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
 def _run(request, job, machine, warnings, attempts, workdir, progress, captured, started,
          trace=None):
     progress.phase("fetch", pct=0, force=True)
+    # **Every object this job moves, timed and counted** (J12). Kept on `trace` because the
+    # record is assembled in `handle`'s `finally`, where a fetch that broke the job still reaches.
+    transfers = trace.setdefault("transfers", []) if trace is not None else None
 
     # ── fetch ────────────────────────────────────────────────────────────────────────────────
     download = os.path.join(workdir, "source")
-    storage.fetch_source(request["source_url"], download)
+    storage.fetch_source(request["source_url"], download, transfers=transfers)
     # The vendored CLI dispatches on file extension and treats an unknown one as 'skip, return
     # zero frames' rather than as an error, so the extension comes from the bytes.
     extension = probe.detect_extension(download)
@@ -839,7 +847,7 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     client = storage.client_for(request["output"])
     artefacts = []
     master_key = storage.upload(client, request["output"], master, master_path,
-                                keys.content_type(master))
+                                keys.content_type(master), transfers=transfers)
     artefacts.append(master)
 
     measured = probe.probe_output(master_path)
@@ -885,7 +893,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             entries = []
         for entry in entries:
             entry["key"] = storage.upload(client, request["output"], entry["name"],
-                                          entry["path"], entry["content_type"])
+                                          entry["path"], entry["content_type"],
+                                          transfers=transfers)
             artefacts.append(entry["name"])
             derived.append({k: v for k, v in entry.items() if k not in ("path", "name")})
 
@@ -973,7 +982,7 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     with open(manifest_path, "w") as handle:
         handle.write(manifest_module.serialise(manifest_body))
     manifest_key = storage.upload(client, request["output"], manifest_name, manifest_path,
-                                  keys.content_type(manifest_name))
+                                  keys.content_type(manifest_name), transfers=transfers)
     artefacts.append(manifest_name)
 
     # A job that retried is worth a diagnostics bundle even though it succeeded: it holds both
@@ -1629,6 +1638,9 @@ def _record_phases(record):
     # with no per-phase times it had nowhere to be attributed and was read as host variance.
     if watch.durations:
         record["phase_seconds"] = dict(watch.durations)
+        # **What stopped the container inside each of those phases** (J12): cgroup `cpu.stat`
+        # counters charged per phase, beside the seconds they explain.
+        record["phase_cpu_stat"] = dict(watch.cpu_throttle)
 
 
 

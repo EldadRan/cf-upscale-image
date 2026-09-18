@@ -153,6 +153,12 @@ CGROUP_V1_MEMORY_MAX = "sys/fs/cgroup/memory/memory.limit_in_bytes"
 
 #: cgroup v2's CPU quota: "<quota> <period>", or "max <period>" when unlimited.
 CGROUP_V2_CPU_MAX = "sys/fs/cgroup/cpu.max"
+#: **The direct measure of being stopped** (J12): cgroup v2's `cpu.stat`, beside the quota
+#: above. `nr_throttled` counts the periods this container was stopped for having spent its
+#: slice, and `throttled_usec` how long it was stopped — what J11's slow postprocess had to infer.
+CGROUP_V2_CPU_STAT = "sys/fs/cgroup/cpu.stat"
+#: The four counters read, all monotonic, so a job's share is a difference of two readings.
+CPU_STAT_FIELDS = ("usage_usec", "nr_periods", "nr_throttled", "throttled_usec")
 
 #: **What the OOM killer actually watches**, and what this worker has never recorded
 #: (F-2026-08-20-41, CF exemption 34b528d). Our `[host]` banners report VmRSS. The kernel decides
@@ -341,6 +347,44 @@ def cpu_quota(root="/"):
     except (ValueError, ZeroDivisionError):
         return None
     return allowed if allowed > 0 else None
+
+
+def cpu_stat(root="/"):
+    """`{field: int}` for `CPU_STAT_FIELDS` from cgroup v2's `cpu.stat`, or None if unreadable.
+
+    **A field the file does not carry is None, never zero** — `nr_throttled` is absent without a
+    CPU controller, and a zero would read as "never stopped". Monotonic counters: difference two
+    readings with `cpu_stat_delta` for what one interval cost.
+    """
+    try:
+        with open(os.path.join(root, CGROUP_V2_CPU_STAT)) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    values = {}
+    for line in lines:
+        name, _, raw = line.strip().partition(" ")
+        if name in CPU_STAT_FIELDS:
+            try:
+                values[name] = int(raw)
+            except ValueError:
+                pass
+    return {name: values.get(name) for name in CPU_STAT_FIELDS}
+
+
+def cpu_stat_delta(before, after):
+    """What happened between two `cpu_stat` readings. None where either side could not say.
+
+    **A counter that went backwards is None, not negative**: that is a different cgroup, not a
+    job that un-spent its CPU.
+    """
+    if before is None or after is None:
+        return None
+    delta = {}
+    for name in CPU_STAT_FIELDS:
+        a, b = before.get(name), after.get(name)
+        delta[name] = None if a is None or b is None or b < a else b - a
+    return delta
 
 
 def _host_ram_gb():
