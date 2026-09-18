@@ -309,6 +309,102 @@ class RefusedQuality(unittest.TestCase):
         self.assertEqual(got["quality"]["ideal_window"], planner.ideal_window(1))
 
 
+class MaxTarget(unittest.TestCase):
+    """§3e: on a refusal, the largest target that plans on this card — the worker's own walk,
+    reported and never taken; null when nothing smaller plans."""
+
+    def _workers_walk(self, got, body_job):
+        """What the worker itself reports for the same card and shape: estimator.plan's own
+        refusal, read from its `reduce_target_resolution` option."""
+        worker_job = {"target_short_edge_px": ps.read_job({"job": body_job})["target"],
+                      "source_width": body_job["source_width"],
+                      "source_height": body_job["source_height"],
+                      "estimated_frames": body_job["frames"], "still": body_job["is_still"],
+                      "tile_quality": body_job["tile_quality"],
+                      "schedule": body_job["schedule"]}
+        with self.assertRaises(estimator.WorkerError) as caught:
+            estimator.plan(worker_job, got["hardware_used"])
+        return (caught.exception.shortfall or {}).get("options") or []
+
+    def test_equals_the_workers_walk(self):
+        body_job = job(target_short_edge_px=4320)
+        got = answer(request(body_job))
+        self.assertFalse(got["fits"])
+        options = self._workers_walk(got, body_job)
+        self.assertEqual(len(options), 1, options)
+        edge = int(options[0]["how"].rsplit("=", 1)[1])
+        target = got["max_target"]
+        self.assertEqual(target["target_short_edge_px"], edge)
+        self.assertEqual((target["output_width"], target["output_height"]),
+                         estimator.output_dimensions(1920, 1080, edge))
+        self.assertIn("delivers {}x{} ".format(target["output_width"], target["output_height"]),
+                      options[0]["cost"])
+        self.assertIn("at a window of {} frames".format(target["best_window"]),
+                      options[0]["cost"])
+        # **Reported, never taken**: the card still refuses at what the caller asked for.
+        self.assertLess(edge, 4320)
+
+    def test_nothing_smaller_plans_is_null(self):
+        body_job = job(target_short_edge_px=4320)
+        got = answer(request(body_job, [tier(cards=[card(A40, vram_total_gb=1.5,
+                                                         vram_free_gb=1.0)])]))
+        self.assertFalse(got["fits"])
+        self.assertEqual(self._workers_walk(got, body_job), [])
+        self.assertIsNone(got["max_target"])
+
+    def test_a_fitting_card_is_null(self):
+        got = answer(request())
+        self.assertTrue(got["fits"])
+        self.assertIsNone(got["max_target"])
+
+    def test_an_output_size_request_gets_a_short_edge(self):
+        body_job = job(target_short_edge_px=None, output_size={"width": 7680, "height": 4320})
+        del body_job["target_short_edge_px"]
+        got = answer(request(body_job))
+        self.assertFalse(got["fits"])
+        self.assertEqual(sorted(got["max_target"]),
+                         ["best_window", "output_height", "output_width",
+                          "target_short_edge_px"])
+
+    def test_on_the_wire_for_every_card(self):
+        entry = one(request(job(target_short_edge_px=4320),
+                            [tier(cards=[card(A40), card(A40, vram_total_gb=1.5,
+                                                         vram_free_gb=1.0)])]))
+        wire = ps.project(entry)
+        for got in wire["cards"]:
+            self.assertIn("max_target", got)
+
+    def test_a_changed_worker_option_is_loud(self):
+        """The service reads the worker's own option; if its shape moves, the answer must
+        fail rather than guess."""
+        saved = estimator._terminal_options
+        for option in ({"option": "reduce_target_resolution", "how": "resend smaller",
+                        "cost": "?"},
+                       # A target that parses, and a sentence the service cannot re-derive.
+                       {"option": "reduce_target_resolution",
+                        "how": "resend with target_short_edge_px=1024",
+                        "cost": "delivers 1x1 instead of 2x2, at a window of 999 frames"}):
+            estimator._terminal_options = lambda *a, **k: [dict(option)]
+            try:
+                with self.assertRaises(RuntimeError, msg=option["how"]):
+                    answer(request(job(target_short_edge_px=4320)))
+            finally:
+                estimator._terminal_options = saved
+
+    def test_step_for_step_even_off_the_default_tiling(self):
+        """The walk prices at the default tiling whatever the request says; the service reports
+        that walk step for step. (Swept 2026-09-18: tile_quality moved neither the action nor
+        the window at any target, so the two agree today — this pins that they keep agreeing.)"""
+        body_job = job(target_short_edge_px=4320, tile_quality="high")
+        got = answer(request(body_job))
+        self.assertFalse(got["fits"])
+        options = self._workers_walk(got, body_job)
+        self.assertEqual(got["max_target"]["target_short_edge_px"],
+                         int(options[0]["how"].rsplit("=", 1)[1]))
+        self.assertIn("at a window of {} frames".format(got["max_target"]["best_window"]),
+                      options[0]["cost"])
+
+
 class Quality(unittest.TestCase):
     """§3d: window, tail and tiling — and the chunk and the blocks are not on the wire."""
 
@@ -873,7 +969,7 @@ class Projection(unittest.TestCase):
     TIER_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
                    "registry_version", "commit", "handler_tree", "worker_handler_tree",
                    "handler_match")
-    CARD_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis",
+    CARD_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds", "prediction_basis",
                    "rate_from", "reason", "residency", "anchored", "binding_phase", "quality",
                    "hardware_used", "vram_source", "vram_stats", "resolved_from")
 

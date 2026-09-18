@@ -326,6 +326,7 @@ def _plan_card(job, snapshot):
         return {
             "fits": False, "predicted_seconds": None, "prediction_basis": None,
             "reason": refusal.message,
+            "max_target": _max_target(refusal, job, snapshot),
             # P1d/P1a (§3b): both labels as planner.fits reads a refusal (planner.py, fits).
             "residency": verdict.get("residency", planner.ROUTE_UP),
             "anchored": usable <= planner.ANCHORED_MAX_USABLE,
@@ -335,6 +336,8 @@ def _plan_card(job, snapshot):
         }
     return {
         "fits": True,
+        # §3e: only a refusal has a largest-that-plans to report.
+        "max_target": None,
         "predicted_seconds": rationale.get("predicted_seconds"),
         "prediction_basis": rationale.get("prediction_basis"),
         "reason": None,
@@ -347,6 +350,46 @@ def _plan_card(job, snapshot):
         "rate_from": _rate_from(rationale),
         "rationale": rationale, "planner_verdict": None,
     }
+
+
+#: The worker's own option, `resend with target_short_edge_px=N` (estimator._terminal_options).
+_REDUCE_HOW = re.compile(r"target_short_edge_px=(\d+)$")
+
+
+def _max_target(refusal, job, snapshot):
+    """§3e: the largest target that plans on this card, or None when nothing smaller does.
+
+    **THE WORKER'S OWN WALK, NOT A SECOND ONE.** `estimator.plan`'s capacity refusal already
+    carries `_terminal_options`' answer in its shortfall — down the 32 px grid, even-snapped,
+    floor 64, `planner.plan` in a loop — so the service reads it rather than walking again. The
+    one number is taken from the worker's option, and the rest is re-derived with the walk's own
+    arguments and checked against the worker's sentence: **a changed option fails the answer
+    rather than guessing.** Reported, never taken; an `output_size` request gets a short edge.
+    """
+    options = [o for o in (refusal.shortfall or {}).get("options") or []
+               if o.get("option") == "reduce_target_resolution"]
+    if not options:
+        return None
+    matched = _REDUCE_HOW.search(options[0].get("how") or "")
+    if not matched:
+        raise RuntimeError("the worker's reduce_target_resolution option changed shape: {!r}"
+                           .format(options[0]))
+    edge = int(matched.group(1))
+    width, height = job["source_width"], job["source_height"]
+    out_w, out_h = estimator.output_dimensions(width, height, edge)
+    # **Exactly the walk's call** (estimator._terminal_options): its frames, its usable VRAM,
+    # and no tile_quality or schedule — the window is the one the worker's sentence names.
+    answer = planner.plan(
+        (width, height), max(1, int(job["frames"] or 1)), edge,
+        usable_gb=estimator._usable_vram(snapshot), host_ram_gb=snapshot.get("host_ram_gb"),
+        gpu_name=snapshot.get("gpu_name"))
+    if answer.get("action") != "plan" or "delivers {}x{} ".format(out_w, out_h) not in \
+            options[0].get("cost", "") or \
+            "at a window of {} frames".format(answer["w"]) not in options[0].get("cost", ""):
+        raise RuntimeError("the worker's smaller target does not re-derive: {!r}".format(
+            options[0]))
+    return {"target_short_edge_px": edge, "output_width": out_w, "output_height": out_h,
+            "best_window": answer["w"]}
 
 
 def _rate_from(rationale):
@@ -443,7 +486,8 @@ def estimate_core(body, commit, vram_table=None):
 TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
                     "registry_version", "commit", "handler_tree", "worker_handler_tree",
                     "handler_match")
-CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "predicted_seconds", "prediction_basis",
+CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds",
+                    "prediction_basis",
                     "rate_from", "reason", "residency", "anchored", "binding_phase", "quality",
                     "hardware_used", "vram_source", "vram_stats", "resolved_from")
 
