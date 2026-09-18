@@ -2263,8 +2263,11 @@ def _upscale_once(cli, request, source, source_path, master_path, plan, progress
                                    # call site exactly and a nested `def` not at all, so a named
                                    # one would put this line back outside the instrument that
                                    # now covers it.
+                                   # **A write hook, so the plain budget stop and
+                                   # not the gap rule** (R7 Q2): nothing is left to
+                                   # enter once frames are being written.
                                    on_chunk=lambda written, **forwarded: (
-                                       deadline.budget_spent(),
+                                       deadline.frames_written(),
                                        progress.frames(written, **forwarded))[1],
                                    # **The heartbeat, and it is not the same thing as `on_chunk`.**
                                    # `frames_done` cannot advance here -- frames are not written

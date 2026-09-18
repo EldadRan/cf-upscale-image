@@ -1189,7 +1189,26 @@ class DeadlineWatch:
         first version of this had its only call site inside `tile()`, which left exactly those
         jobs with neither stop. A guard reachable on one run shape and not another is the shape
         this project keeps paying for.
+
+        **This is the MODEL's hook** — banner, batch, tile — and it carries the gap rule. A frame
+        written is `frames_written`'s, which does not.
         """
+        self._stop_check(gap_rule=True)
+
+    def frames_written(self, *_ignored, **_also_ignored):
+        """A write hook (`on_chunk`): the plain budget stop, and **never the gap rule** (R7 Q2,
+        ruled 2026-09-18).
+
+        The rule asks whether the job can afford to ENTER the next thing it cannot interrupt.
+        Frames are written only after a chunk's four phases have run, so what follows a write is
+        more writes, the drain and the upload — or the next chunk, whose first phase banner is a
+        hook and asks then. **After the last frame there is nothing left to enter**, and the
+        longest gap, typically a model load, describes none of the tail. Applying it there
+        refused a FINISHED render, which puts cost above success. The gap is still measured.
+        """
+        self._stop_check(gap_rule=False)
+
+    def _stop_check(self, gap_rule):
         spent = self.elapsed()
         # **Measured with or without a budget**: the record wants the gaps of every run, and a
         # job with no budget is the common case the corpus would otherwise never see.
@@ -1197,7 +1216,8 @@ class DeadlineWatch:
         if self.budget_s is None:
             return
         if spent < self.stop_at_s:
-            self._next_gap_would_overrun(spent)
+            if gap_rule:
+                self._next_gap_would_overrun(spent)
             return
         if self.budget_s <= WRITE_RESERVE_S:
             # **§4d clause 9: a budget the reserve swallows whole.** Stopped at the first hook,
