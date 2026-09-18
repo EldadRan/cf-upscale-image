@@ -3,8 +3,8 @@
   "rule": "per gpu_name: minimum vram_total_gb over included readings, then minimum vram_free_gb at that total (cf-planner.md §4a)",
   "corpus": {
     "source": "cf-upscale-project/records/runs",
-    "records": 89,
-    "included": 82,
+    "records": 110,
+    "included": 103,
     "excluded": [
       "01REAL20260823T18121000",
       "01REAL20260823T18170000",
@@ -18,21 +18,21 @@
       "01REAL20260820T09291300"
     ],
     "first_record": "01REAL20260819T14575300",
-    "last_record": "01REAL20260831T20142700",
+    "last_record": "01REAL20260918T21403500",
     "first_utc": "2026-08-19T15:55:10.771399+00:00",
-    "last_utc": "2026-08-31T20:25:28.898034+00:00"
+    "last_utc": "2026-09-18T21:45:48.082186+00:00"
   },
   "cards": {
     "NVIDIA A40": {
       "vram_total_gb": 44.34,
       "vram_free_gb": 43.72,
-      "readings": 49,
+      "readings": 56,
       "readings_at_total": 2,
       "stats": {
-        "free_mean_gb": 44.3016,
+        "free_mean_gb": 44.2727,
         "free_min_gb": 43.72,
         "free_max_gb": 47.05,
-        "n": 49,
+        "n": 56,
         "n_at_total": 2
       }
     },
@@ -52,27 +52,27 @@
     "NVIDIA H200": {
       "vram_total_gb": 139.8,
       "vram_free_gb": 139.06,
-      "readings": 23,
-      "readings_at_total": 21,
+      "readings": 29,
+      "readings_at_total": 27,
       "stats": {
-        "free_mean_gb": 139.0683,
+        "free_mean_gb": 139.0672,
         "free_min_gb": 139.06,
         "free_max_gb": 139.08,
-        "n": 23,
-        "n_at_total": 21
+        "n": 29,
+        "n_at_total": 27
       }
     },
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
       "vram_total_gb": 94.97,
       "vram_free_gb": 93.74,
-      "readings": 8,
-      "readings_at_total": 5,
+      "readings": 16,
+      "readings_at_total": 13,
       "stats": {
-        "free_mean_gb": 94.21,
+        "free_mean_gb": 94.2344,
         "free_min_gb": 93.74,
         "free_max_gb": 94.29,
-        "n": 8,
-        "n_at_total": 5
+        "n": 16,
+        "n_at_total": 13
       }
     }
   }
