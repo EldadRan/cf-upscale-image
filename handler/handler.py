@@ -1265,7 +1265,10 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                                   "the clip at a configuration it has already reached"}
             else:
                 nxt_row, walk = solver.next_after_oom(
-                    _job_shape_for(source, plan, estimated_frames, exact_size),
+                    # **A still is one frame to the solver too** (W2 Q1): it exited on
+                    # `frames is None` before pricing anything, so a still that OOMed was
+                    # refused untried — against 3.19, where one walked to swapped and delivered.
+                    _job_shape_for(source, plan, 1 if still else estimated_frames, exact_size),
                     machine, plan, (rationale or {}).get("predicted_peak_vram_gb"),
                     phase=(shortfall or {}).get("phase"), shortfall=shortfall,
                     relax_swap=not request.get("pin"))
