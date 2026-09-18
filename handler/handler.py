@@ -643,12 +643,23 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
 
     # **A deadline that could not be checked has to say so.** Silence here reads exactly like a
     # deadline that was checked and passed — which is how a 60s cap let a 591s job run and bill.
+    #
+    # **Replaced, not removed (W2 Q4).** It said the deadline "was NOT checked" — no job has had
+    # a pre-run check since §4d — and that the job "will be killed with the cost billed", which
+    # J7's budget stop made false. It must still NOT reassure: the reserve is sized to the write
+    # path and not measured (api.md §4d), and nothing here predicts whether the work will fit.
     if request.get("execution_timeout_ms") and not rationale.get("predicted_seconds"):
+        absent = rationale.get("timing_unavailable")
+        why = ("{} has no calibration rows (see rationale.timing_unavailable)".format(
+                   absent.get("running_on"))
+               if absent else "nothing comparable is calibrated at this size")
         warnings.append(
-            "execution_timeout_ms was given but this job could not be predicted at rung '{}' — "
-            "nothing comparable is calibrated, so the deadline was NOT checked and a job that "
-            "cannot finish inside it will be killed with the cost billed.".format(
-                rationale["rung"]))
+            "no time prediction for this job: {}, so there is no predicted duration and no ETA "
+            "until the run has measured its own progress. The in-run stops still apply — the job "
+            "stops {}s before execution_timeout_ms to write its record — but that reserve is "
+            "sized to the write path and not measured, and nothing predicts whether this job's "
+            "work fits the budget; one that does not is stopped, not finished.".format(
+                why, estimator.WRITE_RESERVE_S))
 
     # Comfortable but close is worth saying before it bites, since the caller chooses the cap and
     # a resubmit costs them the whole job over again. **Read off the same arithmetic the refusal
