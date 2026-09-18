@@ -357,7 +357,9 @@ def cpu_stat(root="/"):
     readings with `cpu_stat_delta` for what one interval cost.
     """
     try:
-        with open(os.path.join(root, CGROUP_V2_CPU_STAT)) as handle:
+        # **ASCII, not the locale's encoding**: the kernel writes ASCII, and a locale that decodes
+        # anything (latin-1) would turn garbage into a row of Nones instead of an unreadable file.
+        with open(os.path.join(root, CGROUP_V2_CPU_STAT), encoding="ascii") as handle:
             lines = handle.read().splitlines()
     except (OSError, ValueError):
         # **ValueError too**: a decode error is one, and this is read at handler entry, outside
