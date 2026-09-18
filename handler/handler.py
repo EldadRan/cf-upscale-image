@@ -1268,6 +1268,9 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             ratcheted = list(getattr(pipeline.run, "last_ratchet", []) or [])
             if ratcheted:
                 record["ratchet"] = ratcheted
+            # **Only real steps withhold a restart** (W2 Q2): a `stopped` record says why the
+            # stream gave up, and a first OOM that stopped at the floor took no step at all.
+            if _real_steps(ratcheted):
                 # **A clip that already recovered in place is not restarted.** Everything this
                 # loop could try has been tried, from a position that had frames written, which
                 # this one does not.
@@ -1286,7 +1289,10 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
             record["walk"] = walk
             refusal = _refuse_retry(request, plan, nxt_row, shortfall, machine, source_path,
                                     exc, estimated_frames=estimated_frames,
-                                    window_steps_spent=_window_steps_spent(ratcheted))
+                                    # **Told, not counted** (W2 Q2): the reason the
+                                    # ratchet published, not a count of its steps.
+                                    window_steps_spent=_ratchet_stop_reason(ratcheted)
+                                    == "window_step_budget")
             if refusal is not None:
                 raise refusal
 
@@ -1460,6 +1466,18 @@ WINDOW_STEP_BUDGET = 3
 #: The step kinds `_Ratchet` counts against `WINDOW_STEP_BUDGET`. `same_window` is the free
 #: in-place retry and is not a window step.
 _BUDGETED_STEPS = ("replan", "step_down")
+
+
+def _ratchet_stop_reason(published):
+    """The reason the stream's ratchet gave up, from its `stopped` record, or None if it did not
+    stop — an OOM that arrived after the stream is not a ratchet stop and says neither (W2 Q2)."""
+    stops = [r for r in published or [] if r.get("kind") == "stopped"]
+    return stops[-1].get("reason") if stops else None
+
+
+def _real_steps(published):
+    """The steps a stream actually took — a `stopped` record is not a step."""
+    return [r for r in published or [] if r.get("kind") != "stopped"]
 
 
 def _window_steps_spent(steps):
@@ -1793,6 +1811,10 @@ class _Ratchet:
         return bool(self._request["allow_oom_retry"]) and estimator.is_oom(exception)
 
     def step(self, plan, frames_written, exception):
+        #: **Why this ratchet gave up, when it does** (W2 Q2): "window_step_budget" or "floor",
+        #: published by the stream as a `stopped` record so the refusal reads the reason instead
+        #: of inferring it from a count of steps.
+        self.stop_reason = None
         estimator.release_gpu_memory()
         shortfall = estimator.diagnose_oom(exception, hardware.read())
 
@@ -1845,6 +1867,7 @@ class _Ratchet:
         # override the ranking: a decode failure exits sideways to the same window at the next
         # grid instead of cutting the window it did not implicate.
         if self._window_steps >= WINDOW_STEP_BUDGET:
+            self.stop_reason = "window_step_budget"
             return None
         if self._job_shape is None:
             # No dimensions to re-plan against — a caller that built this ratchet for the stream
@@ -1919,6 +1942,7 @@ class _Ratchet:
         window = _effective_window(plan)
         smaller = [w for w in solver.lattice(window) if w < window]
         if not smaller:
+            self.stop_reason = "floor"
             return None
         self._window_steps += 1
         nxt_plan = dict(plan)

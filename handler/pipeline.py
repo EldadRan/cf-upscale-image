@@ -744,6 +744,10 @@ def _stream(cli, capture, args, plan, frame_budget, writer, on_chunk, chunk_size
             # own refusal explains what was tried — with `last_ratchet` recording that the frames
             # already written are gone, so nothing above restarts the clip believing it is cheap.
             if step is None:
+                # **Why, published beside the steps** (W2 Q2), so the refusal is told the reason
+                # rather than inferring it from how many steps there were.
+                _stream.last_ratchet.append({"kind": "stopped",
+                                             "reason": getattr(ratchet, "stop_reason", None)})
                 raise
 
             plan = step["plan"]
