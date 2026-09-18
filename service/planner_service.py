@@ -332,6 +332,7 @@ def _plan_card(job, snapshot):
             "anchored": usable <= planner.ANCHORED_MAX_USABLE,
             "binding_phase": None, "quality": _quality_of_refusal(frames),
             "rate_from": None,
+            "timing_unavailable": None,
             "rationale": None, "planner_verdict": verdict,
         }
     return {
@@ -348,6 +349,9 @@ def _plan_card(job, snapshot):
         # §4a-ii: whose measurement the time is. The worker's own two keys, carried through
         # unchanged — null means the rate is this card's own rows.
         "rate_from": _rate_from(rationale),
+        # J5: a card no row was measured on gets no time and says so — a named absence. The
+        # card still fits and still has quality; a null time is not a refusal.
+        "timing_unavailable": rationale.get("timing_unavailable"),
         "rationale": rationale, "planner_verdict": None,
     }
 
@@ -496,7 +500,7 @@ TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_heig
                     "handler_match")
 CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds",
                     "prediction_basis",
-                    "rate_from", "reason", "residency", "anchored", "binding_phase", "quality",
+                    "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
                     "hardware_used", "vram_source", "vram_stats", "resolved_from")
 
 

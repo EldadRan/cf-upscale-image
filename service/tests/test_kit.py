@@ -450,6 +450,34 @@ class MaxTarget(unittest.TestCase):
                       options[0]["cost"])
 
 
+class TimingUnavailable(unittest.TestCase):
+    """J5: a card no row was measured on gets a NAMED absence of time — and still fits, still
+    has quality. A null time is not a refusal, and a refusal is still a refusal."""
+
+    def test_an_unseen_card_fits_with_no_time_and_says_why(self):
+        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5,
+                                                     vram_free_gb=44.0)])]))
+        self.assertTrue(got["fits"])
+        self.assertIsNotNone(got["quality"]["best_window"])
+        self.assertIsNone(got["predicted_seconds"])
+        self.assertIsNone(got["prediction_basis"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
+        self.assertIn(A40, got["timing_unavailable"]["cards_with_rows"])
+        self.assertNotIn(MIG, got["timing_unavailable"]["cards_with_rows"])
+
+    def test_an_unseen_card_that_cannot_hold_it_still_refuses(self):
+        got = answer(request(job(target_short_edge_px=4320),
+                             [tier(cards=[card(MIG, vram_total_gb=44.5, vram_free_gb=44.0)])]))
+        self.assertFalse(got["fits"])
+        self.assertIsNone(got["timing_unavailable"])
+
+    def test_a_measured_card_is_unchanged(self):
+        got = answer(request())
+        self.assertTrue(got["fits"])
+        self.assertIsNotNone(got["predicted_seconds"])
+        self.assertIsNone(got["timing_unavailable"])
+
+
 class Quality(unittest.TestCase):
     """§3d: window, tail and tiling — and the chunk and the blocks are not on the wire."""
 
@@ -1015,7 +1043,7 @@ class Projection(unittest.TestCase):
                    "registry_version", "commit", "handler_tree", "worker_handler_tree",
                    "handler_match")
     CARD_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds", "prediction_basis",
-                   "rate_from", "reason", "residency", "anchored", "binding_phase", "quality",
+                   "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
                    "hardware_used", "vram_source", "vram_stats", "resolved_from")
 
     def _through_http(self, body):
