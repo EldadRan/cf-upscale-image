@@ -133,6 +133,10 @@ class Parity(unittest.TestCase):
     RECORD = "2026-08-31_01REAL20260831T15562300.json"
     #: The two keys the handler adds after `estimator.plan` returns (§7, ruled on C3).
     HANDLER_ADDED = ("deadline", "effective_temporal_window")
+    #: **Keys W5 P3 re-derives** (ruled 2026-09-18): the record was written by the lookup, and the
+    #: simple rate replaced it. Checked against the worker's own derivation instead, so parity
+    #: still means the service answers exactly what the worker would — today.
+    P3_REDERIVED = ("predicted_seconds", "seconds_per_frame")
 
     def test_cd622500(self):
         path = os.path.join(RUNS, self.RECORD)
@@ -156,18 +160,30 @@ class Parity(unittest.TestCase):
 
         self.assertEqual(got["vram_source"], "given")
         self.assertIsNone(got["resolved_from"])
-        compared = sorted(k for k in recorded if k not in self.HANDLER_ADDED)
+        compared = sorted(k for k in recorded
+                          if k not in self.HANDLER_ADDED and k not in self.P3_REDERIVED)
         mismatched = {k: (recorded[k], fresh.get(k, "<absent>"))
                       for k in compared if fresh.get(k, object()) != recorded[k]}
         self.assertEqual(mismatched, {}, "recorded vs fresh")
         only_fresh = sorted(set(fresh) - set(recorded))
         print("\n  parity: {} recorded keys equal; excluded {}; only in fresh output: {}".format(
             len(compared), list(self.HANDLER_ADDED), only_fresh))
-        self.assertEqual(got["predicted_seconds"], 897.1)
+        # **The record's number is the lookup's; the service's is the rate's** (W5 P3). The rate
+        # is the A40's batched one, derived from the committed table.
         self.assertEqual(recorded["predicted_seconds"], 897.1)
+        rate = estimator.card_rates(estimator.load_calibration())[(A40, estimator.BATCHED)]
+        pixels = fresh["output_width"] * fresh["output_height"]
+        self.assertEqual(fresh["seconds_per_frame"], round(pixels / 1e6 / rate["mpx_per_s"], 4))
+        # **Tied to the frame count, not to itself** (review, P3): the service's number is the
+        # rate over the delivered plane times the source's frames, so a wrong frame count or a
+        # term added on the way out fails here. The rate itself is pinned against a formula
+        # written out in tests/run_local.py (check_the_rate_is_derived_per_card_and_regime).
+        self.assertEqual(got["predicted_seconds"],
+                         round(pixels / 1e6 / rate["mpx_per_s"] * source["estimated_frames"], 1))
         # Every field the wire carries is the worker's own, key for key (review F2, F3 on P1).
         for field, key in PROJECTED_FROM_RATIONALE:
-            self.assertEqual(got[field], recorded[key], field)
+            expected = fresh[key] if key in self.P3_REDERIVED else recorded[key]
+            self.assertEqual(got[field], expected, field)
         for field, key in QUALITY_FROM_RATIONALE:
             self.assertEqual(got["quality"][field], recorded[key], field)
         self.assertEqual(got["prediction_basis"], "measured")
@@ -245,34 +261,41 @@ class PerCard(unittest.TestCase):
 class RateFrom(unittest.TestCase):
     """Whose measurement the time is (§4a-ii): null where it is this card's own."""
 
-    def test_one_number_on_three_cards_says_where_it_came_from(self):
-        cards = [card(A40), card(H200), card(B200)]
-        entry = one(request(tiers=[tier(host_ram_gb=377.0, cards=cards)]))
+    def test_one_number_on_two_cards_says_where_it_came_from(self):
+        # **W5 P3**: a rate is per card and regime, so the lookup's "one number on three cards"
+        # (the pixel band held only A40 rows) is gone. What survives is a card with no rows in
+        # the job's REGIME: the B200 has no window-1 rate, so a still on it borrows the slowest
+        # measured card's — the A40's — and the two answer the same number.
+        cards = [card(A40), card(B200)]
+        entry = one(request(job(frames=1, is_still=True, source_width=749, source_height=500, target_short_edge_px=1920), [tier(host_ram_gb=377.0, cards=cards)]))
         seconds = [c["predicted_seconds"] for c in entry["cards"]]
         self.assertEqual(len(set(seconds)), 1, "the case exists because the numbers are equal")
         rates = [c["rate_from"] for c in entry["cards"]]
         self.assertIsNone(rates[0], "the A40 owns the rows this rate came from")
-        for got, name in zip(entry["cards"][1:], (H200, B200)):
-            self.assertIsNotNone(got["rate_from"], name)
-            self.assertEqual(got["rate_from"]["running_on"], name)
-            self.assertEqual(got["rate_from"]["rows_measured_on"], [A40])
-            self.assertEqual(got["prediction_basis"], "borrowed", name)
-        self.assertNotEqual(rates, [None, None, None])
+        got = entry["cards"][1]
+        self.assertEqual(got["rate_from"]["running_on"], B200)
+        self.assertEqual(got["rate_from"]["rows_measured_on"], [A40])
+        self.assertEqual(got["prediction_basis"], "borrowed")
 
     def test_rate_from_is_the_workers_own_keys(self):
-        got = answer(request(tiers=[tier(host_ram_gb=377.0, cards=[card(B200)])]))
+        got = answer(request(job(frames=1, is_still=True, source_width=749, source_height=500, target_short_edge_px=1920), [tier(host_ram_gb=377.0, cards=[card(B200)])]))
         self.assertEqual(got["rate_from"], got["rationale"]["timing_from_another_card"])
 
     def test_tiling_half(self):
-        # `high` tiling has no rows at all, on any card: the rate is the default-tiling rows'.
-        got = answer(request(job(tile_quality="high"), [tier(cards=[card(A40)])]))
+        # **The RTX PRO 6000 has no `high` row** (W5 P3 banked `high` rows for the A40 and the
+        # H200): its rate is the default-tiling rows', and the label says so.
+        got = answer(request(job(tile_quality="high"),
+                             [tier(host_ram_gb=377.0, cards=[card(BLACKWELL)])]))
         self.assertEqual(got["rate_from"]["tiling"],
                          got["rationale"]["timing_from_another_tiling"])
         self.assertNotIn("running_on", got["rate_from"])
         self.assertEqual(got["prediction_basis"], "borrowed")
 
     def test_both_halves_at_once(self):
-        got = answer(request(job(tile_quality="high"),
+        # A `high` still on the B200: no window-1 rate of its own, and no `high` row among the
+        # A40 window-1 rows it borrows.
+        got = answer(request(job(frames=1, is_still=True, source_width=749, source_height=500,
+                                 target_short_edge_px=1920, tile_quality="high"),
                              [tier(host_ram_gb=377.0, cards=[card(B200)])]))
         self.assertEqual(got["rate_from"]["running_on"], B200)
         self.assertEqual(got["rate_from"]["rows_measured_on"], [A40])
@@ -598,12 +621,23 @@ class PoolFloor(unittest.TestCase):
         # the table's worst and is not in this list.
         self.assertEqual(got["hardware_used"]["gpu_name"], H200)
         self.assertEqual(got["resolved_from"], {"card": MIG, "measured": H200})
-        # The worker's own rate_from names the H200 borrowing the A40's rows; withheld time must
-        # carry no one else's rate beside it (review, J5).
-        self.assertIsNotNone(got["rationale"]["timing_from_another_card"])
+        # Withheld time must carry no one else's rate beside it (review, J5) — asserted below on a
+        # resolved card that borrows (W5 P3 gave the H200 its own batched rate).
         self.assertIsNone(got["rate_from"])
         # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
         # CF sent; the memory resolution above is unchanged.
+        self.assertIsNone(got["prediction_basis"])
+        self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
+
+    def test_withheld_time_carries_no_borrowed_rate(self):
+        # **The half above, on a card that borrows** (W5 P3): a still resolved onto the B200,
+        # which has no window-1 rate, so the worker's rationale names the A40's rows — and the
+        # MIG's withheld time must not carry them.
+        got = answer(request(job(frames=1, is_still=True, source_width=749, source_height=500, target_short_edge_px=1920),
+                             [tier(host_ram_gb=377.0, cards=[card(MIG), card(B200, vram_total_gb=179.0)])]))
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": B200})
+        self.assertIsNotNone(got["rationale"]["timing_from_another_card"])
+        self.assertIsNone(got["rate_from"])
         self.assertIsNone(got["prediction_basis"])
         self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
@@ -966,7 +1000,13 @@ class Still(unittest.TestCase):
         Pinned at cf-upscale-image bb39a9c, before J10."""
         got = one(request(job(frames=1, is_still=True, source_width=749, source_height=500,
                               target_short_edge_px=1920)))["cards"][0]
-        self.assertEqual((got["predicted_seconds"], got["prediction_basis"]), (27.4, "measured"))
+        # **Moved by W5 P3, by ruling** — 27.4 was the lookup's. Pinned now to the mechanism, not
+        # to a number: the A40's window-1 rate over the delivered plane, one frame. A banked row
+        # moves it without failing this; a service that stops answering the worker's rate fails.
+        rate = estimator.card_rates(estimator.load_calibration())[(A40, estimator.UNBATCHED)]
+        width, height = estimator.output_dimensions(749, 500, 1920)
+        self.assertEqual((got["predicted_seconds"], got["prediction_basis"]),
+                         (round(width * height / 1e6 / rate["mpx_per_s"], 1), "measured"))
 
 
 class Match(unittest.TestCase):
