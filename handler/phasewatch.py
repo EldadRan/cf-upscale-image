@@ -392,6 +392,10 @@ def boot_banner():
         "\n" + build_banner())
 
 
+#: `PhaseWatch._phase_cpu` between a close and the next open.
+_NOT_OPEN = object()
+
+
 def _torch_peak_gb():
     """Peak bytes allocated since the last reset, in GB, or None off-GPU.
 
@@ -521,7 +525,10 @@ class PhaseWatch(object):
         #: like `durations` (J12). **`nr_throttled`/`throttled_usec` are the direct measure of the
         #: container being stopped**; a field the host cannot say stays None rather than zero.
         self.cpu_throttle = {}
-        self._phase_cpu = None
+        #: The reading at the open phase's start, None when it could not be read, and
+        #: `_NOT_OPEN` when no phase has opened since the last close — a second close then
+        #: charges nothing rather than nulling a good figure.
+        self._phase_cpu = _NOT_OPEN
         if read_cpu_stat is None:
             import hardware  # noqa: PLC0415 — stdlib-only; the cycle stays absent
             read_cpu_stat = hardware.cpu_stat
@@ -709,7 +716,9 @@ class PhaseWatch(object):
         phase's figure None**, whole or per field: a sum missing a term is not a smaller sum.
         """
         import hardware  # noqa: PLC0415 — stdlib-only; the cycle stays absent
-        opened, self._phase_cpu = self._phase_cpu, None
+        opened, self._phase_cpu = self._phase_cpu, _NOT_OPEN
+        if opened is _NOT_OPEN:
+            return
         delta = hardware.cpu_stat_delta(opened, self._cpu_reading())
         first = self.phase not in self.cpu_throttle
         so_far = self.cpu_throttle.get(self.phase)

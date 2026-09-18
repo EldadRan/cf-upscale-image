@@ -143,7 +143,9 @@ def upload(client, output, name, path, content_type, transfers=None):
     try:
         key = _upload(client, output, name, path, content_type)
     except BaseException:
-        _transfer(transfers, "upload", name, started, _size_or_none(path), False)
+        # **None, not the file's size**: how much of a failed upload moved is unknown, and the
+        # size would total exactly as a delivery does. A failed fetch knows what it received.
+        _transfer(transfers, "upload", name, started, None, False)
         raise
     _transfer(transfers, "upload", name, started, _size_or_none(path), True)
     return key

@@ -359,7 +359,9 @@ def cpu_stat(root="/"):
     try:
         with open(os.path.join(root, CGROUP_V2_CPU_STAT)) as handle:
             lines = handle.read().splitlines()
-    except OSError:
+    except (OSError, ValueError):
+        # **ValueError too**: a decode error is one, and this is read at handler entry, outside
+        # every other guard — an instrument must never cost the job it measures.
         return None
     values = {}
     for line in lines:
