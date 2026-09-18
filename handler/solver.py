@@ -428,25 +428,40 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
     # phase's own repriced peak is the floor of what it needed — it failed at that price, so it
     # needs at least that much — which keeps the correction in one currency either way.
     needed = float(needed) if needed else max(repriced or 0.0, usable) * 1.0001
-    # **A still whose OOM names no phase is read as a decode OOM** (W2 R1(b)). An unknown phase
-    # defaults to the WINDOW lever, which for a still is terminal — so an OOM we could not read
-    # was refused as though the sampler were indicted, when a coarser grid might have survived
-    # it. The decode grid is what a still can vary and what decisions.md 3.19 walked. A NAMED
-    # dit_sample stays the window lever and stays honestly terminal.
+    # **A still whose OOM names no phase tries the grids, decode then encode** (W2 R1(b)).
+    # An unknown phase defaulted to the WINDOW lever, terminal for a still, so an OOM we could
+    # not read was refused as though the sampler were indicted. **Decode first is a CHOICE, not a
+    # finding, and it is unmeasured**: decode_grid is the lever with a real ladder under it, and
+    # an assumption that can be tried cheaply beats one that terminates. When the assumed lever
+    # runs dry the OTHER grid is tried — an assumption running out is not the hardware running
+    # out. A NAMED phase never falls through: an indicted sampler stays terminal at w1.
+    named_phase = phase
     phase_assumed = frames == 1 and phase not in planner.PHASE_LEVER
-    if phase_assumed:
-        phase = "vae_decode"
-    answer = planner.correct(src, frames, target, usable, phase, needed, failed,
-                             host_ram_gb=host_ram,
-                             tile_quality=failed.get("tile_quality", "default"))
+    tried = []
+    for candidate in (("vae_decode", "vae_encode") if phase_assumed else (phase,)):
+        tried.append(candidate)
+        answer = planner.correct(src, frames, target, usable, candidate, needed, failed,
+                                 host_ram_gb=host_ram,
+                                 tile_quality=failed.get("tile_quality", "default"))
+        if answer.get("action") == "plan":
+            break
+    phase = tried[-1]
 
     lever = planner.PHASE_LEVER.get(phase, "window")
-    basis = "measured from the message: {} corrected against {:.2f} GiB needed at w{}".format(
-        lever.replace("_", " "), needed, failed["w"])
+    if phase_assumed:
+        # **Said as an assumption**: the record must not read "measured" for a phase nobody named.
+        basis = ("assumed, not measured: no phase was named, so the {} was tried as a choice "
+                 "against {:.2f} GiB needed at w{}".format(lever.replace("_", " "), needed,
+                                                          failed["w"]))
+    else:
+        basis = "measured from the message: {} corrected against {:.2f} GiB needed at w{}".format(
+            lever.replace("_", " "), needed, failed["w"])
     why = {
-        "bound_gb": round(usable, 2), "phase": phase, "lever": lever, "basis": basis,
-        # Said, not silent: the decode phase was ASSUMED for a still whose OOM named none.
+        # The phase the OOM NAMED (None when none) — never the one assumed in its place, so the
+        # corpus can tell a guessed walk from a measured one.
+        "bound_gb": round(usable, 2), "phase": named_phase, "lever": lever, "basis": basis,
         "phase_assumed": phase_assumed,
+        "levers_tried": [planner.PHASE_LEVER[c] for c in tried] if phase_assumed else None,
         "exited_sideways": lever in ("decode_grid", "encode_grid"),
         "carried_free_levers": ("swap_io_components"
                                 if failed_config.get("swap_io_components") else None),
@@ -459,6 +474,11 @@ def next_after_oom(job, snapshot, failed_config, failed_prediction_gb,
     if answer.get("action") != "plan":
         why["candidates_under_bound"] = 0
         why["reason"] = answer.get("reason")
+        if phase_assumed:
+            # **The caller is owed the fact that we guessed**, not only that we stopped.
+            why["reason"] = ("the phase of this OOM was never named, so both grids were tried as "
+                             "an assumption and neither has a smaller grid that fits — {}".format(
+                                 answer.get("reason")))
         why["options"] = answer.get("options")
         return None, why
 

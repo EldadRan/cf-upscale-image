@@ -1287,6 +1287,10 @@ def _upscale_with_retry(cli, request, source, source_path, master_path, plan, ra
                     phase=(shortfall or {}).get("phase"), shortfall=shortfall,
                     relax_swap=not request.get("pin"))
             record["walk"] = walk
+            # **A guessed walk is marked as one in the refusal too** (W2 R1, ruled): the corpus
+            # must tell a walk on an assumed phase from one on a measured phase.
+            if (walk or {}).get("phase_assumed"):
+                shortfall = dict(shortfall or {}, phase_assumed=True)
             refusal = _refuse_retry(request, plan, nxt_row, shortfall, machine, source_path,
                                     exc, estimated_frames=estimated_frames,
                                     # **Told, not counted** (W2 Q2): the reason the
@@ -1422,8 +1426,8 @@ def _refuse_retry(request, plan, next_row, shortfall, machine, source_path, exc,
         # the walk's own reason, which names the lever and why it cannot move.
         return WorkerError(
             errors.CAPACITY_EXCEEDED,
-            "out of memory on a still, and nothing left to try on this card: {}. A larger card "
-            "is the remedy.".format(
+            "out of memory on a still, and this card has no configuration left for it: {}. A "
+            "larger card is the remedy.".format(
                 (walk or {}).get("reason") or (walk or {}).get("basis")
                 or "no smaller configuration of this image fits"),
             remedy=errors.Remedy.LARGER_GPU,
