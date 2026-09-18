@@ -434,52 +434,56 @@ def run(cli, capture, args, plan, frame_budget, writer, on_chunk=None, keep_alph
     # coupling is one named function rather than a copy that drifts from it.
     original_reader = None
     carried_alpha = []
-    if keep_alpha:
-        original_reader = cli._read_frames_from_cap
-        cli._read_frames_from_cap = _read_frames_preserving_alpha(
-            cli, carried_alpha, strip=not alpha_through_model)
-    # **Swapped for the same reason and in the same way**: the colour-correction pyramid indexes
-    # its padded convolution in 32 bits, which caps a 4K pass at 84 frames and an 8K pass at 21.
-    # Above that the vendored code does not degrade -- it dies in phase 4 with the three
-    # expensive phases already paid for. `colorfix.install` splits the pyramid and nothing else,
-    # and only when the batch would actually cross the bound, so every window measured below it
-    # takes the byte-for-byte path it was measured on.
-    colour_restore = colorfix.install(cli, _color_fix_module(cli), _phases_module(cli),
-                                      debug=cli.debug)
-    # **Installed here rather than around a chunk.** Each of the four phases runs once per chunk,
-    # and the figure worth keeping is the maximum across all of them; a watch scoped to one chunk
-    # would report the last chunk's peak, which is the one number nobody wants. Scoped here it
-    # also spans a ratchet, so a run that stepped down still reports which phase set the ceiling.
-    # `on_batch(phase, index, total)` is the job's only heartbeat once the chunk holds the whole
-    # clip. `on_chunk` used to fire exactly once in that case, at the end; it now advances with
-    # the frames actually written (F-2026-08-18-11).
-    #: **One model, for the life of this job** (F-2026-08-20-45), and on rung 2 for the life of
-    #: each chunk's DiT (amendment 9). Local to this call, so it dies when the job does; the
-    #: vendored global cache it also populates is evicted by `release_runner_cache`, which the
-    #: caller runs in a `finally`.
-    runner_cache = {}
-    # **`on_tile` is the deadline checkpoint's only input** (`api.md` §4d). It rides the same tap
-    # as `on_batch` and for the same reason: the tap wraps the vendored logger and observes before
-    # delegating, so a tile announcement reaches us whether or not the vendored debug is on. A
-    # refusal raised from it travels the seam `_is_a_refusal` opened.
-    watch = PhaseWatch(cli, on_batch=_scheduling_eviction(on_batch, plan, runner_cache,
-                                                          debug=cli.debug, schedule=schedule),
-                       on_tile=on_tile)
-    #: **Stamped with the attempt the handler is on.** `run.last_phases` is a function attribute
-    #: and nothing clears it, so on a warm worker it survives between jobs — and a run that
-    #: raises before reaching here (a still, a refusal, a failure before the stream) would find
-    #: the PREVIOUS run's watch waiting and record its phase times as its own. The stamp is what
-    #: lets `handler._phase_watch` tell this attempt's watch from a leftover.
-    #:
-    #: Read off `run` rather than taken as a parameter because `run`'s signature is the vendored
-    #: call's shape; the handler publishes the token the same way it reads the results back.
-    watch.attempt_token = getattr(run, "attempt_token", None)
-    run.last_phases = watch
-    #: **Reachable by the end-of-job release**, which runs in the handler's `finally` and has no
-    #: sight of this scope. Published rather than passed because the release must also work on
-    #: the paths that never reached `run` — a refusal before the stream, or a crash inside it.
-    run.last_runner_cache = runner_cache
+    colour_restore = None
+    # **Both swaps INSIDE the try whose finally undoes them** (W2 Q3). They sat before it, and
+    # colorfix.install raises by design between them: the reader stayed patched on a warm
+    # worker, its closure holding this job's carried_alpha for every later job to append into.
     try:
+        if keep_alpha:
+            original_reader = cli._read_frames_from_cap
+            cli._read_frames_from_cap = _read_frames_preserving_alpha(
+                cli, carried_alpha, strip=not alpha_through_model)
+        # **Swapped for the same reason and in the same way**: the colour-correction pyramid indexes
+        # its padded convolution in 32 bits, which caps a 4K pass at 84 frames and an 8K pass at 21.
+        # Above that the vendored code does not degrade -- it dies in phase 4 with the three
+        # expensive phases already paid for. `colorfix.install` splits the pyramid and nothing else,
+        # and only when the batch would actually cross the bound, so every window measured below it
+        # takes the byte-for-byte path it was measured on.
+        colour_restore = colorfix.install(cli, _color_fix_module(cli), _phases_module(cli),
+                                          debug=cli.debug)
+        # **Installed here rather than around a chunk.** Each of the four phases runs once per chunk,
+        # and the figure worth keeping is the maximum across all of them; a watch scoped to one chunk
+        # would report the last chunk's peak, which is the one number nobody wants. Scoped here it
+        # also spans a ratchet, so a run that stepped down still reports which phase set the ceiling.
+        # `on_batch(phase, index, total)` is the job's only heartbeat once the chunk holds the whole
+        # clip. `on_chunk` used to fire exactly once in that case, at the end; it now advances with
+        # the frames actually written (F-2026-08-18-11).
+        #: **One model, for the life of this job** (F-2026-08-20-45), and on rung 2 for the life of
+        #: each chunk's DiT (amendment 9). Local to this call, so it dies when the job does; the
+        #: vendored global cache it also populates is evicted by `release_runner_cache`, which the
+        #: caller runs in a `finally`.
+        runner_cache = {}
+        # **`on_tile` is the deadline checkpoint's only input** (`api.md` §4d). It rides the same tap
+        # as `on_batch` and for the same reason: the tap wraps the vendored logger and observes before
+        # delegating, so a tile announcement reaches us whether or not the vendored debug is on. A
+        # refusal raised from it travels the seam `_is_a_refusal` opened.
+        watch = PhaseWatch(cli, on_batch=_scheduling_eviction(on_batch, plan, runner_cache,
+                                                              debug=cli.debug, schedule=schedule),
+                           on_tile=on_tile)
+        #: **Stamped with the attempt the handler is on.** `run.last_phases` is a function attribute
+        #: and nothing clears it, so on a warm worker it survives between jobs — and a run that
+        #: raises before reaching here (a still, a refusal, a failure before the stream) would find
+        #: the PREVIOUS run's watch waiting and record its phase times as its own. The stamp is what
+        #: lets `handler._phase_watch` tell this attempt's watch from a leftover.
+        #:
+        #: Read off `run` rather than taken as a parameter because `run`'s signature is the vendored
+        #: call's shape; the handler publishes the token the same way it reads the results back.
+        watch.attempt_token = getattr(run, "attempt_token", None)
+        run.last_phases = watch
+        #: **Reachable by the end-of-job release**, which runs in the handler's `finally` and has no
+        #: sight of this scope. Published rather than passed because the release must also work on
+        #: the paths that never reached `run` — a refusal before the stream, or a crash inside it.
+        run.last_runner_cache = runner_cache
         # `carried_alpha` is what `_stream` reattaches. None when the model carried the channel
         # itself, because reattaching a Lanczos alpha over the model's would be doing the work
         # twice and keeping the worse of the two.
