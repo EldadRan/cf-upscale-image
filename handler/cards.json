@@ -1,0 +1,93 @@
+{
+  "cards": {
+    "NVIDIA A40": {
+      "mpx_per_s": {
+        "batched": 0.715,
+        "unbatched": 0.22
+      },
+      "vram_free_gb": 43.72,
+      "vram_total_gb": 44.34
+    },
+    "NVIDIA B200": {
+      "mpx_per_s": {
+        "batched": 1.65,
+        "unbatched": null
+      },
+      "vram_free_gb": 177.52,
+      "vram_total_gb": 178.35
+    },
+    "NVIDIA H200": {
+      "mpx_per_s": {
+        "batched": 1.7,
+        "unbatched": 0.37
+      },
+      "vram_free_gb": 139.06,
+      "vram_total_gb": 139.8
+    },
+    "NVIDIA L40": {
+      "mpx_per_s": {
+        "batched": 0.65,
+        "unbatched": null
+      },
+      "vram_free_gb": 43.85,
+      "vram_total_gb": 44.39
+    },
+    "NVIDIA L40S": {
+      "mpx_per_s": {
+        "batched": 1.05,
+        "unbatched": null
+      },
+      "vram_free_gb": 43.84,
+      "vram_total_gb": 44.39
+    },
+    "NVIDIA RTX 6000 Ada Generation": {
+      "mpx_per_s": {
+        "batched": 1.05,
+        "unbatched": null
+      },
+      "vram_free_gb": 46.83,
+      "vram_total_gb": 47.38
+    },
+    "NVIDIA RTX A6000": {
+      "mpx_per_s": {
+        "batched": 0.78,
+        "unbatched": null
+      },
+      "vram_free_gb": 44.06,
+      "vram_total_gb": 44.42
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition": {
+      "mpx_per_s": {
+        "batched": 1.1,
+        "unbatched": null
+      },
+      "vram_free_gb": 93.74,
+      "vram_total_gb": 94.97
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+      "mpx_per_s": {
+        "batched": 1.05,
+        "unbatched": null
+      },
+      "vram_free_gb": 93.74,
+      "vram_total_gb": 94.97
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb": {
+      "mpx_per_s": {
+        "batched": 0.6,
+        "unbatched": null
+      },
+      "vram_free_gb": 46.84,
+      "vram_total_gb": 47.38
+    },
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition": {
+      "mpx_per_s": {
+        "batched": 1.6,
+        "unbatched": null
+      },
+      "vram_free_gb": 94.28,
+      "vram_total_gb": 95.01
+    }
+  },
+  "generated_utc": "2026-09-19T21:33:42Z"
+}
