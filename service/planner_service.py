@@ -436,10 +436,23 @@ def estimate_core(body, commit, card_table=None):
 
     # Tables after the door: a malformed request is refused by name whatever state they are in.
     # **ONE card table for the whole request, both halves** (W6): memory resolves against it
-    # here, and the worker times every card against the same object below.
+    # here, and the worker times every card against the same object below. **The body's
+    # `card_table` is that table when sent and valid** (item 2) — the worker's own resolution,
+    # so a table CF sends to both surfaces makes them agree by construction.
+    #
+    # **KNOWN, TEMPORARY SILENCE:** a refused override falls back to the in-image table and the
+    # warning is DROPPED here, until CF rules the /estimate `warnings` field (Q5b, 2026-09-19).
+    # The worker says it; the service cannot yet.
+    sent = card_table is None and "card_table" in body
     if card_table is None:
-        card_table = estimator.load_card_table()
+        card_table, _unsaid = estimator.resolve_card_table(body.get("card_table"),
+                                                           "card_table" in body)
+        sent = sent and _unsaid is None
     table_cards = memory_cards(card_table)
+    if not table_cards and sent:
+        # The caller's valid table carries no memory at all: the caller's input, named.
+        raise Refusal("card_table", "carries no card's vram_total_gb and vram_free_gb, so no "
+                                    "card without a reading can be resolved")
     if not table_cards:
         # Before any card is planned: every fallback below ends in a measured card.
         raise TableUnusable("the card table gives no card's memory")

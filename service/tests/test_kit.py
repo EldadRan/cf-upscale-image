@@ -847,6 +847,51 @@ class Refusals(unittest.TestCase):
             self.assertNotIn("refused", payload)
 
 
+class CardTableRidesTheEstimate(unittest.TestCase):
+    """**W6 item 2 on the service: a `card_table` in the body prices AND resolves memory**, the
+    same resolution the worker runs (`estimator.resolve_card_table`) — so a table CF sends to
+    both surfaces makes them agree by construction.
+
+    **KNOWN, TEMPORARY SILENCE:** a refused override falls back to the in-image table with no
+    word on the wire until CF rules the /estimate `warnings` field (Q5b). Asserted as it is, so
+    the day the field lands this case is where it changes.
+    """
+
+    SENT = {"generated_utc": "sent", "cards": {
+        A40: {"vram_total_gb": 40.0, "vram_free_gb": 39.5,
+              "mpx_per_s": {"batched": 0.1, "unbatched": None}}}}
+
+    def _body(self, **extra):
+        return dict(request(tiers=[tier(cards=[card(A40)])]), **extra)
+
+    def test_a_sent_table_prices_and_resolves_memory(self):
+        from service import app
+        status, payload = app.route("POST", "/estimate",
+                                    json.dumps(self._body(card_table=self.SENT)).encode("utf-8"),
+                                    commit=None)
+        self.assertEqual(status, 200, payload)
+        got = payload["tiers"][0]["cards"][0]
+        width, height = estimator.output_dimensions(1920, 1080, 1480)
+        self.assertEqual(got["predicted_seconds"], round(width * height / 1e6 / 0.1 * 90, 1),
+                         "the sent rate did not price the card")
+        self.assertEqual((got["hardware_used"]["vram_total_gb"],
+                          got["hardware_used"]["vram_free_gb"]), (40.0, 39.5),
+                         "memory did not come from the sent table")
+
+    def test_a_sent_table_with_no_memory_is_the_callers_to_fix(self):
+        # Valid (it carries a rate) but no card's memory: the caller's input, refused by name —
+        # never the 503 that means the service's own table is broken.
+        memoryless = {"cards": {A40: {"mpx_per_s": {"batched": 0.6}}}}
+        refused_field(self, self._body(card_table=memoryless), "card_table")
+
+    def test_a_refused_table_falls_back_to_the_in_image_one(self):
+        bare = answer(self._body())
+        for bad in (None, "not a table", {"cards": {A40: {"mpx_per_s": {"Batched": 0.6}}}}):
+            got = answer(self._body(card_table=bad))
+            self.assertEqual(got["predicted_seconds"], bare["predicted_seconds"], repr(bad))
+            self.assertEqual(got["hardware_used"], bare["hardware_used"], repr(bad))
+
+
 class StartupRefusesABrokenTable(unittest.TestCase):
     """**A broken in-image card table stops the service before the port opens** (review of W6):
     `load_card_table` returns None rather than raising, so the old startup call — `version()` —
