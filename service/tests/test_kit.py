@@ -33,8 +33,8 @@ import planner  # noqa: E402
 
 SHA_A = "a" * 40
 
-with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as _handle:
-    TABLE = json.load(_handle)["cards"]
+#: The memory half of the in-image card table (W6), as the service resolves it.
+TABLE = ps.memory_cards(estimator.load_card_table())
 
 A40 = "NVIDIA A40"
 H200 = "NVIDIA H200"
@@ -88,10 +88,29 @@ def answer(body, index=0, commit=None):
     return one(body, commit=commit)["cards"][index]
 
 
+def answer_with(card_table, body, index=0):
+    """One card's answer against `card_table` handed to the core (W6)."""
+    return ps.estimate_core(body, commit=None, card_table=card_table)[0]["cards"][index]
+
+
 def refused_field(test, body, field):
     with test.assertRaises(ps.Refusal) as caught:
         ps.estimate_core(body, commit=None)
     test.assertEqual(caught.exception.field, field, caught.exception.message)
+
+
+def with_card_table(document, call):
+    """`call()` with the worker's in-image card table replaced by `document` (W6)."""
+    saved = estimator.load_card_table
+    estimator.load_card_table = lambda *a, **k: json.loads(json.dumps(document))
+    try:
+        return call()
+    finally:
+        estimator.load_card_table = saved
+
+
+def shipped_rates():
+    return estimator.table_rates(estimator.load_card_table())
 
 
 def _git(*args):
@@ -141,15 +160,14 @@ class Parity(unittest.TestCase):
         print("\n  parity: {} recorded keys equal; excluded {}; only in fresh output: {}".format(
             len(compared), list(self.HANDLER_ADDED), only_fresh))
         # **The record's number is the lookup's; the service's is the rate's** (W5 P3). The rate
-        # is the A40's batched one, derived from the committed table.
+        # is the A40's batched one, read from the card table (W6).
         self.assertEqual(recorded["predicted_seconds"], 897.1)
-        rate = estimator.card_rates(estimator.load_calibration())[(A40, estimator.BATCHED)]
+        rate = shipped_rates()[(A40, estimator.BATCHED)]
         pixels = fresh["output_width"] * fresh["output_height"]
         self.assertEqual(fresh["seconds_per_frame"], round(pixels / 1e6 / rate["mpx_per_s"], 4))
         # **Tied to the frame count, not to itself** (review, P3): the service's number is the
         # rate over the delivered plane times the source's frames, so a wrong frame count or a
-        # term added on the way out fails here. The rate itself is pinned against a formula
-        # written out in tests/run_local.py (check_the_rate_is_derived_per_card_and_regime).
+        # term added on the way out fails here.
         self.assertEqual(got["predicted_seconds"],
                          round(pixels / 1e6 / rate["mpx_per_s"] * source["estimated_frames"], 1))
         # Every field the wire carries is the worker's own, key for key (review F2, F3 on P1).
@@ -288,29 +306,29 @@ class RateFrom(unittest.TestCase):
 
 
 class AbsenceNamesTheSentCard(unittest.TestCase):
-    """W5 F4 (ruled 2026-09-19): an absence the worker raises under a SUBSTITUTED card's name is
-    re-pointed at the card CF sent, with the worker's own reason and regime kept.
+    """W5 F4 (ruled 2026-09-19): an absence names the card CF SENT, with the worker's own reason
+    and regime. **Since W6 the worker times the card under that name itself** (§4a-ii), so there
+    is nothing left to re-point.
 
-    Unreachable on the committed tables, which cover the same cards, so the calibration is
-    patched: the L40S is MEASURED (batched rows only) and absent from the VRAM table, so a nominal
-    resolves its memory to the A40; and no card has a window-1 row or a still to scale, so a still
-    reaches the worker's no-rows-in-regime absence — raised under the A40's name.
+    Reached with a patched card table: the L40S is PRICED (batched only) and carries no memory,
+    so a nominal resolves its memory to the A40; and no card holds a window-1 rate, so a
+    still reaches the no-rate-in-regime absence.
     """
 
     L40S = "NVIDIA L40S"
+    # The L40S is priced and carries no memory, so its memory resolves elsewhere (W6).
+    CARDS = {"generated_utc": "test", "cards": {
+        A40: {"vram_total_gb": 44.34, "vram_free_gb": 43.72,
+              "mpx_per_s": {"batched": 0.6, "unbatched": None}},
+        L40S: {"vram_total_gb": None, "vram_free_gb": None,
+               "mpx_per_s": {"batched": 0.6, "unbatched": None}}}}
 
     def test_the_absence_names_the_card_cf_sent(self):
         self.assertNotIn(self.L40S, TABLE)
-        rows = [{"gpu_name": name, "output_pixels": 3686400, "frames": 48, "window": 21,
-                 "seconds_per_frame": 6.0, "rung": "balanced"} for name in (A40, self.L40S)]
-        saved = estimator.load_calibration
-        estimator.load_calibration = lambda *a, **k: [dict(r) for r in rows]
-        try:
-            got = answer(request(job(frames=1, is_still=True, source_width=749, source_height=500,
-                                     target_short_edge_px=1920),
-                                 [tier(cards=[card(self.L40S, vram_total_gb=44.5)])]))
-        finally:
-            estimator.load_calibration = saved
+        got = with_card_table(self.CARDS, lambda: answer(request(
+            job(frames=1, is_still=True, source_width=749, source_height=500,
+                target_short_edge_px=1920),
+            [tier(cards=[card(self.L40S, vram_total_gb=44.5)])])))
         self.assertEqual(got["resolved_from"], {"card": self.L40S, "measured": A40})
         self.assertIsNone(got["predicted_seconds"])
         absent = got["timing_unavailable"] or {}
@@ -319,6 +337,43 @@ class AbsenceNamesTheSentCard(unittest.TestCase):
         # The worker's reason stands: this is F4's absence, not J5's.
         self.assertEqual(absent.get("regime"), estimator.UNBATCHED)
         self.assertIn("regime", absent.get("why", ""))
+
+
+class OwnTimeSubstitutedMemory(unittest.TestCase):
+    """**A memory substitution is not a time substitution** (§4a-ii; W6, the recurrence the gate
+    filed). A card the card table PRICES but gives no memory resolves its memory to another
+    card and is timed at ITS OWN rate — it used to be planned, and so priced, under the
+    substitute's name.
+
+    **`borrowed` WITH `rate_from` NULL IS THE DESIGNED READING, NOT A CONTRADICTION** (§4a-i,
+    C14): `borrowed` covers both senses, `rate_from` null says the time is this card's own, and
+    `resolved_from` says the memory was not. Do not "fix" it.
+    """
+
+    L40S = "NVIDIA L40S"
+    L40S_RATE = 0.9
+
+    def _cards(self):
+        document = json.loads(json.dumps(estimator.load_card_table()))
+        # Priced, and no memory: the case two tables made and one table still can (W6).
+        document["cards"][self.L40S] = {"vram_total_gb": None, "vram_free_gb": None,
+                                        "mpx_per_s": {"batched": self.L40S_RATE,
+                                                      "unbatched": None}}
+        return document
+
+    def test_own_rate_under_substituted_memory(self):
+        self.assertNotIn(self.L40S, TABLE)
+        got = with_card_table(self._cards(), lambda: answer(request(
+            tiers=[tier(cards=[card(self.L40S, vram_total_gb=44.5)])])))
+        self.assertEqual(got["resolved_from"], {"card": self.L40S, "measured": A40})
+        self.assertEqual(got["hardware_used"]["gpu_name"], A40)
+        width, height = estimator.output_dimensions(1920, 1080, 1480)
+        self.assertEqual(got["predicted_seconds"],
+                         round(width * height / 1e6 / self.L40S_RATE * 90, 1),
+                         "the L40S's own rate, not the A40's")
+        self.assertIsNone(got["rate_from"])
+        self.assertIsNone(got["timing_unavailable"])
+        self.assertEqual(got["prediction_basis"], "borrowed")
 
 
 class RefusedQuality(unittest.TestCase):
@@ -526,17 +581,6 @@ class TimingUnavailable(unittest.TestCase):
         self.assertEqual(got["vram_source"], "given")
         self.assertNotIn("memory was resolved", got["timing_unavailable"]["why"])
 
-    def test_both_tables_cover_the_same_cards(self):
-        """**The tripwire for the residual** (review, J5): a card the calibration prices but the
-        VRAM table lacks would resolve by memory to ANOTHER card and be priced at that card's
-        speed, labelled borrowed — the substitute's time for a priceable name. While the two
-        tables name the same cards it cannot happen; the day they diverge, this says so."""
-        priced = set(estimator.cards_with_priceable_rows(estimator.load_calibration()))
-        self.assertEqual(priced, set(TABLE),
-                         "calibration prices {} and the VRAM table holds {}; a priced card "
-                         "missing from the VRAM table gets another card's speed".format(
-                             sorted(priced), sorted(TABLE)))
-
     def test_a_measured_card_is_unchanged(self):
         got = answer(request())
         self.assertTrue(got["fits"])
@@ -578,7 +622,6 @@ class VramOrder(unittest.TestCase):
         self.assertEqual(got["vram_source"], "given")
         self.assertEqual(got["hardware_used"]["vram_total_gb"], 44.43)
         self.assertEqual(got["hardware_used"]["vram_free_gb"], 44.08)
-        self.assertIsNone(got["vram_stats"])
 
     def test_free_without_total_is_not_a_reading(self):
         got = answer(request(tiers=[tier(cards=[card(A40, vram_free_gb=44.08)])]))
@@ -641,19 +684,20 @@ class PoolFloor(unittest.TestCase):
         got = answer(request(job(frames=1, is_still=True, source_width=749, source_height=500, target_short_edge_px=1920),
                              [tier(host_ram_gb=377.0, cards=[card(MIG), card(B200, vram_total_gb=179.0)])]))
         self.assertEqual(got["resolved_from"], {"card": MIG, "measured": B200})
-        self.assertIsNotNone(got["rationale"]["timing_from_another_card"])
+        # Since W6 the worker times under the MIG's name, so no borrowed rate exists at all.
+        self.assertNotIn("timing_from_another_card", got["rationale"])
         self.assertIsNone(got["rate_from"])
         self.assertIsNone(got["prediction_basis"])
         self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
-    def test_floor_card_is_borrowed_even_when_the_worker_measured_it(self):
-        # The floor lands on the A40, which the table measures at this size, so the worker labels
-        # the rate "measured". It is not a measurement of the card CF named.
+    def test_floor_card_time_is_judged_on_the_name_sent(self):
+        # The floor lands on the A40, which the card table prices. The time is still the MIG's
+        # to answer, and the worker itself withholds it under the MIG's name (W6).
         cards = [card(MIG), card(A40, vram_total_gb=44.7)]
         got = answer(request(tiers=[tier(cards=cards)]))
         self.assertEqual(got["vram_source"], "pool_floor")
         self.assertEqual(got["hardware_used"]["gpu_name"], A40)
-        self.assertEqual(got["rationale"]["prediction_basis"], "measured")
+        self.assertEqual(got["rationale"]["timing_unavailable"]["running_on"], MIG)
         # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
         # CF sent; the memory resolution above is unchanged.
         self.assertIsNone(got["prediction_basis"])
@@ -677,9 +721,8 @@ class Nearest(unittest.TestCase):
         self.assertEqual(got["vram_source"], "nearest_memory")
         self.assertEqual(got["resolved_from"], {"card": MIG, "measured": A40})
         self.assertEqual(got["hardware_used"]["gpu_name"], A40)
-        self.assertEqual(got["rationale"]["prediction_basis"], "measured")
         # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
-        # CF sent; the memory resolution above is unchanged.
+        # CF sent — by the worker itself since W6; the memory resolution above is unchanged.
         self.assertIsNone(got["prediction_basis"])
         self.assertEqual(got["timing_unavailable"]["running_on"], MIG)
 
@@ -694,71 +737,43 @@ class Nearest(unittest.TestCase):
         self.assertEqual(ps.nearest_measured((low + high) / 2.0, table), A40)
 
 
-class VramStats(unittest.TestCase):
-    """The corpus behind a table figure rides back; the plan uses the MINIMUM (§4a)."""
+class NoVramStats(unittest.TestCase):
+    """W6 Q4 (ruled by CF, 2026-09-19): `vram_stats` is dropped outright — nothing read it — and
+    the card table carries total and free only. Memory comes from that table's figures."""
 
-    def test_stats_on_table(self):
+    def test_no_vram_stats_anywhere(self):
+        from service import app
+        body = request(tiers=[tier(cards=[card(A40), card(MIG, vram_total_gb=44.5), card(MIG)])])
+        status, payload = app.route("POST", "/estimate", json.dumps(body).encode("utf-8"),
+                                    commit=None)
+        self.assertEqual(status, 200, payload)
+        for got in list(one(body)["cards"]) + list(payload["tiers"][0]["cards"]):
+            self.assertNotIn("vram_stats", got)
+        self.assertNotIn("vram_stats", ps.CARD_WIRE_FIELDS)
+
+    def test_memory_is_the_card_tables(self):
+        shipped = estimator.load_card_table()["cards"]
         got = answer(request(tiers=[tier(cards=[card(A40)])]))
         self.assertEqual(got["vram_source"], "table")
-        self.assertEqual(got["vram_stats"], TABLE[A40]["stats"])
-        self.assertEqual(got["vram_stats"]["n_at_total"], TABLE[A40]["readings_at_total"])
-        self.assertLess(got["vram_stats"]["n_at_total"], got["vram_stats"]["n"])
-        self.assertEqual(got["hardware_used"]["vram_free_gb"], TABLE[A40]["vram_free_gb"])
-        self.assertNotEqual(got["hardware_used"]["vram_free_gb"],
-                            got["vram_stats"]["free_mean_gb"])
-        self.assertLess(got["hardware_used"]["vram_free_gb"], got["vram_stats"]["free_max_gb"])
+        self.assertEqual((got["hardware_used"]["vram_total_gb"],
+                          got["hardware_used"]["vram_free_gb"]),
+                         (shipped[A40]["vram_total_gb"], shipped[A40]["vram_free_gb"]))
 
-    def test_stats_on_nearest(self):
-        got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
-        self.assertEqual(got["vram_stats"], TABLE[A40]["stats"])
+    def test_a_card_with_a_rate_and_no_memory_is_not_measured_for_memory(self):
+        document = json.loads(json.dumps(estimator.load_card_table()))
+        document["cards"]["NVIDIA L40S"] = {"vram_total_gb": None, "vram_free_gb": None,
+                                            "mpx_per_s": {"batched": 0.9, "unbatched": None}}
+        self.assertNotIn("NVIDIA L40S", ps.memory_cards(document))
+        got = answer_with(document, request(tiers=[tier(cards=[card("NVIDIA L40S")])]))
+        self.assertEqual(got["vram_source"], "pool_floor")
+        # Its time is still its own (§4a-ii).
+        self.assertIsNone(got["rate_from"])
+        self.assertIsNone(got["timing_unavailable"])
 
-    def test_stats_are_copies_not_the_tables_own_object(self):
-        table = ps.load_vram_table()
-        entry = one(request(tiers=[tier(cards=[card(A40), card(A40)])]),)
-        first, second = (c["vram_stats"] for c in entry["cards"])
-        self.assertEqual(first, TABLE[A40]["stats"])
-        self.assertIsNot(first, second)
-        self.assertIsNot(first, table["cards"][A40]["stats"])
-
-    def test_no_stats_where_the_figure_is_not_the_tables(self):
-        got = answer(request(tiers=[tier(cards=[card(A40, vram_total_gb=44.43,
-                                                     vram_free_gb=44.08)])]))
-        self.assertIsNone(got["vram_stats"])
-
-    def test_stats_recomputed_from_the_corpus(self):
-        # **Recomputed here, not compared with itself**: min over a superset of the readings the
-        # figure comes from is below it for ANY implementation, right or wrong (review F3).
-        if SERVICE not in sys.path:
-            sys.path.insert(0, SERVICE)
-        import generate_vram_table as gen
-        readings = gen.read_corpus(RUNS)
-        by_card = {}
-        for rid, (gpu_name, total, free, _utc) in readings.items():
-            if rid not in gen.LEAK_EXCLUDED:
-                by_card.setdefault(gpu_name, []).append((total, free))
-        self.assertEqual(sorted(by_card), sorted(TABLE))
-        for name, rows in by_card.items():
-            frees = [f for _t, f in rows]
-            lowest_total = min(t for t, _ in rows)
-            row = TABLE[name]
-            self.assertEqual(row["vram_total_gb"], lowest_total, name)
-            self.assertEqual(row["vram_free_gb"],
-                             min(f for t, f in rows if t == lowest_total), name)
-            self.assertEqual(row["stats"], {
-                "free_mean_gb": round(sum(frees) / len(frees), 4),
-                "free_min_gb": min(frees),
-                "free_max_gb": max(frees),
-                "n": len(frees),
-                "n_at_total": len([t for t, _ in rows if t == lowest_total]),
-            }, name)
-            # The two answer different questions (§4a): the spread ranges over every reading, the
-            # planned figure rests on the readings at the minimum total alone.
-            self.assertLessEqual(row["stats"]["n_at_total"], row["stats"]["n"], name)
-
-    def test_the_committed_table_is_the_generators(self):
-        out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_vram_table.py"),
-                              "--check", RUNS], capture_output=True, text=True)
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+    def test_the_old_tables_are_gone(self):
+        for name in ("vram_table.json", "generate_vram_table.py"):
+            self.assertFalse(os.path.exists(os.path.join(SERVICE, name)), name)
+        self.assertFalse(os.path.exists(os.path.join(REPO_ROOT, "handler", "calibration.json")))
 
 
 class HostRam(unittest.TestCase):
@@ -823,16 +838,13 @@ class Refusals(unittest.TestCase):
         from service import app
         with self.assertRaises(ps.TableUnusable):
             ps.estimate_core(request(tiers=[tier(cards=[card(MIG)])]), commit=None,
-                             vram_table={"cards": {}, "corpus": {}})
-        real = ps.load_vram_table
-        ps.load_vram_table = lambda *a, **k: {"cards": {}, "corpus": {}}
-        try:
-            status, payload = app.route("POST", "/estimate",
-                                        json.dumps(request()).encode("utf-8"), commit=None)
-        finally:
-            ps.load_vram_table = real
-        self.assertEqual(status, 503)
-        self.assertNotIn("refused", payload)
+                             card_table={"cards": {A40: {"mpx_per_s": {"batched": 0.6}}}})
+        # **An in-image table that fails its check, or is absent, is the same deploy fault.**
+        for broken in (None, {"cards": {}}):
+            status, payload = with_card_table(broken, lambda: app.route(
+                "POST", "/estimate", json.dumps(request()).encode("utf-8"), commit=None))
+            self.assertEqual(status, 503, broken)
+            self.assertNotIn("refused", payload)
 
 
 class Residency(unittest.TestCase):
@@ -1002,9 +1014,9 @@ class Still(unittest.TestCase):
         got = one(request(job(frames=1, is_still=True, source_width=749, source_height=500,
                               target_short_edge_px=1920)))["cards"][0]
         # **Moved by W5 P3, by ruling** — 27.4 was the lookup's. Pinned now to the mechanism, not
-        # to a number: the A40's window-1 rate over the delivered plane, one frame. A banked row
+        # to a number: the A40's window-1 rate over the delivered plane, one frame. A new table
         # moves it without failing this; a service that stops answering the worker's rate fails.
-        rate = estimator.card_rates(estimator.load_calibration())[(A40, estimator.UNBATCHED)]
+        rate = shipped_rates()[(A40, estimator.UNBATCHED)]
         width, height = estimator.output_dimensions(749, 500, 1920)
         self.assertEqual((got["predicted_seconds"], got["prediction_basis"]),
                          (round(width * height / 1e6 / rate["mpx_per_s"], 1), "measured"))
@@ -1072,16 +1084,8 @@ class TablesAfterTheDoor(unittest.TestCase):
     """A malformed request is refused by name whatever state the committed tables are in."""
 
     def test_refusal_named_with_unreadable_table(self):
-        real = ps.load_vram_table
-
-        def broken(*_args, **_kwargs):
-            raise OSError("no table")
-
-        ps.load_vram_table = broken
-        try:
-            refused_field(self, request(tiers=[tier(cards=[])]), "tiers[0].cards")
-        finally:
-            ps.load_vram_table = real
+        with_card_table(None, lambda: refused_field(self, request(tiers=[tier(cards=[])]),
+                                                    "tiers[0].cards"))
 
 
 class Projection(unittest.TestCase):
@@ -1091,7 +1095,7 @@ class Projection(unittest.TestCase):
                    "registry_version", "commit")
     CARD_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds", "prediction_basis",
                    "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
-                   "hardware_used", "vram_source", "vram_stats", "resolved_from")
+                   "hardware_used", "vram_source", "resolved_from")
 
     def _through_http(self, body):
         from service import app
@@ -1147,9 +1151,12 @@ class Projection(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["commit"], SHA_A)
         self.assertEqual(payload["registry_version"], planner.REGISTRY_VERSION)
-        self.assertEqual(payload["calibration_rows"], len(estimator.load_calibration()))
-        with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as handle:
-            self.assertEqual(payload["vram_table_corpus"], json.load(handle)["corpus"])
+        shipped = estimator.load_card_table()
+        self.assertEqual(payload["card_table_generated_utc"], shipped["generated_utc"])
+        self.assertEqual(payload["card_table_cards_priced"],
+                         len({name for name, _regime in shipped_rates()}))
+        self.assertNotIn("calibration_rows", payload)
+        self.assertNotIn("vram_table_corpus", payload)
 
 
 class Isolation(unittest.TestCase):

@@ -13,7 +13,7 @@ ENV CF_PLANNER_COMMIT=${RAILWAY_GIT_COMMIT_SHA} \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
-COPY handler/*.py handler/calibration.json /app/handler/
+COPY handler/*.py handler/cards.json /app/handler/
 COPY service/ /app/service/
 RUN pip install --no-cache-dir -r /app/service/requirements.txt
 

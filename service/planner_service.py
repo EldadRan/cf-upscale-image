@@ -8,15 +8,12 @@ reorders nothing, chooses no card and ranks nothing: which card CF expects, and 
 placement risk, is CF's policy.
 
 **Every number is the worker's own output.** What this module adds is where each input came from.
-It rewrites two things, both about the card CF NAMED rather than the one planned: the TIME of a
-card whose sent name has no priceable rows is withheld — predicted_seconds, prediction_basis and
-rate_from null, timing_unavailable naming it (J5, f05b28d; memory and time are different facts),
-and any absence the worker raised under a substituted card's name — W5 F4's no-rows-in-regime —
-is re-pointed at CF's card with the worker's own reason kept;
-and `prediction_basis` goes from `measured` to `borrowed` wherever the planned card is not the one
-CF named — `nearest_memory` and `pool_floor` (§4a-i). **The second is unreachable while the VRAM
-table and the calibration table cover the same cards**, which the kit asserts, and is kept for the
-day they diverge.
+Memory is planned against the card §4a-i resolves; **time is judged by the worker itself on the
+name CF SENT** (§4a-ii, W6), so a card the card table holds is priced at its own rate whatever its
+memory was resolved to, and J5's and F4's absences name CF's card with no rewrite here. The one
+field this module rewrites is `prediction_basis`, `measured` to `borrowed`, wherever the planned
+card is not the one CF named — `nearest_memory` and `pool_floor` (§4a-i, C14): `borrowed` covers
+both senses, and `resolved_from` beside it says it was the memory.
 """
 
 import json
@@ -36,15 +33,13 @@ for _module in (estimator, planner, validation):
             _module.__name__, _module.__file__, worker_path.HANDLER))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VRAM_TABLE_PATH = os.path.join(HERE, "vram_table.json")
-
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
 class TableUnusable(RuntimeError):
-    """The service's own committed table cannot answer. **A deploy fault, never the caller's** —
-    §4's refusals are input faults, and a 400 naming `service.vram_table` would tell CF it sent
-    something wrong about a file CF has never seen."""
+    """The in-image card table cannot answer for memory. **A deploy fault, never the caller's** —
+    §4's refusals are input faults, and a 400 naming the table would tell CF it sent something
+    wrong about a file CF has never seen."""
 
 
 class Refusal(Exception):
@@ -56,9 +51,21 @@ class Refusal(Exception):
         self.message = message
 
 
-def load_vram_table(path=VRAM_TABLE_PATH):
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
+def memory_cards(card_table):
+    """`{gpu_name: {vram_total_gb, vram_free_gb}}` — the cards the card table gives BOTH memory
+    figures, a copy (W6: the memory half of the one curated table). **A card with a rate and no
+    memory is not measured for memory**, and resolves like any other card the table lacks.
+
+    **The plan uses these figures, and nothing else rides with them**: `vram_stats` was dropped by
+    CF on 2026-09-19 (W6 Q4) — nothing read it, and §4a always said the statistics were
+    information, not an input.
+    """
+    if not card_table or estimator.card_table_problem(card_table):
+        return {}
+    return {name: {"vram_total_gb": entry["vram_total_gb"],
+                   "vram_free_gb": entry["vram_free_gb"]}
+            for name, entry in card_table["cards"].items()
+            if entry.get("vram_total_gb") is not None and entry.get("vram_free_gb") is not None}
 
 
 def service_commit(environ):
@@ -201,13 +208,6 @@ def nearest_measured(nominal_gb, table_cards):
                                               table_cards[name]["vram_total_gb"], name))
 
 
-def _copy_stats(row):
-    """A COPY of the table row's statistics. A live reference would be process-global shared
-    mutable state the moment anyone caches the table, which `vram_table=` exists to allow."""
-    stats = row.get("stats")
-    return dict(stats) if isinstance(stats, dict) else None
-
-
 def _worst_measured(names, table_cards):
     """The worst card the table measures among `names`, or None where it measures none."""
     measured = [name for name in names if name in table_cards]
@@ -224,18 +224,16 @@ def resolve_card(card, siblings, table_cards):
     if total is not None and free is not None:
         # A reading, used as sent. **A free without a total is not one**, and a total without a
         # free is a nominal — neither is planned against directly.
-        planned_name, vram_source, resolved_from, stats = name, "given", None, None
+        planned_name, vram_source, resolved_from = name, "given", None
     elif name in table_cards:
         planned_name, vram_source, resolved_from = name, "table", None
         total, free = table_cards[name]["vram_total_gb"], table_cards[name]["vram_free_gb"]
-        stats = _copy_stats(table_cards[name])
     elif total is not None:
         # A nominal: it SELECTS a measured card and is never planned against.
         planned_name = nearest_measured(total, table_cards)
         vram_source, resolved_from = "nearest_memory", {"card": name, "measured": planned_name}
         total, free = (table_cards[planned_name]["vram_total_gb"],
                        table_cards[planned_name]["vram_free_gb"])
-        stats = _copy_stats(table_cards[planned_name])
     else:
         # **`pool_floor`, deliberately pessimistic** (§4a-i): the worst measured card in THIS
         # list, else the table's worst. An unnamed card is usually better than the list
@@ -245,14 +243,11 @@ def resolve_card(card, siblings, table_cards):
         vram_source, resolved_from = "pool_floor", {"card": name, "measured": planned_name}
         total, free = (table_cards[planned_name]["vram_total_gb"],
                        table_cards[planned_name]["vram_free_gb"])
-        # §3b lists vram_stats on table and nearest_memory; pool_floor names its card instead.
-        stats = None
 
     return {
         "hardware": {"gpu_name": planned_name, "vram_total_gb": total, "vram_free_gb": free,
                      "host_ram_gb": card["host_ram_used_gb"]},
         "vram_source": vram_source,
-        "vram_stats": stats,
         "resolved_from": resolved_from,
     }
 
@@ -281,8 +276,11 @@ def _quality_of_refusal(frames):
             for field, _key in QUALITY_FROM_RATIONALE}
 
 
-def _plan_card(job, snapshot):
-    """One card through `estimator.plan`, unchanged."""
+def _plan_card(job, snapshot, card_table, timed_as):
+    """One card through `estimator.plan`, unchanged — memory against `snapshot`, TIME under
+    `timed_as`, the name CF sent (§4a-ii). **A memory substitution is not a time substitution**:
+    planning under the substitute's name priced a card the table DOES hold at the substitute's
+    rate, hidden only while the two tables covered the same cards (W6)."""
     worker_job = {
         "target_short_edge_px": job["target"],
         "source_width": job["source_width"],
@@ -294,7 +292,8 @@ def _plan_card(job, snapshot):
     }
     frames = 1 if job["still"] else job["frames"]
     try:
-        _chosen, rationale = estimator.plan(worker_job, snapshot)
+        _chosen, rationale = estimator.plan(worker_job, snapshot, card_table=card_table,
+                                            timed_as=timed_as)
     except WorkerError as refusal:
         if refusal.code != CAPACITY_EXCEEDED:
             raise
@@ -395,9 +394,9 @@ def _max_target(refusal, job, snapshot):
 def _rate_from(rationale):
     """`timing_from_another_card`, plus the tiling where that differs too (§4a-ii).
 
-    **THE SAME NUMBER COMES BACK ON EVERY CARD IN A TIER** when only one card has rows in the
-    pixel band — `estimator._attach_timing` falls back to `same_card or comparable` — and three
-    identical numbers side by side look like three measurements. This is what says they are not.
+    **THE SAME NUMBER CAN COME BACK ON SEVERAL CARDS IN A TIER** when they borrow one lender's
+    rate, and identical numbers side by side look like several measurements. This is what says
+    they are not.
     """
     other_card = rationale.get("timing_from_another_card")
     other_tiling = rationale.get("timing_from_another_tiling")
@@ -409,7 +408,7 @@ def _rate_from(rationale):
     return rate_from
 
 
-def estimate_core(body, commit, vram_table=None):
+def estimate_core(body, commit, card_table=None):
     """Every tier's answer, in the order sent, each with one answer per card.
 
     The whole request is read before anything is planned, so a refusal on the last tier costs no
@@ -424,10 +423,14 @@ def estimate_core(body, commit, vram_table=None):
     read = [read_tier(t, i) for i, t in enumerate(tiers)]
 
     # Tables after the door: a malformed request is refused by name whatever state they are in.
-    table_cards = (vram_table or load_vram_table())["cards"]
+    # **ONE card table for the whole request, both halves** (W6): memory resolves against it
+    # here, and the worker times every card against the same object below.
+    if card_table is None:
+        card_table = estimator.load_card_table()
+    table_cards = memory_cards(card_table)
     if not table_cards:
         # Before any card is planned: every fallback below ends in a measured card.
-        raise TableUnusable("the service's VRAM table measures no card")
+        raise TableUnusable("the card table gives no card's memory")
 
     if job["canvas"] is not None:
         delivered = job["canvas"]
@@ -435,44 +438,16 @@ def estimate_core(body, commit, vram_table=None):
         delivered = estimator.output_dimensions(job["source_width"], job["source_height"],
                                                 job["target"])
 
-    # J5 (ruled f05b28d): the cards the time table can price, judged by the worker's own
-    # predicate. **MEMORY AND TIME ARE DIFFERENT FACTS WITH DIFFERENT SOURCES.**
-    priced_cards = estimator.cards_with_priceable_rows(estimator.load_calibration())
+    # Time is judged against the same table on the name CF SENT, so J5's and F4's absences come
+    # back naming CF's card from the worker itself. **Memory and time are different facts read
+    # from different halves of one table.**
 
     entries = []
     for tier in read:
         answers = []
         for card in tier["cards"]:
             resolved = resolve_card(card, tier["cards"], table_cards)
-            planned = _plan_card(job, resolved["hardware"])
-            own = planned.get("timing_unavailable") or {}
-            # **Every absence is judged on the name CF SENT** — two causes, one block. J5: CF's
-            # card has no priceable rows, so its time is withheld whatever the substitute has.
-            # W5 F4 (ruled 2026-09-19): the worker found no rows in the job's regime on any card
-            # and said so under the snapshot's name, which after §4a-i is the SUBSTITUTE's — CF
-            # asked about X and would be told nothing is known about Y.
-            if planned["fits"] and card["gpu_name"] not in priced_cards \
-                    and own.get("running_on") != card["gpu_name"]:
-                # **Time is judged on the name CF SENT, not the one memory was resolved to.**
-                # §4a-i substitutes a measured card for MEMORY when CF gives no reading, and the
-                # snapshot then carries the substitute's name — so without this the answer
-                # carried the substitute's SPEED, labelled borrowed: J5's defect wearing §4a-i's
-                # clothes. Memory stays resolved (resolved_from says so); time is withheld
-                # (timing_unavailable says so). CF sees both readings.
-                planned = dict(planned, predicted_seconds=None, prediction_basis=None,
-                               rate_from=None, timing_unavailable={
-                                   "running_on": card["gpu_name"],
-                                   "cards_with_rows": priced_cards,
-                                   # Reached only when the worker planned under another
-                                   # card's name — memory was resolved — since a card planned
-                                   # under its own name carries the worker's own reason.
-                                   "why": ("no calibration row was measured on the card CF "
-                                           "named; memory was resolved from another card, and "
-                                           "memory says nothing about speed"),
-                               })
-            elif own and own.get("running_on") != card["gpu_name"]:
-                # The worker's own reason and regime stand — only the card is CF's.
-                planned = dict(planned, timing_unavailable=dict(own, running_on=card["gpu_name"]))
+            planned = _plan_card(job, resolved["hardware"], card_table, card["gpu_name"])
             if resolved["resolved_from"] and planned["prediction_basis"] == "measured":
                 # §4a-i: the one field the service rewrites, and only for the MEMORY sense. The
                 # time sense needs no rewrite — the worker already labels a rate from another
@@ -486,7 +461,6 @@ def estimate_core(body, commit, vram_table=None):
                 label=card["label"],
                 hardware_used=dict(resolved["hardware"]),
                 vram_source=resolved["vram_source"],
-                vram_stats=resolved["vram_stats"],
                 resolved_from=resolved["resolved_from"],
             ))
         entries.append({
@@ -509,7 +483,7 @@ TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_heig
 CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds",
                     "prediction_basis",
                     "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
-                    "hardware_used", "vram_source", "vram_stats", "resolved_from")
+                    "hardware_used", "vram_source", "resolved_from")
 
 
 def project(entry):
@@ -519,14 +493,17 @@ def project(entry):
     return wire
 
 
-def version(commit, vram_table=None):
-    table = vram_table or load_vram_table()
+def version(commit, card_table=None):
+    if card_table is None:
+        card_table = estimator.load_card_table()
     # **The commit and nothing tree-shaped** (W6 item 3, ruled 2026-09-19): the handler/ tree's
     # only source was the retired history table, and CF's comparison is its pinned image tag
     # against this `commit` — both full shas.
     return {
         "commit": commit,
         "registry_version": planner.REGISTRY_VERSION,
-        "calibration_rows": len(estimator.load_calibration()),
-        "vram_table_corpus": table["corpus"],
+        # W6: the in-image card table's own stamp, and how many cards it prices — the one
+        # number a caller can act on. A row count meant nothing once the table was curated.
+        "card_table_generated_utc": (card_table or {}).get("generated_utc"),
+        "card_table_cards_priced": len(estimator.cards_with_rates(card_table)),
     }
