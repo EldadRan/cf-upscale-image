@@ -243,17 +243,15 @@ ENV IMAGE_TAG=${IMAGE_REF} \
     SEEDVR2_COMMIT=${SEEDVR2_COMMIT}
 
 # ── this repo's code, last ──────────────────────────────────────────────────────────────────
-# **`*.py` is not everything the handler needs.** `calibration.json` is measured data the
-# estimator plans from, and when it was added to the repo but not to this line the image shipped
-# without it — silently. Nothing failed: `load_calibration` treats an absent file as a normal
-# state meaning "take the floor", which is correct behaviour and indistinguishable from having no
-# measurements at all. A video job planned to the floor at 15.7 s/frame with a shipped table that
-# said `resident` would do it in 3.4, and the only symptom was a rung nobody expected.
+# **`*.py` is not everything the handler needs.** `cards.json` is the card table the estimator
+# prices time from (W6). Its predecessor, `calibration.json`, was once added to the repo but not
+# to this line and the image shipped without it — silently, because an absent table is read as
+# "nothing known" rather than as an error. Today that state is every card's time withheld, named.
 #
 # Named explicitly rather than `COPY *`: a wildcard would also sweep in whatever lands in this
 # directory later. `tests/run_local.py` asserts every non-`.py` file here is covered by a line
 # below, so adding a data file and forgetting this is a red suite rather than a quiet floor.
-COPY *.py calibration.json ./
+COPY *.py cards.json ./
 
 # The handler must import with the heavy chain still lazy — if this ever pulls in torch, the
 # rung-1 suite stops running in CI and nobody finds out until a GPU-less runner fails.

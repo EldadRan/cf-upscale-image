@@ -506,10 +506,14 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # which `refuse_if_the_deadline_cannot_be_met` owns further down with its own margins.
     _planned_w, _planned_h = estimator.output_dimensions(
         source["width"], source["height"], model_short_edge or 1)
+    # **ONE TABLE PER JOB, AND EVERY RATE READER READS IT** (W6, ruled by CF 2026-09-19): the
+    # frames refusal, the plan's ETA and a forced re-plan price from the same object, so no two
+    # of them can quote from different tables.
+    card_table = estimator.load_card_table()
     estimator.refuse_frames_no_deadline_admits(
-        job_shape, estimator.load_calibration(), _planned_w * _planned_h)
+        job_shape, card_table, _planned_w * _planned_h)
 
-    plan, rationale = estimator.plan(job_shape, machine)
+    plan, rationale = estimator.plan(job_shape, machine, card_table=card_table)
 
     # **Calibration override.** The estimator picks the fastest rung whose *measured* peak fits,
     # and it only ever measures the rung it ran — so an empty table means the floor, for ever,
@@ -530,7 +534,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         # updated — so the fix is to stop updating it by hand. `plan()` builds a coherent one for
         # the forced rung and only the sentence explaining the pin is layered on top.
         estimators_own = rationale
-        plan, rationale = estimator.plan(job_shape, machine, force_rung=index)
+        plan, rationale = estimator.plan(job_shape, machine, card_table=card_table,
+                                         force_rung=index)
         plan["batch_size"] = pipeline.snap_batch_size(plan.get("batch_size", 1))
         # **`reason`, not `why`.** `estimator.plan` calls this field `reason`; writing `why` here
         # added a key nobody reads and left `reason` holding the estimator's *unforced* rationale.
@@ -650,9 +655,16 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # path and not measured (api.md §4d), and nothing here predicts whether the work will fit.
     if request.get("execution_timeout_ms") and not rationale.get("predicted_seconds"):
         absent = rationale.get("timing_unavailable")
-        why = ("{} has no calibration rows (see rationale.timing_unavailable)".format(
-                   absent.get("running_on"))
-               if absent else "nothing comparable is calibrated at this size")
+        # **Each absence in its own words** (W6): J5's is a card the card table does not price;
+        # F4's is a regime no card in it prices — "this card has no rows" was false for the second.
+        if absent and absent.get("regime"):
+            why = ("no card in the card table holds a rate in this job's regime ({}) (see "
+                   "rationale.timing_unavailable)".format(absent["regime"]))
+        elif absent:
+            why = ("{} has no rate in the card table (see rationale.timing_unavailable)".format(
+                absent.get("running_on")))
+        else:
+            why = "nothing comparable is calibrated at this size"
         warnings.append(
             "no time prediction for this job: {}, so there is no predicted duration and no ETA "
             "until the run has measured its own progress. The in-run stops still apply — the job "

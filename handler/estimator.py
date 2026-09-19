@@ -59,10 +59,6 @@ from errors import (CAPACITY_EXCEEDED, DEADLINE_EXCEEDED, INVALID_FIELD_VALUE,
 from pipeline import BATCH_SIZES
 import planner
 
-CALIBRATION_PATH = os.environ.get(
-    "CALIBRATION_PATH", os.path.join(os.path.dirname(__file__), "calibration.json")
-)
-
 #: VRAM held back from planning: allocator fragmentation, the CUDA context, cuDNN workspaces.
 #: **One definition, in `planner`.** It moved from 2.0 to 1.0 on two direct measurements of the
 #: true reserve (R3 1.27 GiB, E1b 1.03), and three modules each holding their own copy of that
@@ -157,18 +153,6 @@ FLOOR_INDEX = len(RUNGS) - 1
 RUNG_NAMES = tuple(r["name"] for r in RUNGS)
 
 
-def load_calibration(path=None):
-    """Measured runs. Absent or unreadable is a normal state, not an error — it is the state
-    this repo ships in, and it means 'take the floor' rather than 'guess'."""
-    path = path or CALIBRATION_PATH
-    try:
-        with open(path) as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return []
-    return data.get("runs", []) if isinstance(data, dict) else (data or [])
-
-
 def short_edge_covering(source_width, source_height, target_width, target_height):
     """The short-edge target whose output covers `target_width` x `target_height` in both axes.
 
@@ -203,232 +187,100 @@ def output_dimensions(source_width, source_height, target_short_edge_px):
     return width - (width % 2), height - (height % 2)
 
 
-#: What a row's tiling is when the row does not say. **Every one of the 39 rows in the shipped
-#: table is absent here, and every one of them was planned at `default`**: `tile_quality` is a
-#: release-2 lever, the first job ever to ask for `high` was the 8K hero shot of 2026-08-20, and
-#: that job's master never landed — so it banked no row (F-2026-08-20-39). Reading absent as
-#: `default` is therefore a statement about this table's history rather than a guess, it is
-#: asserted as such by rung 1, and it stops being load-bearing the moment rows start carrying the
-#: field, which `run_one` now banks.
-#:
-#: The alternative — absent means unknown, so degrade — would relabel every prediction the table
-#: has ever made, including the 8K row a certified verdict already reads as measured. A rule that
-#: changes certified output in order to describe rows it has no doubt about is not caution.
+#: The tiling every rate in the card table is AT. **A curated rate is a DEFAULT-TILING rate** (W6
+#: Q1, ruled 2026-09-19): the table's schema says so and the generator presents `high` rows apart
+#: from `default` ones so the premise is made true rather than assumed. So a job at any other
+#: `tile_quality` is priced from a rate measured at another tiling, and says so.
 DEFAULT_TILE_QUALITY = "default"
 
 
-def _row_tile_quality(row):
-    """The tiling a row is SELECTED under — a selection key, not a claim about its grid.
-
-    **A forced rung's `"rung"` selects as `default`** (W4 R2, option (b) ruled 2026-09-18). Its
-    grid came from `RUNGS[index]` and may or may not be the default grid; reading it as `default`
-    here is the STATUS QUO carried forward deliberately — a forced row banked null before R2 and
-    null already read as `default` — NOT an assertion that the two grids match. Forced runs built
-    23 of the table's 44 rows, so leaving them unmatched would quietly retire them.
-    """
-    tiling = row.get("tile_quality") or DEFAULT_TILE_QUALITY
-    return DEFAULT_TILE_QUALITY if tiling == FORCED_TILING else tiling
-
-
-#: **A row banked as PURE RECORD is not a prediction** (CF, 2026-08-28; `time-model.md` §0c). Two
-#: H200 rows were landed as coverage and explicitly ruled not to make `same_card` non-empty.
-#:
-#: **They were invisible only because the selector was blind, and §0c removes exactly that
-#: blindness** — so the ruling needs a field of its own rather than a bug to shelter behind. Until
-#: today it lived in prose in each row's `note`, which is not something a selector can read.
-PURE_RECORD = "pure_record"
-
-
-def _priceable(row):
-    """May this row inform a prediction at all? **One predicate, every reader.**
-
-    `PURE_RECORD` reached `_in_one_unit` and nothing else, so a row a person ruled out was still
-    read by `fastest_seconds_per_frame` — the lower bound `refuse_frames_no_deadline_admits` uses
-    to REFUSE work — and by `_approximate_seconds_per_frame`. The marker said "not a prediction"
-    and meant "not one prediction out of three". It was unreachable only because both marked rows
-    happen to carry no bare rate, which is the bug sheltering the ruling all over again.
-    """
-    return isinstance(row, dict) and not row.get(PURE_RECORD)
-
-
-def _in_one_unit(row):
-    """A row the caller can price, carrying `seconds_per_frame`, or None. **Never mutates.**
-
-    `time-model.md` §0c, ruled 2026-08-31:
-
-        a bare `seconds_per_frame`                     used as-is
-        `seconds_per_frame_post_strip`                 post_strip + strip_seconds / frames
-        post-strip without `strip_seconds`/`frames`    NOT used, counted as skipped
-        neither                                        not used
-
-    **Amendment 6e ruled on 2026-08-20 that a new row carries the post-strip rate and never a bare
-    one, and this selector read the bare one** — so three conforming rows were unreadable from the
-    day they were banked and `calibration_rows.py` was about to emit fifty more into the same
-    silence. A measurement pipeline built end to end, terminating in a table nothing reads.
-
-    **The conversion is exact arithmetic and takes no model.** `post_strip + strip_seconds/frames`
-    reproduces `attempt_seconds/frames` to within 0.0005 on the three banked rows. Anything that
-    needed a strip ESTIMATE would be the time model, which CF buried today.
-
-    **It re-contaminates each converted row by one draw of the strip** — 2.3%, 11.7% and 5.6% on
-    those three — and that is accepted rather than overlooked. It is what 6e exists to prevent;
-    against the never-retryable refusal it was unacceptable, and `api.md` §4d removed the refusal.
-    Against an ETA it is cheap. Converting DOWN is not available: no visible row carries a strip,
-    and `max()` may not range over two units.
-
-    **A copy, always.** Writing the converted rate onto the caller's row would put a derived value
-    into the calibration table for the life of the process, where the next reader cannot tell it
-    from a measurement.
-    """
-    if not _priceable(row):
-        return None
-    bare = row.get("seconds_per_frame")
-    if _positive_number(bare):
-        # **A copy on this path too.** It used to hand back the caller's own dict, so nine of nine
-        # returned rows were the table's own objects while the docstring promised a copy — a
-        # future caller normalising a rate onto a returned row would corrupt the shipped table
-        # for bare rows and not for converted ones, which is the worst shape that bug can take.
-        return dict(row)
-    post_strip = row.get("seconds_per_frame_post_strip")
-    if not _positive_number(post_strip):
-        return None
-    strip, frames = row.get("strip_seconds"), row.get("frames")
-    # **Half a 6e row is refused rather than guessed at.** Without both columns the strip is
-    # either inside the rate or outside it depending on nothing a reader can see, and a row that
-    # cannot say which unit it is in has the shape of a measurement without being one.
-    if not _number(strip) or not _positive_number(frames):
-        return None
-    return dict(row, seconds_per_frame=post_strip + strip / float(frames))
-
-
-def _number(value):
-    """A real number, and `True` is not one. **`isinstance(True, int)` is the trap.**"""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _positive_number(value):
-    return _number(value) and value > 0
-
-
-def _unconvertible(calibration):
-    """Rows carrying a post-strip rate that cannot be converted. **Counted, never silent.**
-
-    §0c says such a row is skipped; a skip nobody counts is indistinguishable from a table that
-    never held one, which is how the original mismatch survived eleven days.
-    """
-    # **DEFINED IN TERMS OF `_in_one_unit`, so the two cannot disagree.** Spelling the same
-    # predicates twice was already wrong twice: they read `frames: "0"` differently — `not "0"` is
-    # False, so the guard meant to stop the division let it through and `_in_one_unit` raised
-    # `ZeroDivisionError` inside `_timing_rows`, taking the whole estimate down while this
-    # function called the row convertible. Matching the predicates fixed that pair and left a
-    # string post-strip rate dropped by one and counted by neither.
-    #
-    # **A row that LOOKS 6e-shaped and cannot be priced is counted, whatever the reason** — the
-    # key being present is what makes it a row somebody meant as a measurement.
-    return [r for r in calibration or []
-            if _priceable(r)
-            and r.get("seconds_per_frame_post_strip") is not None
-            and _in_one_unit(r) is None]
-
-
-#: The two regimes a rate is derived in (W5 P3). **Window 1 is a different machine**: it pays the
-#: whole per-frame setup on every frame where a window of N amortises it.
+#: The two regimes a rate is held in (W5 P3). **Window 1 is a different machine**: it pays the
+#: whole per-frame setup on every frame where a window of N amortises it. The names are the
+#: table's own keys under `mpx_per_s`.
 BATCHED = "batched"
 UNBATCHED = "unbatched"
+REGIMES = (BATCHED, UNBATCHED)
+
+#: The in-image card table (W6 item 1). **Curated, not derived**: CF authors the rates, a
+#: generator proposes the VRAM halves, and the file is reviewed and committed.
+CARD_TABLE_PATH = os.environ.get(
+    "CARD_TABLE_PATH", os.path.join(os.path.dirname(__file__), "cards.json")
+)
 
 
-def _ran_unbatched(row):
-    """**The one discriminator between the two regimes**, for `_timing_rows` and `card_rates`
-    alike: a row that ran at window 1. Keyed on the window and not the rung name — `floor` is how
-    it is usually reached, but a forced `batch_size=1` at any rung costs exactly the same."""
-    return row.get("window") == 1
+def _finite_positive(value):
+    """A real, finite, positive number. **`True` is not one** — `isinstance(True, int)` is the
+    trap — and json.load accepts `Infinity` and `NaN`."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
 
 
-def card_rates(calibration):
-    """`{(gpu_name, regime): {gpu_name, mpx_per_s, rows, tilings}}` — **derived, never stored**
-    (W5 P3, ruled 2026-09-18).
+def card_table_problem(document):
+    """Why `document` is not a usable card table, or None when it is.
 
-    A card's rate in a regime is `sum(output Mpx x frames) / sum(seconds)` over its usable rows:
-    the frame-weighted mean, so a long run counts for its length and a banked row moves the rate
-    the day it lands. **Usable** is a row `_in_one_unit` can price (so never a pure-record row,
-    and a post-strip row converted exactly), carrying a card, a size, a positive frame count and
-    a known window — a row with no window cannot say which regime it ran in.
+    **STRUCTURAL ONLY, AND IT DOES NOT PRETEND OTHERWISE** (W6 item 2, ruled 2026-09-19): an
+    object, at least one card, non-empty card names, and every number positive and finite.
+    **A RATE TEN TIMES TOO FAST PASSES EVERY ONE OF THESE.** Nothing here can tell a right number
+    from a wrong one; that is the curation step's job, done before the table is committed or sent.
 
-    `tilings` maps each `tile_quality` that fed the rate to the SECONDS it contributed — the
-    rate's own weight, so "dominant" means dominant in the number that priced the job (F1, ruled
-    2026-09-19). For the label only; the rate itself is
-    not partitioned on tiling (see the caller).
+    `null` is allowed where a number is — a card with no unbatched rate carries `null` there —
+    and a key the reader does not use is not a structural fault.
     """
-    sums = {}
-    for raw in calibration or []:
-        row = _in_one_unit(raw)
-        if row is None or not row.get("gpu_name") or row.get("window") is None:
-            continue
-        pixels, frames = row.get("output_pixels"), row.get("frames")
-        if not _positive_number(pixels) or not _positive_number(frames):
-            continue
-        # **Each row's own rate must be a real positive time** (review, P3): `_in_one_unit`
-        # accepts a negative strip, which converts to a rate at or below zero and would INFLATE
-        # the card's speed, and an `Infinity` (json.load accepts it) would zero the rate and
-        # divide by it downstream. Such a row is malformed, not slow.
-        seconds = row["seconds_per_frame"]
-        if not _positive_number(seconds) or not math.isfinite(seconds):
-            continue
-        key = (row["gpu_name"], UNBATCHED if _ran_unbatched(row) else BATCHED)
-        entry = sums.setdefault(key, {"mpx_frames": 0.0, "seconds": 0.0, "rows": 0,
-                                      "tilings": {}})
-        entry["mpx_frames"] += pixels / 1e6 * frames
-        entry["seconds"] += seconds * frames
-        entry["rows"] += 1
-        tiling = _row_tile_quality(row)
-        entry["tilings"][tiling] = entry["tilings"].get(tiling, 0.0) + seconds * frames
-    return {key: {"gpu_name": key[0], "mpx_per_s": entry["mpx_frames"] / entry["seconds"],
-                  "rows": entry["rows"], "tilings": entry["tilings"]}
-            for key, entry in sums.items() if entry["seconds"] > 0}
+    if not isinstance(document, dict):
+        return "the card table is not a JSON object"
+    cards = document.get("cards")
+    if not isinstance(cards, dict) or not cards:
+        return "the card table has no 'cards' object with at least one card"
+    for name, entry in cards.items():
+        if not isinstance(name, str) or not name.strip():
+            return "a card name is empty"
+        if not isinstance(entry, dict):
+            return "card {!r} is not an object".format(name)
+        numbers = [(key, entry.get(key)) for key in ("vram_total_gb", "vram_free_gb")]
+        rates = entry.get("mpx_per_s")
+        if rates is not None:
+            if not isinstance(rates, dict):
+                return "card {!r}: 'mpx_per_s' is not an object".format(name)
+            numbers += [("mpx_per_s." + str(key), value) for key, value in rates.items()]
+        for key, value in numbers:
+            if value is not None and not _finite_positive(value):
+                return "card {!r}: {} is {!r}, not a positive finite number".format(
+                    name, key, value)
+    return None
 
 
-def _timing_rows(calibration, output_pixels, window, unbatched=None):
-    """Rows to borrow a per-frame time from when the configuration has no rung name.
+def load_card_table(path=None):
+    """The in-image card table, or None where it is absent or fails the structural check.
 
-    **Time and memory are different questions and this is where they part.** A borrowed peak is an
-    OOM; a borrowed rate is a wider ETA, which the deadline margin already covers. So this is
-    permissive where `_matching_runs` is strict: any row within 2x on pixels, preferring those at a
-    comparable window, and the caller still prefers rows measured on the same card.
+    **None prices nothing and names every absence** (J5, F4) — it is never read as "no card is
+    slow". A missing in-image table is a build fault, and `tests/run_local.py` asserts the
+    Dockerfile copies it, because the last data file this directory gained shipped without it.
     """
-    # **Selected on pixels alone, deliberately.** An earlier version preferred rows at a
-    # comparable window, which made the rate depend on the plan: two jobs 12.5% apart in size
-    # picked different window bands and their predictions diverged 3.2x. The per-frame rate is
-    # then scaled by the pixel ratio by the caller, which is the correction that belongs here;
-    # the window's effect on speed is real but second-order beside it, and folding it in through
-    # row selection made the prediction unstable rather than sharper.
-    del window
-    rows = [row for row in (_in_one_unit(r) for r in calibration or [])
-            if row is not None and row.get("output_pixels")
-            and 0.5 <= row["output_pixels"] / float(output_pixels) <= 2.0]
+    path = path or CARD_TABLE_PATH
+    try:
+        with open(path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return None if card_table_problem(document) else document
 
-    # **A row that ran without temporal batching may never price one that will, or the reverse**
-    # (F-2026-08-20-40, third face). The reason is one sentence: a window of 1 pays the whole
-    # per-frame setup on every frame, where a window of N amortises it across N. That is a
-    # different quantity, not a slower version of the same one.
-    #
-    # **This subsumes the still/video split and is why it replaced it.** The rule was `frames ==
-    # 1`, which caught all sixteen still rows — every one of them runs at window 1 — and missed
-    # the three *video* rows that also ran unbatched. One of those is an A40 48-frame 4K row at
-    # `rung: floor`, `window: 1`, **34.438 s/frame**, sitting beside honest rows of 12.8, 13.8,
-    # 14.5 and 16.4 for the same card, size and day. Because the caller takes `max()` over
-    # comparable rows, that single row priced every A40 4K video job at roughly 2.4x its measured
-    # rate, wearing `prediction_basis: measured`.
-    #
-    # Keyed on `window` and not on the rung name: `floor` is how this configuration is usually
-    # reached, but the thing that costs is the window, and a forced `batch_size=1` at any rung
-    # costs exactly the same.
-    #
-    # Selection still does not depend on the window's *value* — that was tried and removed,
-    # because two jobs 12.5% apart in size picked different bands and their predictions diverged
-    # 3.2x. This is a partition into batched and unbatched, which is a difference in kind.
-    if unbatched is None:
-        return rows
-    return [r for r in rows if _ran_unbatched(r) == bool(unbatched)]
+
+def table_rates(card_table):
+    """`{(gpu_name, regime): {"gpu_name", "mpx_per_s"}}` — one entry per rate the table holds.
+
+    **Read, never derived** (W6 item 1, ruled 2026-09-19): the old `card_rates()` summed every
+    row, so it could not leave out a starved host, hold a margin, or tell a card measured at one
+    size from one measured across four. A `null` regime is no rate, not a zero one.
+    """
+    if not card_table or card_table_problem(card_table):
+        return {}
+    rates = {}
+    for name, entry in card_table["cards"].items():
+        for regime in REGIMES:
+            value = (entry.get("mpx_per_s") or {}).get(regime)
+            if value is not None:
+                rates[(name, regime)] = {"gpu_name": name, "mpx_per_s": float(value)}
+    return rates
 
 
 #: RunPod's own hard ceiling on `executionTimeout`, in milliseconds — seven days. Not this
@@ -461,27 +313,23 @@ def stop_at_seconds(budget_s):
     return budget_s - WRITE_RESERVE_S
 
 
-def fastest_seconds_per_frame(calibration, output_pixels):
-    """The quickest per-frame rate ever measured here, scaled to this size. `None` if unmeasured.
+def fastest_seconds_per_frame(card_table, output_pixels):
+    """The quickest per-frame time the card table allows at this size. `None` if it holds no rate.
 
     A *lower bound* on how long a frame can take, which is the only direction that can support a
-    refusal: if a job cannot finish even at the fastest rate anyone has ever observed, no
-    configuration will rescue it.
+    refusal: if a job cannot finish even at the fastest rate the table holds, no configuration
+    will rescue it. **Output Mpx over the table's highest `mpx_per_s` in any card and regime**
+    (W6 Q3, ruled 2026-09-19) — the same table the ETA reads, so the two cannot disagree about
+    what is known. It always selects a batched rate, which is right: the question is whether ANY
+    deadline could hold this, so the fastest thing known is the denominator.
     """
-    # **Through `_in_one_unit` as well — "every rate reader", not two of three.** This one is the
-    # lower bound `refuse_frames_no_deadline_admits` uses to DENY a job, and a minimum taken over
-    # a subset is HIGHER than one taken over the whole table: a cheap 6e row it could not see made
-    # the bound stricter and refused work that would have finished. That is the unsafe direction
-    # for the one reader whose output is a refusal.
-    rows = [row for row in (_in_one_unit(r) for r in (calibration or []))
-            if row is not None and row.get("output_pixels")]
-    if not rows:
+    rates = table_rates(card_table)
+    if not rates:
         return None
-    return min(r["seconds_per_frame"] * (output_pixels / float(r["output_pixels"]))
-               for r in rows)
+    return (output_pixels / 1e6) / max(rate["mpx_per_s"] for rate in rates.values())
 
 
-def refuse_frames_no_deadline_admits(job, calibration, output_pixels):
+def refuse_frames_no_deadline_admits(job, card_table, output_pixels):
     """Refuse a frame count that no deadline could accommodate — **arithmetic, not a constant.**
 
     **The bound is the platform's ceiling, not the caller's deadline** (F-2026-08-18-15). The
@@ -497,7 +345,7 @@ def refuse_frames_no_deadline_admits(job, calibration, output_pixels):
     What this deliberately is not is a maximum frame count. `validation.py` records CF
     withdrawing exactly that kind of invented input rule, and a constant here would repeat it:
     a number nobody measured, refusing work that would have succeeded. What replaces it is the
-    arithmetic that was always available — at the fastest rate ever measured, does this many
+    arithmetic that was always available — at the fastest rate the card table holds, does this many
     frames fit in the time the job actually has? A source claiming more than that is not
     describing a job anyone can run.
 
@@ -506,7 +354,7 @@ def refuse_frames_no_deadline_admits(job, calibration, output_pixels):
     frames = job.get("estimated_frames")
     if not frames or frames < 1:
         return
-    per_frame = fastest_seconds_per_frame(calibration, output_pixels)
+    per_frame = fastest_seconds_per_frame(card_table, output_pixels)
     if not per_frame:
         return
     budget_s = PLATFORM_EXECUTION_CEILING_MS / 1000.0
@@ -515,7 +363,7 @@ def refuse_frames_no_deadline_admits(job, calibration, output_pixels):
         return
     raise WorkerError(
         INVALID_FIELD_VALUE,
-        "the source reports {:,} frames, which at the fastest rate ever measured here "
+        "the source reports {:,} frames, which at the fastest rate the card table holds "
         "({:.3f} s/frame at this size) is {:,.0f} s of work against a {:,.0f} s {} — it cannot "
         "finish, so there is no configuration to plan. Check the source's duration and frame "
         "rate: container metadata claiming a duration the file does not have produces exactly "
@@ -559,7 +407,7 @@ def _summarise_passes(passes):
     }
 
 
-def plan(job, snapshot, calibration=None, force_rung=None):
+def plan(job, snapshot, card_table=None, force_rung=None, timed_as=None):
     """Choose a configuration before any work starts. Returns `(plan, rationale)`.
 
     **The heart is `planner`, and this function is the wiring around it.** Six steps over
@@ -568,16 +416,16 @@ def plan(job, snapshot, calibration=None, force_rung=None):
     then attach the timing prediction the deadline guard needs.
 
     What used to live here — the rung ladder as a decider, the pooled frontier, the raw-row
-    matching against `calibration.json` — is gone (F-14). Those were the mechanism for *not*
-    having formulas, and the campaign that produced the registry ended the need for them. The
-    table survives for **time only**: the registry models memory and says nothing about wall
-    clock, and a deadline check that disappears is indistinguishable from one that passes.
+    matching against the old calibration table — is gone (F-14). Those were the mechanism for
+    *not* having formulas, and the campaign that produced the registry ended the need for them.
+    The card table's rates serve **time only**: the registry models memory and says nothing about
+    wall clock. `card_table` None reads the in-image table; `timed_as` is the service's (§4a-ii).
 
     `job` carries `target_short_edge_px`, `source_width`, `source_height` and `estimated_frames`
     — the last from the source's duration and rate, used for **planning and the ETA only**.
     Every frame count this worker reports comes from the decode.
     """
-    calibration = load_calibration() if calibration is None else calibration
+    card_table = load_card_table() if card_table is None else card_table
     width, height = output_dimensions(
         job["source_width"], job["source_height"], job["target_short_edge_px"]
     )
@@ -730,10 +578,14 @@ def plan(job, snapshot, calibration=None, force_rung=None):
                 "against (up to {:.1f}); this plan is an extrapolation and says so"
                 .format(usable or 0.0, planner.ANCHORED_MAX_USABLE))
 
-    _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
+    # **Time is judged on `timed_as` where one is given** — the name CF SENT, when the planner
+    # service planned memory against a substitute (`cf-planner.md` §4a-ii, W6). The worker never
+    # passes it: its snapshot IS the card it runs on.
+    timed_on = snapshot.get("gpu_name") if timed_as is None else timed_as
+    _attach_timing(rationale, card_table, job, timed_on, output_pixels)
     # After the rate, because it adds to the total the rate produced — and never inside it, so a
-    # run that has no timing row at all still reports what its reloads will cost.
-    _attach_reload_cost(rationale, snapshot)
+    # run that has no rate at all still reports what its reloads will cost.
+    _attach_reload_cost(rationale, timed_on)
     return chosen, rationale
 
 
@@ -772,7 +624,7 @@ def model_reload_seconds(gpu_name=None):
     return MODEL_RELOAD_BOUND_S, "bounded"
 
 
-def _attach_reload_cost(rationale, snapshot):
+def _attach_reload_cost(rationale, gpu_name):
     """Rung 2's reloads, priced into the quote as their own line rather than folded into a rate.
 
     Its own term, because amendment 6e's lesson was exactly this shape one axis over: 365 s of
@@ -783,7 +635,7 @@ def _attach_reload_cost(rationale, snapshot):
     reloads = int(rationale.get("reloads") or 0)
     if reloads <= 0:
         return
-    seconds, basis = model_reload_seconds(snapshot.get("gpu_name"))
+    seconds, basis = model_reload_seconds(gpu_name)
     rationale["reload_seconds_each"] = seconds
     rationale["reload_basis"] = basis
     rationale["reload_seconds_total"] = round(reloads * seconds, 1)
@@ -792,122 +644,81 @@ def _attach_reload_cost(rationale, snapshot):
             rationale["predicted_seconds"] + reloads * seconds, 1)
 
 
-def cards_with_priceable_rows(calibration):
+def cards_with_rates(card_table):
     """The cards the table can price time for — J5's test of "measured", shared with the planner
-    service. **Defined BY `card_rates`** (W5 P3): a card is measured exactly when it has a rate in
-    some regime. A looser test let a card pass as measured with no usable rate row — a row with
-    no window or no frame count — and then priced nothing and named nothing, which is the silent
-    null J5 exists to end.
+    service. A card is measured exactly when it holds a rate in some regime: a card entered with
+    memory and no rate prices nothing, so it is not measured."""
+    return sorted({card for card, _regime in table_rates(card_table)})
+
+
+def _attach_timing(rationale, card_table, job, gpu_name, output_pixels):
+    """The ETA — **time only, and from the card table only.**
+
+    The registry models memory; it says nothing about wall clock. So the card table's rates have
+    exactly one job here: predicting seconds. They decide nothing about what is run.
+
+    `gpu_name` is **the card the time is judged on**, which is not always the card memory was
+    planned against: the planner service plans a card CF sent without a reading against a
+    substitute's memory, and times it under the name CF SENT (`cf-planner.md` §4a-ii, W6).
+
+    **The three paths that are not this card's own rate, kept as ruled:**
+
+        a named card the table holds no rate for     no time — J5's named absence
+        a card with a rate, but none in this regime  the SLOWEST card's rate in the regime,
+                                                     labelled borrowed
+        a card that could not be read (no name)      the same borrow
+
+    and where no card holds a rate in the regime at all, F4's named absence.
     """
-    return sorted({card for card, _regime in card_rates(calibration)})
-
-
-def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels):
-    """The ETA and the deadline guard's input — **time only, and from the table only.**
-
-    The registry models memory; it says nothing about wall clock, and the host-tail time model
-    is an open item. So `calibration.json` keeps exactly one job: predicting seconds. It no
-    longer decides anything about what is run, which is the separation F-14 asked for — a peak
-    borrowed from another row is an OOM, while a rate borrowed from another row is a labelled
-    estimate, and only one of those is worth the risk.
-    """
-    skipped = _unconvertible(calibration)
-    if skipped:
-        rationale["rows_unconvertible"] = len(skipped)
-        rationale["rows_unconvertible_why"] = (
-            "carry seconds_per_frame_post_strip without both strip_seconds and frames, so the "
-            "strip is either inside the rate or outside it depending on nothing a reader can see")
-    else:
-        rationale["rows_unconvertible"] = 0
-
-    # **Before the empty-table return** (review, J5): no table means no card is measured, and
-    # the absence is still named rather than bare.
-    # **A CARD THE TABLE HAS NEVER SEEN GETS NO RATE — A NAMED ABSENCE, NEVER A BARE NULL**
-    # (J5, ruled 2026-09-18: ABSENT BEATS WRONG). The fallback below would price it at the
-    # slowest rate measured on OTHER cards — safe against our own data, and optimistic exactly
-    # when the card is slower than anything measured, which is the MIG partition RunPod placed on
-    # low. **Only a NAMED card absent from the whole table**: a card measured at other sizes still
-    # borrows within its pixel window and says so, and an unreadable card (no name) keeps the
-    # path it had. The progress ETA's observed-rate fallback is what makes absence affordable, and
-    # the first delivered run on the card writes the rows that end it.
-    running_on = snapshot.get("gpu_name")
-    # **Rows the rate can actually be priced from** (review, J5): a pure-record, unconvertible or
-    # geometry-less row does not make a card measured — _timing_rows would not use it, and the
-    # card would fall straight back to the pooled borrow this block exists to stop.
-    measured_on = cards_with_priceable_rows(calibration)
+    running_on = gpu_name
+    measured_on = cards_with_rates(card_table)
+    # **A CARD THE TABLE HAS NEVER PRICED GETS NO RATE — A NAMED ABSENCE, NEVER A BARE NULL**
+    # (J5, ruled 2026-09-18: ABSENT BEATS WRONG). Pricing it off the slowest card is safe against
+    # our own data and optimistic exactly when the card is slower than anything priced, which is
+    # the MIG partition RunPod placed on low. Only a NAMED card: an unreadable one borrows below.
+    # The progress ETA's observed-rate fallback is what makes absence affordable.
     if running_on and running_on not in measured_on:
         rationale["timing_unavailable"] = {
             "running_on": running_on,
             "cards_with_rows": measured_on,
-            "why": ("no calibration row was measured on this card; another card's rate is not "
+            "why": ("the card table holds no rate for this card; another card's rate is not "
                     "this card's, so no prediction is made rather than a borrowed one"),
         }
         return
-    if not calibration:
-        return
-    # **THE SIMPLE RATE REPLACES THE LOOKUP** (W5 P3, ruled 2026-09-18). One rate per card per
-    # regime, DERIVED from the table on every call — `card_rates` — so a banked row improves the
-    # prediction with no release and there is no second artefact to keep true. Measured over
-    # W3's eleven delivered runs: the lookup (pixel band, then `max()`) was 147% mean absolute
-    # error and over on 10 of 11; one rate per card was 15%.
-    #
-    # **The regime is the plan's own window, through the SAME discriminator `_timing_rows` uses**
-    # (`_ran_unbatched`). A still always plans 1; a video that plans 1 is the floor rung and pays
-    # the full per-frame setup the same way. The two rates differ by 0.23-0.39x across cards, so
-    # the regime is two rates and never one rate with a multiplier.
+    # **The regime is the plan's own window.** A still always plans 1; a video that plans 1 is the
+    # floor rung and pays the full per-frame setup the same way. The two rates differ by
+    # 0.23-0.39x across cards, so the regime is two rates and never one rate with a multiplier.
     regime = UNBATCHED if rationale.get("temporal_window") == 1 else BATCHED
-    rates = card_rates(calibration)
+    rates = table_rates(card_table)
     rate = rates.get((running_on, regime)) if running_on else None
     borrowed_card = rate is None
     if borrowed_card:
-        # **A MEASURED card with no rows in THIS regime, or a card that could not be read,
-        # borrows within the measured set, labelled** — J5 withholds time only from a named card
-        # the table has never seen, and that returned above. The SLOWEST card measured in the
-        # regime, so the borrow errs long, as the lookup's `max()` did.
         in_regime = {card: r for (card, reg), r in rates.items() if reg == regime}
         if not in_regime:
-            per_frame = _approximate_seconds_per_frame(
-                calibration, chosen["name"], output_pixels, job.get("estimated_frames"))
-            if per_frame is not None:
-                rationale["seconds_per_frame"] = round(per_frame, 4)
-                rationale["prediction_basis"] = "approximate"
-                if _timed_frames(job):
-                    rationale["predicted_seconds"] = round(per_frame * _timed_frames(job), 1)
-                return
-            # **A NAMED ABSENCE, never a bare null** (F4, ruled 2026-09-19): no card has a rate in
-            # this regime and nothing scales to it, so say so the way every other absence does.
+            # **A NAMED ABSENCE, never a bare null** (F4, ruled 2026-09-19; W6 Q2): no card holds
+            # a rate in this regime. The `approximate` basis that used to scale a row here is
+            # gone with the rows.
             rationale["timing_unavailable"] = {
                 "running_on": running_on,
                 "cards_with_rows": measured_on,
                 "regime": regime,
-                "why": ("no card in the table has a usable row in this job's regime ({}), and "
-                        "no row scales to it, so no prediction is made".format(regime)),
+                "why": ("no card in the card table holds a rate in this job's regime ({}), so "
+                        "no prediction is made".format(regime)),
             }
             return
+        # The SLOWEST card in the regime, so the borrow errs long.
         lender = min(in_regime, key=lambda card: in_regime[card]["mpx_per_s"])
         rate = in_regime[lender]
 
     per_frame = (output_pixels / 1e6) / rate["mpx_per_s"]
     rationale["seconds_per_frame"] = round(per_frame, 4)
 
-    # **NO TILING PARTITION ON THE RATE, BY RULING — AND IT UNDER-PREDICTS `high`.** `high` has
-    # one video row in the table; partitioning would leave it unusable and split every other card
-    # three ways, and a term that looked justified has failed leave-one-out four times. **But the
-    # ledger records `high` DOUBLING an 8K job** (F-2026-08-20-40), and this rate does not know
-    # about tiling — **so a `high` job at a large output WILL BE UNDER-PREDICTED until there are
-    # rows to say otherwise.** On the committed table an 8K `high` H200 job prices at ~20.5
-    # s/frame against its own 46.5 s/frame row, the rate being 87% default by weight.
-    #
-    # **So the LABEL is held to the weight, not to presence** (F1, ruled 2026-09-19). `measured`
-    # requires the job's tiling to carry strictly more of the rate's seconds than any other
-    # tiling; otherwise `borrowed`, and `timing_from_another_tiling` says what the rate weighed.
-    # A single `high` row among default ones used to be enough to read `measured`.
+    # **A NON-DEFAULT TILING IS PRICED FROM A DEFAULT-TILING RATE, AND SAYS SO** (F1 as carried by
+    # W6 Q1). The ledger records `high` taking 2.49x `default` on one 8K job, and the rate does not
+    # know about tiling — so a `high` job at a large output WILL BE UNDER-PREDICTED, and the label
+    # is what stops it reading `measured`. A forced rung's `rung` tiling is not `default` either.
     job_tiling = rationale.get("tile_quality") or DEFAULT_TILE_QUALITY
-    weights = rate["tilings"]
-    own_weight = weights.get(job_tiling, 0.0)
-    borrowed_tiling = not all(own_weight > weight
-                              for tiling, weight in weights.items() if tiling != job_tiling) \
-        or own_weight <= 0.0
+    borrowed_tiling = job_tiling != DEFAULT_TILE_QUALITY
     # **`borrowed` outranks `measured`, because it is the weaker claim** (formulas §9): `measured`
     # claims only what THIS card measured at this tiling.
     rationale["prediction_basis"] = (
@@ -915,13 +726,9 @@ def _attach_timing(rationale, calibration, chosen, job, snapshot, output_pixels)
     if borrowed_tiling:
         rationale["timing_from_another_tiling"] = {
             "running_at": job_tiling,
-            "rows_measured_at": sorted(weights),
-            # The share of the rate's seconds each tiling carried — what it actually weighed.
-            "weighed": {tiling: round(weight / sum(weights.values()), 3)
-                        for tiling, weight in sorted(weights.items())},
-            "why_it_matters": ("tile_quality moves the decode grid, and the rate does not know "
-                               "about tiling; a high-tiling 8K job measured 2x its "
-                               "default-tiling prediction (F-2026-08-20-40)"),
+            "why_it_matters": ("tile_quality moves the decode grid, and every rate in the card "
+                               "table is a default-tiling rate; a high-tiling 8K job measured "
+                               "2x its default-tiling prediction (F-2026-08-20-40)"),
         }
     if borrowed_card:
         rationale["timing_from_another_card"] = {
@@ -944,13 +751,6 @@ def _timed_frames(job):
     return job.get("estimated_frames") or (1 if job.get("still") else None)
 
 
-#: How far past the remaining deadline an *approximate* prediction has to reach before it refuses.
-#: A measured prediction refuses on any overrun; a scaled one has to be wrong by more than a factor
-#: of two to be wrong about this, and the cost of the two errors is not symmetric — refusing a job
-#: that would have finished costs the customer their result, while letting a doomed one run costs
-#: the seconds it was going to cost anyway.
-APPROXIMATE_DEADLINE_MARGIN = 2.0
-
 #: **The prediction is multiplied by this before it is compared to the deadline** (CF, 2026-08-15).
 #:
 #: Not a fudge factor: the estimator is *known* to err under, which is the one direction that
@@ -970,64 +770,6 @@ APPROXIMATE_DEADLINE_MARGIN = 2.0
 #: not a guarantee, because the check still fails open (no measurement for a job's shape means no
 #: check at all, and "no refusal" is not "it fits").
 DEADLINE_SAFETY_FACTOR = 1.5
-
-
-def _approximate_seconds_per_frame(calibration, rung_name, output_pixels, estimated_frames=None):
-    """Per-frame time for a rung with nothing comparable measured, scaled by pixel count.
-
-    Inference time on this model is close to linear in output pixels — the measured 4K and 8K runs
-    at `swapped` differ by 4x in pixels and 4.9x in time — so a run at any size gives a usable
-    figure for a run at another. It is not good enough to *plan* with, which is why the rung choice
-    still uses `_matching_runs` and its 2x window, and it is not recorded as a measurement. It is
-    good enough to answer "is this job hours away from a one-minute deadline", which is the only
-    question the refusal asks.
-
-    The **median** rather than the max: the max is the conservative choice for capacity, where
-    being wrong means an OOM, and the reckless one for a refusal, where being wrong means denying
-    a job that would have finished.
-
-    **And a still is not a slow video.** This scaled by pixels and ignored frame count entirely,
-    while `_matching_runs` directly above it has always known frames matter. A one-frame row's
-    per-frame time is mostly fixed cost -- the model load a sequence amortises over hundreds of
-    frames -- so scaling it by pixels answers a different question from the one being asked.
-
-    Measured on 2026-08-15: a 121-frame 4K job at `fast` drew the median of three rows, two of
-    them single stills, and predicted **77.0 s/frame** where the A40 does that work at 14.59 and a
-    Blackwell does it faster. About 5x over, and the deadline guard refused a job that would have
-    finished in twenty minutes -- which is exactly the failure CF named when it asked this worker
-    not to harden the factor into a guarantee.
-
-    So a sequence is estimated from sequences and a still from stills, and only where neither
-    exists does it fall back to everything rather than to nothing. A rough number is the point of
-    this function; a rough number drawn from the wrong kind of run is not.
-    """
-    # **THROUGH `_in_one_unit`, THE SAME PREDICATE THE OTHER TWO READERS USE** (`time-model.md`
-    # §0c, amended 2026-08-31 from "the selector" to "every rate reader").
-    #
-    # This selected on a bare rate while `_timing_rows` had learned both units, so a rung whose
-    # only banked rows came in under 6e produced NO prediction at all — and this is the path
-    # reached exactly when `_timing_rows` found nothing, which is when one row decides the whole
-    # estimate. The clause said "the selector" and there are three; the marker said "not a
-    # prediction" and reached one of them. Same defect, one from each of us, on the same day.
-    #
-    # **Expressed through the shared function rather than beside it**, so the three cannot drift:
-    # two predicates that must agree are a term-against-term defect waiting, and this project has
-    # paid for that shape more than once.
-    rows = [row for row in (_in_one_unit(run) for run in calibration or [])
-            if row is not None and row.get("rung") == rung_name and row.get("output_pixels")]
-    if estimated_frames:
-        sequence = estimated_frames > 1
-        alike = [run for run in rows
-                 if run.get("frames") and (run["frames"] > 1) == sequence]
-        rows = alike or rows
-    scaled = sorted(
-        run["seconds_per_frame"] * (output_pixels / float(run["output_pixels"]))
-        for run in rows)
-    if not scaled:
-        return None
-    return scaled[len(scaled) // 2]
-
-
 
 
 def _usable_vram(snapshot):
