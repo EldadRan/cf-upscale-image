@@ -736,7 +736,8 @@ def _attach_timing(rationale, card_table, job, gpu_name, output_pixels):
     # **A NON-DEFAULT TILING IS PRICED FROM A DEFAULT-TILING RATE, AND SAYS SO** (F1 as carried by
     # W6 Q1). The ledger records `high` taking 2.49x `default` on one 8K job, and the rate does not
     # know about tiling — so a `high` job at a large output WILL BE UNDER-PREDICTED, and the label
-    # is what stops it reading `measured`. A forced rung's `rung` tiling is not `default` either.
+    # is what stops it reading `measured`. **A forced rung is priced at the JOB's tiling**: its
+    # rationale carries what was asked, not `rung` (debug-only; left as is by CF, 2026-09-19).
     job_tiling = rationale.get("tile_quality") or DEFAULT_TILE_QUALITY
     borrowed_tiling = job_tiling != DEFAULT_TILE_QUALITY
     # **`borrowed` outranks `measured`, because it is the weaker claim** (formulas §9): `measured`

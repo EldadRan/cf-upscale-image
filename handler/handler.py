@@ -669,7 +669,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             why = ("{} has no rate in the card table (see rationale.timing_unavailable)".format(
                 absent.get("running_on")))
         else:
-            why = "nothing comparable is calibrated at this size"
+            # A rate exists but no frame count does: a video whose container gives no duration.
+            why = "the source reports no duration, so there is no frame count to price"
         warnings.append(
             "no time prediction for this job: {}, so there is no predicted duration and no ETA "
             "until the run has measured its own progress. The in-run stops still apply — the job "
