@@ -425,6 +425,9 @@ def estimate_core(body, commit, card_table=None):
 
     The whole request is read before anything is planned, so a refusal on the last tier costs no
     planning on the first.
+
+    `card_table`, when a caller of this function passes one, is THE table and the body's
+    `card_table` is not read — a seam for tests; `app.route` never passes one.
     """
     if not isinstance(body, dict):
         raise Refusal("request", "must be a JSON object")

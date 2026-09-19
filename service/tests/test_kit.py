@@ -884,6 +884,16 @@ class CardTableRidesTheEstimate(unittest.TestCase):
         memoryless = {"cards": {A40: {"mpx_per_s": {"batched": 0.6}}}}
         refused_field(self, self._body(card_table=memoryless), "card_table")
 
+    def test_a_refused_override_on_a_broken_image_is_the_services_fault(self):
+        # A refused override does not make the fault the caller's: the service's own table is
+        # the one that cannot answer, so 503 — never a 400 naming card_table (review, W6).
+        from service import app
+        body = json.dumps(self._body(card_table="not a table")).encode("utf-8")
+        status, payload = with_card_table(None, lambda: app.route("POST", "/estimate", body,
+                                                                  commit=None))
+        self.assertEqual(status, 503, payload)
+        self.assertNotIn("refused", payload)
+
     def test_a_refused_table_falls_back_to_the_in_image_one(self):
         bare = answer(self._body())
         for bad in (None, "not a table", {"cards": {A40: {"mpx_per_s": {"Batched": 0.6}}}}):
