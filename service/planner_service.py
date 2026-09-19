@@ -37,7 +37,6 @@ for _module in (estimator, planner, validation):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VRAM_TABLE_PATH = os.path.join(HERE, "vram_table.json")
-HANDLER_HISTORY_PATH = os.path.join(HERE, "handler_history.json")
 
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -60,19 +59,6 @@ class Refusal(Exception):
 def load_vram_table(path=VRAM_TABLE_PATH):
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
-
-
-def load_handler_history(path=HANDLER_HISTORY_PATH):
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def service_handler_tree(history):
-    """The handler/ tree this service plans with: the history table's newest entry (§5).
-
-    The kit holds that this is HEAD's tree — no commit after `newest` touches handler/.
-    """
-    return history["commits"][history["newest"]]
 
 
 def service_commit(environ):
@@ -173,13 +159,9 @@ def read_tier(body, index):
     if "tier" not in body or body["tier"] is None:
         raise Refusal("{}.tier".format(where), "required")
     host_ram_gb = _optional_number(body, "host_ram_gb", where)
-
-    if "worker_commit" not in body:
-        raise Refusal("{}.worker_commit".format(where), "required (null allowed)")
-    worker_commit = body["worker_commit"]
-    if worker_commit is not None and (not isinstance(worker_commit, str)
-                                      or not _FULL_SHA.match(worker_commit)):
-        raise Refusal("{}.worker_commit".format(where), "must be a full 40-hex sha, or null")
+    # **`worker_commit` is not read** (W6 item 3, ruled by CF 2026-09-19): the service no longer
+    # compares commits, and a caller still sending one has it ignored, whatever it holds. CF
+    # compares its pinned image tag with /version's `commit` itself.
 
     cards = body.get("cards")
     if not isinstance(cards, list) or not cards:
@@ -206,8 +188,7 @@ def read_tier(body, index):
                           "no host RAM for this card: neither the card nor the tier carries one")
         read_cards.append(card)
 
-    return {"tier": body["tier"], "host_ram_gb": host_ram_gb, "cards": read_cards,
-            "worker_commit": worker_commit}
+    return {"tier": body["tier"], "host_ram_gb": host_ram_gb, "cards": read_cards}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -447,8 +428,6 @@ def estimate_core(body, commit, vram_table=None):
     if not table_cards:
         # Before any card is planned: every fallback below ends in a measured card.
         raise TableUnusable("the service's VRAM table measures no card")
-    history = load_handler_history()
-    handler_tree = service_handler_tree(history)
 
     if job["canvas"] is not None:
         delivered = job["canvas"]
@@ -510,11 +489,6 @@ def estimate_core(body, commit, vram_table=None):
                 vram_stats=resolved["vram_stats"],
                 resolved_from=resolved["resolved_from"],
             ))
-        worker_commit = tier["worker_commit"]
-        # §5: matched on handler/'s tree. A commit the table does not hold is unknown, never a
-        # mismatch.
-        worker_tree = (None if worker_commit is None
-                       else history["commits"].get(worker_commit))
         entries.append({
             "tier": tier["tier"],
             "cards": answers,
@@ -525,18 +499,13 @@ def estimate_core(body, commit, vram_table=None):
             "planned_short_edge_px": job["target"],
             "registry_version": planner.REGISTRY_VERSION,
             "commit": commit,
-            "handler_tree": handler_tree,
-            "worker_handler_tree": worker_tree,
-            "handler_match": (None if worker_tree is None or handler_tree is None
-                              else worker_tree == handler_tree),
         })
     return entries
 
 
 #: §3b, and nothing else goes on the wire.
 TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
-                    "registry_version", "commit", "handler_tree", "worker_handler_tree",
-                    "handler_match")
+                    "registry_version", "commit")
 CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds",
                     "prediction_basis",
                     "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
@@ -552,11 +521,11 @@ def project(entry):
 
 def version(commit, vram_table=None):
     table = vram_table or load_vram_table()
-    history = load_handler_history()
+    # **The commit and nothing tree-shaped** (W6 item 3, ruled 2026-09-19): the handler/ tree's
+    # only source was the retired history table, and CF's comparison is its pinned image tag
+    # against this `commit` — both full shas.
     return {
         "commit": commit,
-        "handler_tree": service_handler_tree(history),
-        "handler_history_newest": history["newest"],
         "registry_version": planner.REGISTRY_VERSION,
         "calibration_rows": len(estimator.load_calibration()),
         "vram_table_corpus": table["corpus"],

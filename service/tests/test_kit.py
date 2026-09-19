@@ -32,10 +32,6 @@ import estimator  # noqa: E402  (on the path through service.worker_path)
 import planner  # noqa: E402
 
 SHA_A = "a" * 40
-SHA_B = "b" * 40
-#: 26294cc is e499dd5's parent, and e499dd5 changed handler/estimator.py — so its tree is not
-#: HEAD's on any later commit either.
-OTHER_TREE_COMMIT = "26294cc5cb1f90fdaabe84f59223c1215a6f3fc1"
 
 with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as _handle:
     TABLE = json.load(_handle)["cards"]
@@ -73,7 +69,7 @@ def card(gpu_name=A40, **fields):
 
 
 def tier(**overrides):
-    body = {"tier": "t1", "host_ram_gb": 46.57, "worker_commit": None, "cards": [card()]}
+    body = {"tier": "t1", "host_ram_gb": 46.57, "cards": [card()]}
     body.update(overrides)
     return body
 
@@ -101,30 +97,6 @@ def refused_field(test, body, field):
 def _git(*args):
     return subprocess.run(["git", "-C", REPO_ROOT] + list(args), capture_output=True,
                           text=True, check=True).stdout
-
-
-def _same_tree_commit():
-    """A commit on main, not HEAD, whose `handler/` tree is HEAD's — read from the table.
-
-    **Called per test, never at import** (review, W1): a stale table must fail the tests that
-    need it and leave `HistoryTable` to name the cause, not error the whole module before any
-    test runs.
-
-    **Derived, not pinned.** It was pinned to e499dd5 when P1 was written, and the first wave to
-    touch `handler/` after it (W1 J7) made that commit's tree someone else's. Every wave that
-    touches `handler/` regenerates the table, so the table always holds one: its `newest`, when
-    HEAD is the regeneration commit after it.
-    """
-    with open(os.path.join(SERVICE, "handler_history.json"), encoding="utf-8") as handle:
-        commits = json.load(handle)["commits"]
-    head = _git("rev-parse", "HEAD").strip()
-    tree = _git("rev-parse", "HEAD:handler").strip()
-    for sha, handler_tree in commits.items():
-        if sha != head and handler_tree == tree:
-            return sha
-    raise AssertionError(
-        "no commit in handler_history.json other than HEAD shares HEAD's handler/ tree — the "
-        "table is stale or uncommitted; regenerate it and commit it (HistoryTable names which)")
 
 
 class Parity(unittest.TestCase):
@@ -245,9 +217,8 @@ class PerCard(unittest.TestCase):
         self.assertIsNotNone(entry["cards"][0]["quality"]["ideal_window"])
 
     def test_tier_fields_named_once(self):
-        entry = one(request(tiers=[tier(worker_commit=_same_tree_commit())]), commit=SHA_A)
-        for field in ("output_width", "output_height", "registry_version", "commit",
-                      "handler_tree", "worker_handler_tree", "handler_match"):
+        entry = one(request(), commit=SHA_A)
+        for field in ("output_width", "output_height", "registry_version", "commit"):
             self.assertIn(field, entry)
             self.assertNotIn(field, entry["cards"][0])
 
@@ -840,10 +811,6 @@ class Refusals(unittest.TestCase):
         del body["job"]["target_short_edge_px"]
         refused_field(self, body, "job.target_short_edge_px")
 
-    def test_short_worker_commit(self):
-        refused_field(self, request(tiers=[tier(worker_commit=_same_tree_commit()[:7])]),
-                      "tiers[0].worker_commit")
-
     def test_empty_tiers(self):
         refused_field(self, {"job": job(), "tiers": []}, "tiers")
 
@@ -1043,130 +1010,85 @@ class Still(unittest.TestCase):
                          (round(width * height / 1e6 / rate["mpx_per_s"], 1), "measured"))
 
 
-class Match(unittest.TestCase):
-    """handler_match on handler/'s tree, not the commit (§5)."""
+class CommitNotVerified(unittest.TestCase):
+    """W6 item 3 (ruled by CF, 2026-09-19): the service does not compare commits.
 
-    def test_same_tree_other_commit_matches(self):
-        self.assertNotEqual(_same_tree_commit(), _git("rev-parse", "HEAD").strip())
-        entry = one(request(tiers=[tier(worker_commit=_same_tree_commit())]), commit=SHA_A)
-        self.assertEqual(entry["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
-        self.assertEqual(entry["worker_handler_tree"],
-                         _git("rev-parse", _same_tree_commit() + ":handler").strip())
-        self.assertIs(entry["handler_match"], True)
-        self.assertEqual(entry["commit"], SHA_A)
-        self.assertNotIn("commit_match", entry)
+    `worker_commit` is not read — a caller still sending it has it ignored, whatever it holds —
+    and no tier answer carries `worker_handler_tree` or `handler_match`.
+    """
 
-    def test_other_tree_mismatches(self):
-        entry = one(request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT)]))
-        self.assertEqual(entry["worker_handler_tree"],
-                         _git("rev-parse", OTHER_TREE_COMMIT + ":handler").strip())
-        self.assertNotEqual(entry["worker_handler_tree"], entry["handler_tree"])
-        self.assertIs(entry["handler_match"], False)
+    SENT = (None, "a" * 40, "abc1234", 7, "not a sha")
 
-    def test_commit_not_in_table_is_null(self):
-        entry = one(request(tiers=[tier(worker_commit=SHA_B)]))
-        self.assertIsNone(entry["worker_handler_tree"])
-        self.assertIsNone(entry["handler_match"])
-        self.assertIsNotNone(entry["handler_tree"])
+    def test_worker_commit_is_ignored(self):
+        bare = one(request())
+        for sent in self.SENT:
+            with self.subTest(sent=sent):
+                self.assertEqual(one(request(tiers=[tier(worker_commit=sent)])), bare)
 
-    def test_none_sent_is_null(self):
-        entry = one(request())
-        self.assertIsNone(entry["worker_handler_tree"])
-        self.assertIsNone(entry["handler_match"])
+    def test_absent_worker_commit_is_accepted(self):
+        t = tier()
+        t.pop("worker_commit", None)
+        self.assertEqual(one(request(tiers=[t])), one(request()))
+
+    def test_no_match_fields(self):
+        from service import app
+        body = request(tiers=[tier(worker_commit="a" * 40)])
+        status, payload = app.route("POST", "/estimate", json.dumps(body).encode("utf-8"),
+                                    commit=SHA_A)
+        self.assertEqual(status, 200, payload)
+        for entry in (one(body, commit=SHA_A), payload["tiers"][0]):
+            for field in ("worker_handler_tree", "handler_match", "handler_tree"):
+                self.assertNotIn(field, entry)
+            self.assertEqual(entry["commit"], SHA_A)
+
+    def test_version_carries_the_commit_and_no_tree(self):
+        # Option (a), ruled by the gate: the tree's only source was the deleted history table.
+        from service import app
+        status, payload = app.route("GET", "/version", b"", commit=SHA_A)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["commit"], SHA_A)
+        for field in ("handler_tree", "handler_history_newest"):
+            self.assertNotIn(field, payload)
+
+    def test_history_machinery_is_gone(self):
+        for name in ("handler_history.json", "generate_handler_history.py"):
+            self.assertFalse(os.path.exists(os.path.join(SERVICE, name)), name)
+        for attr in ("load_handler_history", "service_handler_tree", "HANDLER_HISTORY_PATH"):
+            self.assertFalse(hasattr(ps, attr), attr)
+
+
+class ServiceCommit(unittest.TestCase):
+    """The service's own commit is information, never a verdict (§5)."""
 
     def test_service_commit_is_information(self):
         with self.assertRaises(ValueError):
             ps.service_commit({"CF_PLANNER_COMMIT": "abc1234"})
         self.assertEqual(ps.service_commit({"CF_PLANNER_COMMIT": SHA_A}), SHA_A)
         self.assertIsNone(ps.service_commit({}))
-        entry = one(request(tiers=[tier(worker_commit=_same_tree_commit())]), commit=None)
-        self.assertIsNone(entry["commit"])
-        self.assertIs(entry["handler_match"], True)
+        self.assertIsNone(one(request(), commit=None)["commit"])
 
 
 class TablesAfterTheDoor(unittest.TestCase):
     """A malformed request is refused by name whatever state the committed tables are in."""
 
-    def test_refusal_named_with_unreadable_history(self):
-        real = ps.load_handler_history
+    def test_refusal_named_with_unreadable_table(self):
+        real = ps.load_vram_table
 
         def broken(*_args, **_kwargs):
             raise OSError("no table")
 
-        ps.load_handler_history = broken
+        ps.load_vram_table = broken
         try:
             refused_field(self, request(tiers=[tier(cards=[])]), "tiers[0].cards")
         finally:
-            ps.load_handler_history = real
-
-
-class HistoryTable(unittest.TestCase):
-    """Generated from git, current at HEAD; a hand edit or a missed handler change fails (§5)."""
-
-    def test_table_is_generated(self):
-        out = subprocess.run([sys.executable, os.path.join(SERVICE, "generate_handler_history.py"),
-                              "--check"], capture_output=True, text=True, cwd=REPO_ROOT)
-        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-
-    def _check(self, path, cwd=None):
-        script = os.path.join(cwd or REPO_ROOT, "service", "generate_handler_history.py")
-        return subprocess.run([sys.executable, script, "--check", path], capture_output=True,
-                              text=True)
-
-    def test_check_fails_on_a_hand_edit(self):
-        table = ps.load_handler_history()
-        edits = {
-            "tree changed": lambda t: t["commits"].__setitem__(list(t["commits"])[3], "0" * 40),
-            "commit removed": lambda t: t["commits"].pop(list(t["commits"])[3]),
-            "ref changed": lambda t: t.__setitem__("ref", "other"),
-            "newest off main": lambda t: t.__setitem__("newest", SHA_B),
-        }
-        for label, edit in edits.items():
-            edited = json.loads(json.dumps(table))
-            edit(edited)
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-                handle.write(json.dumps(edited, indent=2) + "\n")
-            try:
-                self.assertEqual(self._check(handle.name).returncode, 1, label)
-            finally:
-                os.remove(handle.name)
-
-    def test_shallow_clone_stops(self):
-        clone = tempfile.mkdtemp(prefix="shallow_")
-        try:
-            subprocess.run(["git", "clone", "-q", "--depth", "3", "file://" + REPO_ROOT, clone],
-                           check=True, capture_output=True)
-            # The generator under test is THIS tree's, run against the shallow clone's history.
-            os.makedirs(os.path.join(clone, "service"), exist_ok=True)
-            script = os.path.join(clone, "service", "generate_handler_history.py")
-            shutil.copy(os.path.join(SERVICE, "generate_handler_history.py"), script)
-            for args in ([], ["--check"]):
-                out = subprocess.run([sys.executable, script] + args, capture_output=True,
-                                     text=True)
-                self.assertEqual(out.returncode, 2, (args, out.stdout, out.stderr))
-                self.assertIn("shallow", out.stderr)
-        finally:
-            shutil.rmtree(clone)
-
-    def test_newest_is_current_at_head(self):
-        table = ps.load_handler_history()
-        newest = table["newest"]
-        self.assertEqual(subprocess.run(["git", "-C", REPO_ROOT, "merge-base", "--is-ancestor",
-                                         newest, "HEAD"]).returncode, 0)
-        # EVERY commit after newest, not the net diff: a change and its revert net to nothing and
-        # still ran on some tier (review F1 on P1d).
-        self.assertEqual(_git("log", "--format=%H", "{}..HEAD".format(newest), "--", "handler/"),
-                         "")
-        self.assertEqual(table["commits"][newest], _git("rev-parse", "HEAD:handler").strip())
-        self.assertEqual(ps.service_handler_tree(table), table["commits"][newest])
+            ps.load_vram_table = real
 
 
 class Projection(unittest.TestCase):
     """For the same inputs, every §3b field on the wire equals the core output."""
 
     TIER_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_height",
-                   "registry_version", "commit", "handler_tree", "worker_handler_tree",
-                   "handler_match")
+                   "registry_version", "commit")
     CARD_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds", "prediction_basis",
                    "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
                    "hardware_used", "vram_source", "vram_stats", "resolved_from")
@@ -1182,15 +1104,13 @@ class Projection(unittest.TestCase):
         cases = [
             request(),
             request(job(target_short_edge_px=4320), [tier(host_ram_gb=16.0)]),
-            request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5), card(A40, label="idle")],
-                                worker_commit=_same_tree_commit())]),
-            request(tiers=[tier(worker_commit=OTHER_TREE_COMMIT),
-                           tier(tier="t2", cards=[card(B200)], host_ram_gb=377.0)]),
+            request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5), card(A40, label="idle")])]),
+            request(tiers=[tier(), tier(tier="t2", cards=[card(B200)], host_ram_gb=377.0)]),
             request(job(target_short_edge_px=4320), [tier(cards=[card(A40)])]),
             request(tiers=[tier(cards=[card(MIG), card(A40, vram_total_gb=44.7),
                                        card(A40, vram_total_gb=44.43, vram_free_gb=44.08)])]),
         ]
-        matches, sources = set(), set()
+        sources = set()
         for body in cases:
             # HTTP first, on the pristine body: a core that mutated the caller's request would
             # otherwise be invisible to the one case positioned to see it (review F9).
@@ -1199,7 +1119,6 @@ class Projection(unittest.TestCase):
             self.assertEqual(len(wire), len(cores))
             for core, entry in zip(cores, wire):
                 self.assertEqual(sorted(entry), sorted(self.TIER_FIELDS + ("cards",)))
-                matches.add(entry["handler_match"])
                 for field in self.TIER_FIELDS:
                     self.assertIs(type(entry[field]), type(core[field]), field)
                     self.assertEqual(entry[field], core[field], field)
@@ -1212,7 +1131,6 @@ class Projection(unittest.TestCase):
                     for field in self.CARD_FIELDS:
                         self.assertIs(type(got[field]), type(answered[field]), field)
                         self.assertEqual(got[field], answered[field], field)
-        self.assertEqual(matches, {None, True, False})
         self.assertEqual(sources, {"given", "table", "nearest_memory", "pool_floor"})
 
     def test_refusal_on_the_wire_names_the_field(self):
@@ -1232,10 +1150,6 @@ class Projection(unittest.TestCase):
         self.assertEqual(payload["calibration_rows"], len(estimator.load_calibration()))
         with open(os.path.join(SERVICE, "vram_table.json"), encoding="utf-8") as handle:
             self.assertEqual(payload["vram_table_corpus"], json.load(handle)["corpus"])
-        table = ps.load_handler_history()
-        self.assertEqual(payload["handler_tree"], table["commits"][table["newest"]])
-        self.assertEqual(payload["handler_tree"], _git("rev-parse", "HEAD:handler").strip())
-        self.assertEqual(payload["handler_history_newest"], table["newest"])
 
 
 class Isolation(unittest.TestCase):
