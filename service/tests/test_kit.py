@@ -847,6 +847,33 @@ class Refusals(unittest.TestCase):
             self.assertNotIn("refused", payload)
 
 
+class StartupRefusesABrokenTable(unittest.TestCase):
+    """**A broken in-image card table stops the service before the port opens** (review of W6):
+    `load_card_table` returns None rather than raising, so the old startup call — `version()` —
+    passed on a missing or malformed table and every /estimate then answered 503."""
+
+    def test_a_broken_table_fails_startup(self):
+        for broken in (None, {"cards": {}}, {"cards": {A40: {"mpx_per_s": {"batched": 0.6}}}}):
+            with self.assertRaises(ps.TableUnusable, msg=repr(broken)):
+                with_card_table(broken, ps.startup_check)
+
+    def test_the_shipped_table_starts(self):
+        ps.startup_check()
+
+    def test_main_runs_the_check_before_serving(self):
+        from service import app
+        served = []
+        real = app.ThreadingHTTPServer
+        app.ThreadingHTTPServer = lambda *a, **k: served.append(a) or (_ for _ in ()).throw(
+            SystemExit("would serve"))
+        try:
+            with self.assertRaises(ps.TableUnusable):
+                with_card_table(None, app.main)
+        finally:
+            app.ThreadingHTTPServer = real
+        self.assertEqual(served, [], "the port opened on a broken table")
+
+
 class Residency(unittest.TestCase):
     """On a refusal, planner.plan refuses too, and the labels follow planner.fits (§3b)."""
 

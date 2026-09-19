@@ -51,6 +51,18 @@ class Refusal(Exception):
         self.message = message
 
 
+def startup_check():
+    """Raise `TableUnusable` unless the in-image card table loads and gives some card's memory.
+
+    **Before the port opens** (app.main). `estimator.load_card_table` returns None on a missing
+    or malformed file rather than raising — right for the worker, which must keep running — so
+    without this a broken table would deploy, start, and answer 503 to every request.
+    """
+    if not memory_cards(estimator.load_card_table()):
+        raise TableUnusable("the in-image card table is absent, malformed, or gives no card's "
+                            "memory")
+
+
 def memory_cards(card_table):
     """`{gpu_name: {vram_total_gb, vram_free_gb}}` — the cards the card table gives BOTH memory
     figures, a copy (W6: the memory half of the one curated table). **A card with a rate and no
