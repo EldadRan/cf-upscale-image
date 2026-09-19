@@ -224,13 +224,20 @@ def card_table_problem(document):
     from a wrong one; that is the curation step's job, done before the table is committed or sent.
 
     `null` is allowed where a number is — a card with no unbatched rate carries `null` there —
-    and a key the reader does not use is not a structural fault.
+    and a key the reader does not use is not a structural fault, **except inside `mpx_per_s`**.
+
+    **And a table whose rates cannot be READ is shape, not value** (F1, ruled 2026-09-19): at
+    least one card must carry a rate, and a key under `mpx_per_s` must be `batched` or
+    `unbatched`. Without both, a case typo (`"Batched"`) withheld every card's time — blaming the
+    card — and switched off the frames refusal, with no warning. An unknown regime key is refused
+    for the reason `params` refuses an unknown name: CF sent it believing it would be used.
     """
     if not isinstance(document, dict):
         return "the card table is not a JSON object"
     cards = document.get("cards")
     if not isinstance(cards, dict) or not cards:
         return "the card table has no 'cards' object with at least one card"
+    readable = False
     for name, entry in cards.items():
         if not isinstance(name, str) or not name.strip():
             return "a card name is empty"
@@ -241,11 +248,18 @@ def card_table_problem(document):
         if rates is not None:
             if not isinstance(rates, dict):
                 return "card {!r}: 'mpx_per_s' is not an object".format(name)
+            unknown = sorted(str(key) for key in rates if key not in REGIMES)
+            if unknown:
+                return "card {!r}: 'mpx_per_s' has unknown regime key(s) {} — only {}".format(
+                    name, unknown, " and ".join(REGIMES))
             numbers += [("mpx_per_s." + str(key), value) for key, value in rates.items()]
+            readable = readable or any(value is not None for value in rates.values())
         for key, value in numbers:
             if value is not None and not _finite_positive(value):
                 return "card {!r}: {} is {!r}, not a positive finite number".format(
                     name, key, value)
+    if not readable:
+        return "no card in the card table carries a rate under 'mpx_per_s'"
     return None
 
 
@@ -349,7 +363,7 @@ def fastest_seconds_per_frame(card_table, output_pixels):
     return (output_pixels / 1e6) / max(rate["mpx_per_s"] for rate in rates.values())
 
 
-def refuse_frames_no_deadline_admits(job, card_table, output_pixels):
+def refuse_frames_no_deadline_admits(job, card_table, output_pixels, from_request=False):
     """Refuse a frame count that no deadline could accommodate — **arithmetic, not a constant.**
 
     **The bound is the platform's ceiling, not the caller's deadline** (F-2026-08-18-15). The
@@ -370,6 +384,11 @@ def refuse_frames_no_deadline_admits(job, card_table, output_pixels):
     describing a job anyone can run.
 
     Silent where it cannot know: no rate measured, no frame count, no refusal.
+
+    **`from_request`: the table was the one the REQUEST sent** (W6 5b, ruled 2026-09-19). This is
+    the only path where a sent table can refuse a job, so when it does the message says so and
+    points at that table's rates — "check the source's duration" would send the reader to the one
+    place the fault is not. The in-image text is unchanged.
     """
     frames = job.get("estimated_frames")
     if not frames or frames < 1:
@@ -381,18 +400,25 @@ def refuse_frames_no_deadline_admits(job, card_table, output_pixels):
     fastest_s = frames * per_frame
     if fastest_s <= budget_s:
         return
+    if from_request:
+        advice = ("The rate is the card_table this request sent: check that table's rates "
+                  "before the source — a sent rate far too slow produces exactly this.")
+        rate_from = "the fastest rate in the card_table this request sent"
+    else:
+        advice = ("Check the source's duration and frame rate: container metadata claiming a "
+                  "duration the file does not have produces exactly this.")
+        rate_from = "the fastest rate the card table holds"
     raise WorkerError(
         INVALID_FIELD_VALUE,
-        "the source reports {:,} frames, which at the fastest rate the card table holds "
-        "({:.3f} s/frame at this size) is {:,.0f} s of work against a {:,.0f} s {} — it cannot "
-        "finish, so there is no configuration to plan. Check the source's duration and frame "
-        "rate: container metadata claiming a duration the file does not have produces exactly "
-        "this.".format(frames, per_frame, fastest_s, budget_s,
-                       "platform execution ceiling"),
+        "the source reports {:,} frames, which at {} ({:.3f} s/frame at this size) is {:,.0f} s "
+        "of work against a {:,.0f} s {} — it cannot finish, so there is no configuration to "
+        "plan. {}".format(frames, rate_from, per_frame, fastest_s, budget_s,
+                          "platform execution ceiling", advice),
         shortfall={"estimated_frames": frames,
                    "fastest_seconds_per_frame": round(per_frame, 4),
                    "seconds_at_that_rate": round(fastest_s, 1),
                    "budget_seconds": round(budget_s, 1),
+                   "card_table": "sent" if from_request else "in-image",
                    "budget_source": "runpod execution ceiling"},
     )
 

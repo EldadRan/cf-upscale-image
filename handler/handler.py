@@ -516,7 +516,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     if card_table_warning:
         warnings.append(card_table_warning)
     estimator.refuse_frames_no_deadline_admits(
-        job_shape, card_table, _planned_w * _planned_h)
+        job_shape, card_table, _planned_w * _planned_h,
+        from_request=bool(request.get("card_table_sent")) and not card_table_warning)
 
     plan, rationale = estimator.plan(job_shape, machine, card_table=card_table)
 
