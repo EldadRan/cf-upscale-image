@@ -265,6 +265,26 @@ def load_card_table(path=None):
     return None if card_table_problem(document) else document
 
 
+def resolve_card_table(card_table, sent):
+    """`(table, warning)` — the ONE table every rate reader in a job reads (W6 item 2).
+
+        sent and structurally valid       the sent table, silently — it is the source of truth
+        not sent                          the in-image table, silently
+        sent and failing the check        the in-image table, and a warning that says so
+
+    **Never a refusal, and never a silent fallback that looks like success.** The check is
+    `card_table_problem`'s — structural only, so a sent table with a wrong number is used as sent.
+    """
+    if not sent:
+        return load_card_table(), None
+    problem = card_table_problem(card_table)
+    if problem is None:
+        return card_table, None
+    return load_card_table(), (
+        "the request's card_table was refused ({}), so this job was priced from the in-image "
+        "card table instead".format(problem))
+
+
 def table_rates(card_table):
     """`{(gpu_name, regime): {"gpu_name", "mpx_per_s"}}` — one entry per rate the table holds.
 

@@ -161,6 +161,12 @@ TOP_LEVEL_FIELDS = {
     # acceptance stops needing paid runs to check the decision logic — and it goes through the
     # *production* code path, so what it reports is what a real run would have done.
     "plan_only",
+    # **An updated card table, riding the request** (W6 item 2, ruled by CF 2026-09-19). Top level
+    # and not `params`: a rate changes the ETA, never how the master looks. **Not judged here, at
+    # all**: any JSON value is accepted and handed on verbatim, and `estimator.resolve_card_table`
+    # alone decides whether it is used — a malformed table is a legal request that falls back to
+    # the in-image copy with a warning, never a refusal. Not a lever, so not behind `debug`.
+    "card_table",
 }
 
 REQUIRED_TOP_LEVEL = ("request_id", "request_date", "source_url", "output", "params")
@@ -873,6 +879,10 @@ def validate(job_input):
         "diagnostics_reserve": reserve,
         "run_record": run_record,
         "debug": bool(job_input.get("debug")),
+        # **Presence, not truthiness**, and verbatim: `null` sent is a table sent, and a malformed
+        # one — it warns. Only an absent field is the silent in-image case.
+        "card_table_sent": "card_table" in job_input,
+        "card_table": job_input.get("card_table"),
         "force_rung": _rung_name(job_input.get("force_rung")),
         # RunPod's own ceiling is 7 days. No lower bound beyond positive: a caller who sends a
         # deadline this worker cannot meet gets a refusal with the arithmetic, which is more

@@ -508,8 +508,13 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         source["width"], source["height"], model_short_edge or 1)
     # **ONE TABLE PER JOB, AND EVERY RATE READER READS IT** (W6, ruled by CF 2026-09-19): the
     # frames refusal, the plan's ETA and a forced re-plan price from the same object, so no two
-    # of them can quote from different tables.
-    card_table = estimator.load_card_table()
+    # of them can quote from different tables. **The request's `card_table` is that table when it
+    # is sent and passes the structural check** (item 2); a refused one warns and the in-image
+    # copy prices the job.
+    card_table, card_table_warning = estimator.resolve_card_table(
+        request.get("card_table"), request.get("card_table_sent"))
+    if card_table_warning:
+        warnings.append(card_table_warning)
     estimator.refuse_frames_no_deadline_admits(
         job_shape, card_table, _planned_w * _planned_h)
 
