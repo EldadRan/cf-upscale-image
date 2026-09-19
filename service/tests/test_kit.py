@@ -35,6 +35,11 @@ SHA_A = "a" * 40
 
 #: The memory half of the in-image card table (W6), as the service resolves it.
 TABLE = ps.memory_cards(estimator.load_card_table())
+#: **Where a 44.5 GB nominal resolves, READ from the table rather than pinned** (W6): the curated
+#: table's 44-48 GB class grew from the A40 alone to six cards, and the nearest moved to the RTX
+#: A6000 (44.42) the day CF's rates landed. The property is "the nearest measured card", not a
+#: name.
+NEAR_44_5 = ps.nearest_measured(44.5, TABLE)
 
 A40 = "NVIDIA A40"
 H200 = "NVIDIA H200"
@@ -195,13 +200,13 @@ class PerCard(unittest.TestCase):
         # **Each answer is planned against ITS OWN card** — the echoed name alone is built in the
         # same loop as the answer, so it cannot show a misalignment (review F5).
         self.assertEqual([c["hardware_used"]["gpu_name"] for c in entry["cards"]],
-                         [H200, A40, B200, A40])
+                         [H200, A40, B200, NEAR_44_5])
         self.assertEqual([c["vram_source"] for c in entry["cards"]],
                          ["table", "table", "table", "nearest_memory"])
         self.assertEqual([c["hardware_used"]["vram_total_gb"] for c in entry["cards"]],
                          [TABLE[H200]["vram_total_gb"], TABLE[A40]["vram_total_gb"],
-                          TABLE[B200]["vram_total_gb"], TABLE[A40]["vram_total_gb"]])
-        self.assertEqual(entry["cards"][3]["resolved_from"], {"card": MIG, "measured": A40})
+                          TABLE[B200]["vram_total_gb"], TABLE[NEAR_44_5]["vram_total_gb"]])
+        self.assertEqual(entry["cards"][3]["resolved_from"], {"card": MIG, "measured": NEAR_44_5})
 
     def test_labels_echoed(self):
         cards = [card(A40, label="idle"), card(H200, label="catalog"), card(B200)]
@@ -310,13 +315,13 @@ class AbsenceNamesTheSentCard(unittest.TestCase):
     and regime. **Since W6 the worker times the card under that name itself** (§4a-ii), so there
     is nothing left to re-point.
 
-    Reached with a patched card table: the L40S is PRICED (batched only) and carries no memory,
+    Reached with a patched card table: a fixture card is PRICED (batched only) and carries no memory,
     so a nominal resolves its memory to the A40; and no card holds a window-1 rate, so a
     still reaches the no-rate-in-regime absence.
     """
 
-    L40S = "NVIDIA L40S"
-    # The L40S is priced and carries no memory, so its memory resolves elsewhere (W6).
+    L40S = "NVIDIA FIXTURE 48GB"  # a name the curated table does not hold
+    # The fixture card is priced and carries no memory, so its memory resolves elsewhere (W6).
     CARDS = {"generated_utc": "test", "cards": {
         A40: {"vram_total_gb": 44.34, "vram_free_gb": 43.72,
               "mpx_per_s": {"batched": 0.6, "unbatched": None}},
@@ -329,11 +334,12 @@ class AbsenceNamesTheSentCard(unittest.TestCase):
             job(frames=1, is_still=True, source_width=749, source_height=500,
                 target_short_edge_px=1920),
             [tier(cards=[card(self.L40S, vram_total_gb=44.5)])])))
+        # Its own two-card table: the A40 is the only card with memory.
         self.assertEqual(got["resolved_from"], {"card": self.L40S, "measured": A40})
         self.assertIsNone(got["predicted_seconds"])
         absent = got["timing_unavailable"] or {}
         self.assertEqual(absent.get("running_on"), self.L40S,
-                         "CF asked about the L40S and was told about the A40")
+                         "CF asked about its card and was told about the A40")
         # The worker's reason stands: this is F4's absence, not J5's.
         self.assertEqual(absent.get("regime"), estimator.UNBATCHED)
         self.assertIn("regime", absent.get("why", ""))
@@ -350,7 +356,7 @@ class OwnTimeSubstitutedMemory(unittest.TestCase):
     `resolved_from` says the memory was not. Do not "fix" it.
     """
 
-    L40S = "NVIDIA L40S"
+    L40S = "NVIDIA FIXTURE 48GB"  # a name the curated table does not hold
     L40S_RATE = 0.9
 
     def _cards(self):
@@ -365,8 +371,8 @@ class OwnTimeSubstitutedMemory(unittest.TestCase):
         self.assertNotIn(self.L40S, TABLE)
         got = with_card_table(self._cards(), lambda: answer(request(
             tiers=[tier(cards=[card(self.L40S, vram_total_gb=44.5)])])))
-        self.assertEqual(got["resolved_from"], {"card": self.L40S, "measured": A40})
-        self.assertEqual(got["hardware_used"]["gpu_name"], A40)
+        self.assertEqual(got["resolved_from"], {"card": self.L40S, "measured": NEAR_44_5})
+        self.assertEqual(got["hardware_used"]["gpu_name"], NEAR_44_5)
         width, height = estimator.output_dimensions(1920, 1080, 1480)
         self.assertEqual(got["predicted_seconds"],
                          round(width * height / 1e6 / self.L40S_RATE * 90, 1),
@@ -643,7 +649,7 @@ class VramOrder(unittest.TestCase):
         got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
         self.assertEqual(got["vram_source"], "nearest_memory")
         self.assertNotEqual(got["hardware_used"]["vram_total_gb"], 44.5)
-        self.assertEqual(got["hardware_used"]["vram_total_gb"], TABLE[A40]["vram_total_gb"])
+        self.assertEqual(got["hardware_used"]["vram_total_gb"], TABLE[NEAR_44_5]["vram_total_gb"])
 
     def test_unmeasured_without_nominal_is_pool_floor(self):
         got = answer(request(tiers=[tier(cards=[card(MIG)])]))
@@ -719,8 +725,8 @@ class Nearest(unittest.TestCase):
         self.assertNotIn(MIG, TABLE)
         got = answer(request(tiers=[tier(cards=[card(MIG, vram_total_gb=44.5)])]))
         self.assertEqual(got["vram_source"], "nearest_memory")
-        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": A40})
-        self.assertEqual(got["hardware_used"]["gpu_name"], A40)
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": NEAR_44_5})
+        self.assertEqual(got["hardware_used"]["gpu_name"], NEAR_44_5)
         # **Since J5's service ruling (f05b28d) the MIG's TIME is withheld**, judged on the name
         # CF sent — by the worker itself since W6; the memory resolution above is unchanged.
         self.assertIsNone(got["prediction_basis"])
@@ -729,7 +735,9 @@ class Nearest(unittest.TestCase):
     def test_nominal_near_a_bigger_card(self):
         got = answer(request(tiers=[tier(host_ram_gb=377.0,
                                          cards=[card(MIG, vram_total_gb=96.0)])]))
-        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": BLACKWELL})
+        bigger = ps.nearest_measured(96.0, TABLE)
+        self.assertGreater(TABLE[bigger]["vram_total_gb"], 90.0, "the premise: a 96 GB class")
+        self.assertEqual(got["resolved_from"], {"card": MIG, "measured": bigger})
 
     def test_tie_takes_lower_memory(self):
         low, high = TABLE[A40]["vram_total_gb"], TABLE[BLACKWELL]["vram_total_gb"]
