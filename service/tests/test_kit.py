@@ -910,11 +910,15 @@ class CardTableRidesTheEstimate(unittest.TestCase):
             self.assertEqual(got["hardware_used"], bare["hardware_used"], repr(bad))
 
     def test_a_refused_table_warns_on_the_wire(self):
-        # Q5b: the worker's own sentence, on the service's answer.
+        # Q5b: the worker's own sentence, ONCE, on the service's answer. **Two tiers and three
+        # cards**, so a per-tier or per-card append reads 5 here rather than 1 (review).
         from service import app
+        body = request(tiers=[tier(cards=[card(A40), card(B200, vram_total_gb=179.0)],
+                                   host_ram_gb=377.0),
+                              tier(tier="t2", cards=[card(A40)])])
         for bad in (None, "not a table", {"cards": {A40: {"mpx_per_s": {"Batched": 0.6}}}}):
             status, payload = app.route(
-                "POST", "/estimate", json.dumps(self._body(card_table=bad)).encode("utf-8"),
+                "POST", "/estimate", json.dumps(dict(body, card_table=bad)).encode("utf-8"),
                 commit=None)
             self.assertEqual(status, 200, payload)
             warnings = payload.get("warnings") or []
@@ -926,12 +930,14 @@ class CardTableRidesTheEstimate(unittest.TestCase):
                              "the service reworded the worker's own sentence")
 
     def test_nothing_to_say_carries_no_warnings(self):
+        # **ABSENT, not an empty list** (review): `assertFalse` cannot tell the two apart, and a
+        # key that appears on every 200 is the one thing a downstream consumer could break on.
         from service import app
         for body in (self._body(), self._body(card_table=self.SENT)):
             status, payload = app.route("POST", "/estimate", json.dumps(body).encode("utf-8"),
                                         commit=None)
             self.assertEqual(status, 200, payload)
-            self.assertFalse(payload.get("warnings"), payload.get("warnings"))
+            self.assertNotIn("warnings", payload)
 
 
 class StartupRefusesABrokenTable(unittest.TestCase):
