@@ -66,7 +66,7 @@
     },
     "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
       "mpx_per_s": {
-        "batched": 1.05,
+        "batched": 1.25,
         "unbatched": null
       },
       "vram_free_gb": 93.74,
@@ -89,5 +89,5 @@
       "vram_total_gb": 95.01
     }
   },
-  "generated_utc": "2026-09-19T21:33:42Z"
+  "generated_utc": "2026-09-20T09:51:23Z"
 }
