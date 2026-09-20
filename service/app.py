@@ -43,7 +43,16 @@ def route(method, path, body, commit):
             return 400, {"refused": {"field": refusal.field, "message": refusal.message}}
         except ps.TableUnusable as broken:
             # The service's own committed table, not the caller's request: 503, never a 400.
-            return 503, {"error": "service tables unusable", "detail": str(broken)}
+            #
+            # **The 503 carries `warnings` too** (ruled 2026-09-20): a caller can hit this with a
+            # malformed `card_table` of its own, and a 503 alone would tell it OUR service is
+            # broken — a diagnostic naming the wrong owner sends the work to the party that
+            # cannot do it. The error stays ours; `warnings` stays CF's, in the same words the
+            # 200 uses.
+            unusable = {"error": "service tables unusable", "detail": str(broken)}
+            if warnings:
+                unusable["warnings"] = warnings
+            return 503, unusable
         answer = {"tiers": [ps.project(e) for e in entries]}
         if warnings:
             answer["warnings"] = warnings

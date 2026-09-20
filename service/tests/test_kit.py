@@ -902,6 +902,29 @@ class CardTableRidesTheEstimate(unittest.TestCase):
         self.assertEqual(status, 503, payload)
         self.assertNotIn("refused", payload)
 
+    def test_a_503_still_says_the_sent_table_was_refused(self):
+        """**Two facts, two owners, two fields** (ruled 2026-09-20): the error says OUR tables
+        are unusable, `warnings` says CF's table was refused. Dropping the second tells a caller
+        whose own table is malformed that our service is broken — a diagnostic naming the wrong
+        owner sends the work to the party who cannot do it."""
+        from service import app
+        body = json.dumps(self._body(card_table="not a table")).encode("utf-8")
+        status, payload = with_card_table(None, lambda: app.route("POST", "/estimate", body,
+                                                                  commit=None))
+        self.assertEqual(status, 503, payload)
+        self.assertNotIn("refused", payload)
+        self.assertIn("unusable", payload["error"])
+        self.assertEqual(payload.get("warnings"),
+                         [estimator.resolve_card_table("not a table", True)[1]])
+
+    def test_a_503_with_nothing_sent_carries_no_warnings(self):
+        from service import app
+        body = json.dumps(self._body()).encode("utf-8")
+        status, payload = with_card_table(None, lambda: app.route("POST", "/estimate", body,
+                                                                  commit=None))
+        self.assertEqual(status, 503, payload)
+        self.assertNotIn("warnings", payload)
+
     def test_a_refused_table_falls_back_to_the_in_image_one(self):
         bare = answer(self._body())
         for bad in (None, "not a table", {"cards": {A40: {"mpx_per_s": {"Batched": 0.6}}}}):
