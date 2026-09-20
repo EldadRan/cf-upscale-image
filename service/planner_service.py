@@ -420,7 +420,7 @@ def _rate_from(rationale):
     return rate_from
 
 
-def estimate_core(body, commit, card_table=None):
+def estimate_core(body, commit, card_table=None, warnings=None):
     """Every tier's answer, in the order sent, each with one answer per card.
 
     The whole request is read before anything is planned, so a refusal on the last tier costs no
@@ -428,6 +428,8 @@ def estimate_core(body, commit, card_table=None):
 
     `card_table`, when a caller of this function passes one, is THE table and the body's
     `card_table` is not read — a seam for tests; `app.route` never passes one.
+
+    `warnings`, when given, is the list this appends to — the door puts it on the wire (Q5b).
     """
     if not isinstance(body, dict):
         raise Refusal("request", "must be a JSON object")
@@ -443,14 +445,17 @@ def estimate_core(body, commit, card_table=None):
     # `card_table` is that table when sent and valid** (item 2) — the worker's own resolution,
     # so a table CF sends to both surfaces makes them agree by construction.
     #
-    # **KNOWN, TEMPORARY SILENCE:** a refused override falls back to the in-image table and the
-    # warning is DROPPED here, until CF rules the /estimate `warnings` field (Q5b, 2026-09-19).
-    # The worker says it; the service cannot yet.
+    # **A refused override SAYS SO** (Q5b, ruled by CF 2026-09-20): the worker's own sentence,
+    # unreworded, onto the answer's `warnings`. Before it, the planner answered from the in-image
+    # table with no word on the wire while the worker said it plainly — the two halves telling a
+    # caller different things about the same table.
     sent = card_table is None and "card_table" in body
     if card_table is None:
-        card_table, _unsaid = estimator.resolve_card_table(body.get("card_table"),
+        card_table, refused = estimator.resolve_card_table(body.get("card_table"),
                                                            "card_table" in body)
-        sent = sent and _unsaid is None
+        sent = sent and refused is None
+        if refused and warnings is not None:
+            warnings.append(refused)
     table_cards = memory_cards(card_table)
     if not table_cards and sent:
         # The caller's valid table carries no memory at all: the caller's input, named.

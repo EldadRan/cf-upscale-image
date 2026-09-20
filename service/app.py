@@ -33,14 +33,21 @@ def route(method, path, body, commit):
             request = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             return 400, {"refused": {"field": "request", "message": "body is not JSON"}}
+        # **Q5b: what the answer could not do quietly.** Today that is one sentence — a sent
+        # `card_table` the worker's own check refused — carried in the worker's words. Absent
+        # where there is nothing to say, so no caller reading `tiers` is affected.
+        warnings = []
         try:
-            entries = ps.estimate_core(request, commit=commit)
+            entries = ps.estimate_core(request, commit=commit, warnings=warnings)
         except ps.Refusal as refusal:
             return 400, {"refused": {"field": refusal.field, "message": refusal.message}}
         except ps.TableUnusable as broken:
             # The service's own committed table, not the caller's request: 503, never a 400.
             return 503, {"error": "service tables unusable", "detail": str(broken)}
-        return 200, {"tiers": [ps.project(e) for e in entries]}
+        answer = {"tiers": [ps.project(e) for e in entries]}
+        if warnings:
+            answer["warnings"] = warnings
+        return 200, answer
     return 404, {"error": "not found"}
 
 

@@ -860,9 +860,9 @@ class CardTableRidesTheEstimate(unittest.TestCase):
     same resolution the worker runs (`estimator.resolve_card_table`) — so a table CF sends to
     both surfaces makes them agree by construction.
 
-    **KNOWN, TEMPORARY SILENCE:** a refused override falls back to the in-image table with no
-    word on the wire until CF rules the /estimate `warnings` field (Q5b). Asserted as it is, so
-    the day the field lands this case is where it changes.
+    **A refused override SAYS SO** (Q5b, ruled by CF 2026-09-20): a top-level `warnings` list
+    carries the worker's own sentence, so the planner never answers from the in-image table
+    without a word. Absent where there is nothing to say.
     """
 
     SENT = {"generated_utc": "sent", "cards": {
@@ -908,6 +908,30 @@ class CardTableRidesTheEstimate(unittest.TestCase):
             got = answer(self._body(card_table=bad))
             self.assertEqual(got["predicted_seconds"], bare["predicted_seconds"], repr(bad))
             self.assertEqual(got["hardware_used"], bare["hardware_used"], repr(bad))
+
+    def test_a_refused_table_warns_on_the_wire(self):
+        # Q5b: the worker's own sentence, on the service's answer.
+        from service import app
+        for bad in (None, "not a table", {"cards": {A40: {"mpx_per_s": {"Batched": 0.6}}}}):
+            status, payload = app.route(
+                "POST", "/estimate", json.dumps(self._body(card_table=bad)).encode("utf-8"),
+                commit=None)
+            self.assertEqual(status, 200, payload)
+            warnings = payload.get("warnings") or []
+            self.assertEqual(len(warnings), 1, repr(bad))
+            self.assertIn("card_table", warnings[0])
+            self.assertIn("in-image", warnings[0])
+            self.assertEqual(warnings[0],
+                             estimator.resolve_card_table(bad, True)[1],
+                             "the service reworded the worker's own sentence")
+
+    def test_nothing_to_say_carries_no_warnings(self):
+        from service import app
+        for body in (self._body(), self._body(card_table=self.SENT)):
+            status, payload = app.route("POST", "/estimate", json.dumps(body).encode("utf-8"),
+                                        commit=None)
+            self.assertEqual(status, 200, payload)
+            self.assertFalse(payload.get("warnings"), payload.get("warnings"))
 
 
 class StartupRefusesABrokenTable(unittest.TestCase):
