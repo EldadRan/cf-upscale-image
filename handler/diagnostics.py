@@ -50,10 +50,22 @@ BUNDLE_HEAD_LINES = 400
 
 # Anything that looks like a signed URL or a credential. Presigned URLs are the realistic case:
 # they arrive in the request, and a traceback that includes the request would carry one.
+#
+# **A signed query WITHOUT a scheme is the same credential** (T1a, 2026-09-28). urllib3 writes a
+# failed request as `Max retries exceeded with url: /bkt/key?X-Amz-...` — path and query, no
+# host — and every pattern here required `https?://`, so a failed fetch carried the caller's
+# signature into the response, the record and the bundle intact. The last two patterns take the
+# query whatever precedes it; the first two still name a whole URL where there is one.
+#
+# **No backslash inside a match**: the record and the bundle are swept AFTER serialising, and a
+# match that ate the `\` of an escaped quote would leave the JSON unparseable.
 _REDACTIONS = (
-    (re.compile(r"https?://[^\s\"']*[?&]X-Amz-[^\s\"']*", re.I), "<presigned-url-redacted>"),
-    (re.compile(r"https?://[^\s\"']*[?&](?:Signature|token|sig)=[^\s\"']*", re.I),
+    (re.compile(r"https?://[^\s\"'\\]*[?&]X-Amz-[^\s\"'\\]*", re.I), "<presigned-url-redacted>"),
+    (re.compile(r"https?://[^\s\"'\\]*[?&](?:Signature|token|sig)=[^\s\"'\\]*", re.I),
      "<signed-url-redacted>"),
+    (re.compile(r"[^\s\"'\\]*[?&]X-Amz-[^\s\"'\\]*", re.I), "<presigned-query-redacted>"),
+    (re.compile(r"[^\s\"'\\]*[?&](?:Signature|token|sig)=[^\s\"'\\]*", re.I),
+     "<signed-query-redacted>"),
     (re.compile(r"(?i)(secret_access_key|session_token|access_key_id)[\"']?\s*[:=]\s*[\"']?"
                 r"[A-Za-z0-9/+=_.-]{8,}"), r"\1=<redacted>"),
 )
@@ -120,8 +132,34 @@ def redact(text):
     return text
 
 
+def redact_document(value):
+    """`value` with every string in it redacted — dicts, lists and tuples walked, everything else
+    returned as it is. **For a structure that leaves as a structure**: the response envelope.
+
+    **The response was the one surface nothing swept** (T1a). The record and the bundle are
+    serialised and swept whole; `cf_error.message` was returned as built, and three branches build
+    it by formatting an exception's text straight in. Sweeping the finished envelope, like the
+    finished bundle, is the form a message added later cannot outflank."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {key: redact_document(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(redact_document(item) for item in value)
+    return value
+
+
+def print_exc():
+    """`traceback.print_exc()`, redacted. **A traceback's last line is the exception's text**,
+    and a printed line reaches RunPod's log stream whether or not a capture is running."""
+    sys.stderr.write(redact(traceback.format_exc()))
+
+
 class _Tee:
-    """Writes through to the real stream and keeps the tail. Never raises."""
+    """Writes through to the real stream and keeps the tail. Never raises.
+
+    **What goes through is redacted too** (T1a): the real stream is RunPod's log, and a line the
+    worker prints — its own or the model's — reaches it whether or not the tail keeps it."""
 
     def __init__(self, stream, sink):
         self._stream = stream
@@ -131,6 +169,10 @@ class _Tee:
         try:
             self._sink(text)
         except Exception:  # noqa: BLE001 — capturing must never break the thing being captured
+            pass
+        try:
+            text = redact(text)
+        except Exception:  # noqa: BLE001 — see above; an unredactable write passes as it came
             pass
         return self._stream.write(text)
 

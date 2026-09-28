@@ -31,7 +31,6 @@ import shutil
 import sys
 import tempfile
 import time
-import traceback
 
 # **`--dry-run-walk`, gated above the imports it must not trigger.** The walk is pure arithmetic
 # over `solver`, and the acceptance kit has to be able to ask it on a laptop; `derives` pulls
@@ -211,7 +210,7 @@ def handle(job_input, job=None):
             return _decorate(payload, machine, attempts, warnings, progress, started,
                              debug=request.get("debug"))
         except Exception as exc:  # noqa: BLE001 — a job must return an envelope, never raise
-            traceback.print_exc()
+            diagnostics.print_exc()
             _write_diagnostics(request, machine, attempts, exc, captured, failed=True,
                                trace=trace, warnings=warnings, job=job, started=started)
             payload = {"cf_error": {
@@ -268,7 +267,7 @@ def _write_run_record_stub(request, machine, rationale, source, job, started):
                         deadline_at=_writes_deadline(request, started))
     except Exception as exc:  # noqa: BLE001 — a record must never cost a delivered master
         print("[run-record] stub NOT assembled ({}: {}). The job is unaffected.".format(
-            type(exc).__name__, str(exc)[:200]))
+            type(exc).__name__, diagnostics.redact(str(exc))[:200]))
 
 
 def _write_run_record(outcome, request, machine, attempts, warnings, progress, trace, job,
@@ -316,7 +315,7 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
                         owed_after=0)
     except Exception as exc:  # noqa: BLE001 — a record must never cost a delivered master
         print("[run-record] NOT assembled ({}: {}). The job is unaffected.".format(
-            type(exc).__name__, str(exc)[:200]))
+            type(exc).__name__, diagnostics.redact(str(exc))[:200]))
 
 
 def _run(request, job, machine, warnings, attempts, workdir, progress, captured, started,
@@ -2501,7 +2500,11 @@ def _decorate(payload, machine, attempts, warnings, progress, started, debug=Non
         payload.setdefault("attempts", attempts)
     if progress.emitted:
         payload["progress_emitted"] = len(progress.emitted)
-    return payload
+    # **Swept whole on the way out** (T1a): every shape passes through here, and three of them
+    # carry an exception's text in `cf_error.message` — one a failed fetch's, with the caller's
+    # presigned query in urllib3's bare-path form. `diagnostics.redact_document` says why the
+    # finished envelope, not the fields.
+    return diagnostics.redact_document(payload)
 
 
 def _write_to_the_reserve(exception, job=None, note=None):
@@ -2532,11 +2535,13 @@ def handler(job):
     try:
         return handle(job.get("input") or {}, job)
     except Exception as exc:  # noqa: BLE001 — the last line of defence
-        traceback.print_exc()
+        diagnostics.print_exc()
         # Past `handle`, so past everything that knew where this job's diagnostics go.
         _write_to_the_reserve(exc, job=job, note="escaped handle(); no validated request")
+        # **Past `_decorate`, so redacted here** (T1a): the one envelope that never reaches it.
         return {"cf_error": {"code": errors.INTERNAL,
-                             "message": "{}: {}".format(type(exc).__name__, exc)}}
+                             "message": diagnostics.redact(
+                                 "{}: {}".format(type(exc).__name__, exc))}}
 
 
 if __name__ == "__main__":
@@ -2552,6 +2557,6 @@ if __name__ == "__main__":
     try:
         runpod.serverless.start({"handler": handler})
     except Exception as exc:  # noqa: BLE001
-        traceback.print_exc()
+        diagnostics.print_exc()
         _write_to_the_reserve(exc, note="the serve loop exited; no job was in scope")
         raise

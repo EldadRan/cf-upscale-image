@@ -312,7 +312,7 @@ def write(document, url, log=print, label="run-record", deadline_at=None, owed_a
         try:
             log("[{}] NOT written ({}: {}). The job is unaffected; if this is a signature "
                 "or expiry error the URL died before the job did.".format(
-                    label, type(exc).__name__, str(exc)[:200]))
+                    label, type(exc).__name__, diagnostics.redact(str(exc))[:200]))
         except Exception:  # noqa: BLE001 — a last resort that raises is not one
             pass
         return False
