@@ -182,7 +182,7 @@ def _transfer_block(transfers):
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
-          transfers=None, cpu_stat=None):
+          transfers=None, cpu_stat=None, transfer_memory=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -253,6 +253,11 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # hide. Totals by direction beside the objects, so a slow datacentre reads off one number
         # and the object that was slow off the list.
         "transfers": _transfer_block(transfers),
+        # **The host's memory peak across each transfer** (T1b): `fetch`, `master_upload`,
+        # `derive_uploads`, each `{seconds, samples, interval_s, peak_anon_gb, peak_current_gb,
+        # limit_gb, error}`. A key absent is a transfer that never began — a refusal before the
+        # fetch, a job with no derives.
+        "transfer_memory": transfer_memory or {},
         # **The job's cgroup `cpu.stat` delta** (J12): `nr_throttled` and `throttled_usec` are the
         # container being stopped, measured rather than inferred. None where the host cannot say.
         "cpu_stat": cpu_stat,

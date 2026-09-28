@@ -28,6 +28,7 @@ once per chunk and the recorded figure is the maximum across them — the peak i
 """
 
 import re
+import threading
 import time
 
 #: Phase number to the name this worker uses. Deliberately not the vendored wording: these names
@@ -256,6 +257,119 @@ def observe(label, rss, peak=None, total=None, frames_fed=None):
         })
     except Exception:  # noqa: BLE001 — see the docstring
         pass
+
+
+#: How often a transfer's memory is read (T1b). **Short, because a transfer is short**: at the
+#: parallel rate an upload lasts seconds, and the RIFE worker's ~15 s sampler missed its upload
+#: entirely (`cf-rife-project/docs/decisions.md` §25b). Two small cgroup files per read.
+TRANSFER_SAMPLE_S = 0.25
+
+
+def _memory_now():
+    """`(anon_gb, memory_current_gb)` — the pair every other host reading carries — or Nones."""
+    import hardware  # noqa: PLC0415 — stdlib-only; local to keep the import cycle absent
+
+    return hardware.memory_breakdown_gb().get("anon"), hardware.memory_current_gb()
+
+
+class TransferPeak(object):
+    """**The host's memory PEAK ACROSS one transfer** (T1b), not a point at either edge.
+
+    No host sample was taken during a transfer: the last before the upload is `model-evicted`
+    and the fetch had none, so what a transfer holds resident was never read. This reads anon and
+    `memory.current` every `TRANSFER_SAMPLE_S` on a daemon thread, **and once at each edge**, so a
+    transfer shorter than the interval still yields a reading of two samples rather than none.
+
+    On exit — a failed transfer included, which is the one worth having — the reading goes to
+    `sink(label, reading)` and a `[host]` line is printed. **Never raises and never swallows**:
+    the transfer's own exception passes through untouched, and a sampler that fails leaves a
+    reading that says so.
+    """
+
+    def __init__(self, label, sink=None, interval_s=None):
+        self.label = label
+        self._sink = sink
+        self._interval_s = TRANSFER_SAMPLE_S if interval_s is None else interval_s
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._started = time.time()
+        self.samples = 0
+        self.peak_anon_gb = None
+        self.peak_current_gb = None
+        self.error = None
+
+    def _sample(self):
+        try:
+            # Resolved per call, so a witness that swaps the module's reader reaches this.
+            anon, current = _memory_now()
+        except Exception as exc:  # noqa: BLE001 — see the class docstring
+            self.error = "{}: {}".format(type(exc).__name__, exc)
+            return
+        with self._lock:
+            self.samples += 1
+            if anon is not None and (self.peak_anon_gb is None or anon > self.peak_anon_gb):
+                self.peak_anon_gb = anon
+            if current is not None and (self.peak_current_gb is None
+                                        or current > self.peak_current_gb):
+                self.peak_current_gb = current
+
+    def _run(self):
+        while not self._stop.wait(self._interval_s):
+            self._sample()
+
+    def __enter__(self):
+        self._started = time.time()
+        try:
+            self._sample()
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="transfer-peak-{}".format(self.label))
+            self._thread.start()
+        except Exception as exc:  # noqa: BLE001 — see the class docstring
+            self.error = "{}: {}".format(type(exc).__name__, exc)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self._stop.set()
+            if self._thread is not None:
+                self._thread.join()
+            self._sample()
+            reading = self.reading()
+            if self._sink is not None:
+                self._sink(self.label, reading)
+            print(self.banner(reading))
+        except Exception:  # noqa: BLE001 — see the class docstring
+            pass
+        return False
+
+    def reading(self):
+        limit = host_total_gb()
+        with self._lock:
+            return {
+                "seconds": round(time.time() - self._started, 3),
+                "samples": self.samples,
+                "interval_s": self._interval_s,
+                "peak_anon_gb": None if self.peak_anon_gb is None else round(self.peak_anon_gb, 2),
+                "peak_current_gb": (None if self.peak_current_gb is None
+                                    else round(self.peak_current_gb, 2)),
+                # **The limit beside the peak**: T1's acceptance is SAFE, judged against this.
+                "limit_gb": None if not limit else round(limit, 1),
+                "error": self.error,
+            }
+
+    def banner(self, reading):
+        """`[host] <label> anon peak … current peak … of …` — the `[host]` family's shape."""
+        anon, current = reading.get("peak_anon_gb"), reading.get("peak_current_gb")
+        if anon is None and current is None:
+            body = "memory unreadable ({})".format(reading.get("error") or "no cgroup")
+        else:
+            body = "anon peak {}   current peak {}{}".format(
+                "unknown" if anon is None else "{:6.2f} GiB".format(anon),
+                "unknown" if current is None else "{:6.2f} GiB".format(current),
+                "" if not reading.get("limit_gb") else "   of {:.1f}".format(reading["limit_gb"]))
+        return "[host] {:<12} {}   ({} samples over {:.2f}s)".format(
+            self.label, body, reading.get("samples"), reading.get("seconds") or 0.0)
 
 
 #: **The one exception an observer must never swallow** (F-2026-08-20-46). This module's whole

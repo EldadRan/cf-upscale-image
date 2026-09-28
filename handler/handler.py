@@ -24,6 +24,7 @@ MP4 stays a video: it has a rate, it can carry audio, and a frame count is the n
 `docs/decisions.md` 0.2 says not to act on.
 """
 
+import contextlib
 import datetime
 import json
 import os
@@ -304,6 +305,7 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             error=outcome.get("error"),
             warnings=warnings,
             transfers=(trace or {}).get("transfers"),
+            transfer_memory=(trace or {}).get("transfer_memory"),
             cpu_stat=hardware.cpu_stat_delta(cpu_at_entry, hardware.cpu_stat()),
         )
         # **The address came with the job**, like the bundle's always has. `request` may be None
@@ -324,10 +326,14 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     # **Every object this job moves, timed and counted** (J12). Kept on `trace` because the
     # record is assembled in `handle`'s `finally`, where a fetch that broke the job still reaches.
     transfers = trace.setdefault("transfers", []) if trace is not None else None
+    # **The host's memory peak across each transfer** (T1b): the fetch, the master's upload and
+    # the derives' uploads, one reading each. On `trace` for the same reason as `transfers`.
+    memory = trace.setdefault("transfer_memory", {}) if trace is not None else {}
 
     # ── fetch ────────────────────────────────────────────────────────────────────────────────
     download = os.path.join(workdir, "source")
-    storage.fetch_source(request["source_url"], download, transfers=transfers)
+    with phasewatch.TransferPeak("fetch", memory.__setitem__):
+        storage.fetch_source(request["source_url"], download, transfers=transfers)
     # The vendored CLI dispatches on file extension and treats an unknown one as 'skip, return
     # zero frames' rather than as an error, so the extension comes from the bytes.
     extension = probe.detect_extension(download)
@@ -898,8 +904,9 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     measured = probe.probe_output(master_path)
     if trace is not None and trace.get("output") is not None:
         trace["output"]["codec_tag_string"] = measured.get("codec_tag_string")
-    master_key = storage.upload(client, request["output"], master, master_path,
-                                keys.content_type(master), transfers=transfers)
+    with phasewatch.TransferPeak("master_upload", memory.__setitem__):
+        master_key = storage.upload(client, request["output"], master, master_path,
+                                    keys.content_type(master), transfers=transfers)
     artefacts.append(master)
 
     output_entry = dict(measured)
@@ -947,12 +954,15 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             warnings.append("derives failed: {}: {}".format(
                 type(exc).__name__, getattr(exc, "message", None) or str(exc)[:200]))
             entries = []
-        for entry in entries:
-            entry["key"] = storage.upload(client, request["output"], entry["name"],
-                                          entry["path"], entry["content_type"],
-                                          transfers=transfers)
-            artefacts.append(entry["name"])
-            derived.append({k: v for k, v in entry.items() if k not in ("path", "name")})
+        # One reading across every derive's upload; none where no derive was produced.
+        with phasewatch.TransferPeak("derive_uploads", memory.__setitem__) if entries else \
+                contextlib.nullcontext():
+            for entry in entries:
+                entry["key"] = storage.upload(client, request["output"], entry["name"],
+                                              entry["path"], entry["content_type"],
+                                              transfers=transfers)
+                artefacts.append(entry["name"])
+                derived.append({k: v for k, v in entry.items() if k not in ("path", "name")})
 
     # ── the manifest, last ───────────────────────────────────────────────────────────────────
     body = {
