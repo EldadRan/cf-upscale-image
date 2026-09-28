@@ -174,9 +174,16 @@ def _transfer_block(transfers):
         if not values or any(v is None for v in values):
             return None
         return round(sum(values), digits)
+    # **The MASTER's parts, not the job's** (T1c): how many it went up in (1 for a single PUT)
+    # and the size they took — a small master's row would otherwise read as "sixteen in flight
+    # bought nothing". None where no master was uploaded.
+    master = next((o for o in objects if o.get("direction") == "upload"
+                   and o.get("role") == "master"), {})
     return {"fetch_s": total("fetch", "seconds", 3), "fetch_bytes": total("fetch", "bytes", 0),
             "upload_s": total("upload", "seconds", 3),
-            "upload_bytes": total("upload", "bytes", 0), "objects": objects}
+            "upload_bytes": total("upload", "bytes", 0),
+            "upload_parts": master.get("parts"), "upload_part_bytes": master.get("part_bytes"),
+            "objects": objects}
 
 
 def build(status, build_identity, machine, request=None, rationale=None, source=None,

@@ -906,7 +906,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         trace["output"]["codec_tag_string"] = measured.get("codec_tag_string")
     with phasewatch.TransferPeak("master_upload", memory.__setitem__):
         master_key = storage.upload(client, request["output"], master, master_path,
-                                    keys.content_type(master), transfers=transfers)
+                                    keys.content_type(master), transfers=transfers,
+                                    role="master")
     artefacts.append(master)
 
     output_entry = dict(measured)
@@ -960,7 +961,7 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
             for entry in entries:
                 entry["key"] = storage.upload(client, request["output"], entry["name"],
                                               entry["path"], entry["content_type"],
-                                              transfers=transfers)
+                                              transfers=transfers, role="derive")
                 artefacts.append(entry["name"])
                 derived.append({k: v for k, v in entry.items() if k not in ("path", "name")})
 
@@ -1048,7 +1049,8 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     with open(manifest_path, "w") as handle:
         handle.write(manifest_module.serialise(manifest_body))
     manifest_key = storage.upload(client, request["output"], manifest_name, manifest_path,
-                                  keys.content_type(manifest_name), transfers=transfers)
+                                  keys.content_type(manifest_name), transfers=transfers,
+                                  role="manifest")
     artefacts.append(manifest_name)
 
     # A job that retried is worth a diagnostics bundle even though it succeeded: it holds both
