@@ -393,6 +393,9 @@ def upload(client, output, name, path, content_type, transfers=None, role=None, 
     """
     started = time.time()
     stats = {} if stats is None else stats
+    # **Cleared before anything can raise**: a caller's dict must never carry an earlier upload's
+    # count onto this one's failure (review). `_upload` sets both as it learns them.
+    stats["parts"] = stats["part_bytes"] = None
     try:
         key = _upload(client, output, name, path, content_type, on_bytes, stats)
     except BaseException:
@@ -537,8 +540,6 @@ def _upload(client, output, name, path, content_type, on_bytes, stats):
     key = "{}{}".format(prefix if prefix.endswith("/") else prefix + "/", name)
     nbytes = _size_or_none(path) or 0
     part = upload_part_bytes(nbytes)
-    # Set only by a success below; a caller's dict must not carry an earlier upload's count.
-    stats["parts"] = None
     config = TransferConfig(
         multipart_threshold=MULTIPART_THRESHOLD_BYTES,
         multipart_chunksize=part,
