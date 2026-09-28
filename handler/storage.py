@@ -12,11 +12,14 @@ deterministic, derivable from the request, and identical on a re-run. See `keys.
 """
 
 import os
+import queue
+import re
 import threading
 import time
 
 import requests
 
+from diagnostics import redact
 from errors import OUTPUT_WRITE_FAILED, SOURCE_FETCH_FAILED, Remedy, WorkerError
 
 CONNECT_TIMEOUT_S = 10
@@ -28,6 +31,18 @@ R2_REGION = "auto"
 
 #: MiB = 2^20, throughout this module (T1: the RIFE worker's "100 MB" was 100 MiB in code).
 MIB = 1024 * 1024
+
+#: **The ranged fetch** (T1d, adopted from the RIFE worker's §25a): a source of at least
+#: `FETCH_RANGED_MIN_BYTES` whose server answers a one-byte probe with a 206, a total and a strong
+#: ETag is fetched in `FETCH_PART_BYTES` slices by up to `FETCH_STREAMS` streams, each held to
+#: that ETag. Anything else is the single stream it replaces, and the record says why.
+FETCH_RANGED_MIN_BYTES = 64 * MIB
+FETCH_STREAMS = 8
+FETCH_PART_BYTES = 32 * MIB
+#: A slice is tried this many times before the fetch is `source_fetch_failed`. No backoff: the
+#: single stream it replaced did not retry at all.
+FETCH_ATTEMPTS = 3
+_CONTENT_RANGE = re.compile(r"^\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$", re.IGNORECASE)
 
 # Above this, boto3 splits the write into a multipart upload. A single PUT tops out around 5 GiB
 # on R2, and this worker's master will cross that on ordinary content — the media worker measured
@@ -96,24 +111,206 @@ def _size_or_none(path):
         return None
 
 
-def fetch_source(source_url, destination, transfers=None):
-    """Stream the presigned GET to disk. No media ever arrives in the payload.
+def fetch_source(source_url, destination, transfers=None, on_bytes=None, stats=None):
+    """Fetch the presigned GET to disk — in parallel ranges where the server allows it, as one
+    stream where it does not (T1d). No media ever arrives in the payload.
 
     **Timed and counted onto `transfers`, on failure too** (J12): the fetch that broke a job is
     the one worth having, and without it the residual `wall_s` minus the phases mixed the fetch,
-    the uploads and everything else into one number nobody could read.
+    the uploads and everything else into one number nobody could read. **With how it was
+    attempted** — `mode`, `mode_reason`, `streams`, `part_bytes` — decided by the probe BEFORE a
+    byte of the body moves, so a fetch that fails still says which way it tried. `stats`, a dict
+    or None, receives the same four.
+
+    **`on_bytes(done, expected)` is monotonic in both modes** (`_Relay`).
     """
     started = time.time()
+    stats = {} if stats is None else stats
+    counted = {}
     try:
-        destination = _fetch(source_url, destination)
+        received = _fetch(source_url, destination, on_bytes, stats, counted)
     except BaseException:
-        _transfer(transfers, "fetch", "source", started, _size_or_none(destination), False)
+        # **A ranged fetch's file is pre-sized to the total**, so on failure its size would read
+        # as a whole source; what the slices counted is what was received.
+        _transfer(transfers, "fetch", "source", started,
+                  counted["bytes"] if "bytes" in counted else _size_or_none(destination), False,
+                  **stats)
         raise
-    _transfer(transfers, "fetch", "source", started, _size_or_none(destination), True)
+    # **What was counted, not the file's size**: a ranged fetch pre-sizes the file to the total,
+    # so its size would read whole with a slice never written.
+    _transfer(transfers, "fetch", "source", started, received, True, **stats)
     return destination
 
 
-def _fetch(source_url, destination):
+def _fetch(source_url, destination, on_bytes, stats, counted):
+    """The probe decides; returns the bytes received. A ranged fetch keeps its running count in
+    `counted["bytes"]`, so a failure can say what arrived."""
+    total, etag, reason = _probe_ranged(source_url)
+    if reason is None and total < FETCH_RANGED_MIN_BYTES:
+        reason = "small: {} bytes, under {} MiB".format(total, FETCH_RANGED_MIN_BYTES // MIB)
+    if reason is not None:
+        stats.update(mode="single", mode_reason=reason, streams=1, part_bytes=None)
+        print("[fetch] one stream: {}".format(reason))
+        return _fetch_single(source_url, destination, on_bytes)
+    streams = max(1, min(FETCH_STREAMS, -(-total // FETCH_PART_BYTES)))
+    stats.update(mode="ranged", mode_reason=None, streams=streams, part_bytes=FETCH_PART_BYTES)
+    print("[fetch] {} streams of {} MiB slices over {} bytes".format(
+        streams, FETCH_PART_BYTES // MIB, total))
+    received = _fetch_ranged(source_url, destination, total, etag, streams, on_bytes, counted)
+    # **The size check** (T1d step 5): counted per slice, against the probe's total.
+    if received != total:
+        raise WorkerError(SOURCE_FETCH_FAILED,
+                          "the ranged fetch wrote {} bytes of the {} the source declared"
+                          .format(received, total))
+    return received
+
+
+def _probe_ranged(url):
+    """`(total, etag, None)` when ranged mode is possible, else `(None, None, reason)`.
+
+    A `Range: bytes=0-0` GET — a GET, not a HEAD, because a presigned URL is signed for one
+    method. Ranged mode needs a 206, a total in `Content-Range`, and a STRONG ETag: a weak one
+    cannot pass `If-Match`, which is a strong comparison. **Never raises**: a probe that fails
+    outright leads to the single stream, which then fails — or succeeds — exactly as before."""
+    try:
+        with requests.get(url, headers={"Range": "bytes=0-0"}, stream=True,
+                          timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S)) as response:
+            status = response.status_code
+            content_range = response.headers.get("Content-Range") or ""
+            etag = response.headers.get("ETag")
+    except requests.exceptions.RequestException as exc:
+        return None, None, "probe failed: {}".format(type(exc).__name__)
+    if status != 206:
+        return None, None, "probe answered {}, not 206".format(status)
+    match = _CONTENT_RANGE.match(content_range)
+    if match is None:
+        return None, None, "probe gave no total size (Content-Range {!r})".format(
+            redact(content_range))
+    if not etag:
+        return None, None, "probe gave no ETag"
+    if etag.startswith("W/"):
+        return None, None, "probe gave a weak ETag"
+    return int(match.group(3)), etag, None
+
+
+class _SliceError(Exception):
+    """One attempt at one slice failed in a way another attempt may not."""
+
+
+def _fetch_ranged(url, destination, total, etag, streams, on_bytes, counted):
+    """The file pre-sized, each slice written IN PLACE at its offset by one of `streams` workers,
+    every request held to `etag`; nothing held beyond read buffers. Returns the bytes WRITTEN,
+    counted per slice.
+
+    **A final failure of any slice stops the others and raises** — `source_fetch_failed` for a
+    transfer that may succeed next time, anything else (a full disk) as itself, which is what the
+    single stream does with it too. **The descriptor is closed only after every started worker
+    has been joined**, whatever raised.
+    """
+    pending = queue.Queue()
+    for first in range(0, total, FETCH_PART_BYTES):
+        pending.put((first, min(first + FETCH_PART_BYTES, total) - 1))
+    relay = _Relay(on_bytes, total)
+    stop = threading.Event()
+    failures = []
+    counted["bytes"] = 0
+    tally = threading.Lock()
+
+    def work():
+        session = requests.Session()
+        try:
+            while not stop.is_set():
+                try:
+                    first, last = pending.get_nowait()
+                except queue.Empty:
+                    return
+                landed = _fetch_slice(session, url, fd, first, last, total, etag, relay, stop)
+                with tally:
+                    counted["bytes"] += landed
+        except BaseException as exc:  # noqa: BLE001 — carried to the caller's thread, raised there
+            failures.append(exc)
+            stop.set()
+        finally:
+            session.close()
+
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    started = []
+    try:
+        os.ftruncate(fd, total)
+        for n in range(streams):
+            worker = threading.Thread(target=work, name="fetch-{}".format(n), daemon=True)
+            worker.start()
+            started.append(worker)
+        for worker in started:
+            worker.join()
+    except BaseException:
+        stop.set()
+        raise
+    finally:
+        for worker in started:
+            worker.join()
+        os.close(fd)
+    if failures:
+        raise failures[0]
+    relay.flush()
+    return counted["bytes"]
+
+
+def _fetch_slice(session, url, fd, first, last, total, etag, relay, stop):
+    """Bytes `first`-`last`, written at `first`; returns the bytes written — the slice's length,
+    or 0 when the fetch was stopped. `FETCH_ATTEMPTS` tries; a retried slice takes back what its
+    failed attempt reported. **A 412 is not retried**: the object changed under the fetch, and
+    every further range would be refused the same way."""
+    want = last - first + 1
+    why = None
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        if stop.is_set():
+            return 0
+        got = 0
+        try:
+            with session.get(url, headers={"Range": "bytes={}-{}".format(first, last),
+                                           "If-Match": etag},
+                             stream=True, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S)) as response:
+                if response.status_code == 412:
+                    raise WorkerError(
+                        SOURCE_FETCH_FAILED,
+                        "the source changed while it was being fetched: bytes {}-{} no longer "
+                        "match the ETag {} the fetch began with (412). Retry once the object "
+                        "at source_url is stable.".format(first, last, etag))
+                if response.status_code != 206:
+                    raise _SliceError("answered {}, not 206".format(response.status_code))
+                match = _CONTENT_RANGE.match(response.headers.get("Content-Range") or "")
+                if match is None or tuple(int(g) for g in match.groups()) != (first, last, total):
+                    raise _SliceError("Content-Range {!r} is not bytes {}-{}/{}".format(
+                        response.headers.get("Content-Range"), first, last, total))
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
+                    if stop.is_set():
+                        return 0
+                    if not chunk:
+                        continue
+                    if got + len(chunk) > want:
+                        raise _SliceError("more than the {} bytes asked for".format(want))
+                    os.pwrite(fd, chunk, first + got)
+                    got += len(chunk)
+                    relay(len(chunk))
+            if got == want:
+                return want
+            why = "{} of {} bytes".format(got, want)
+        except (requests.exceptions.RequestException, _SliceError) as exc:
+            # The text can carry the presigned query, in either form `redact` knows.
+            why = redact(str(exc))
+        relay(-got)
+        print("[fetch] bytes {}-{}, attempt {} of {}: {}".format(
+            first, last, attempt, FETCH_ATTEMPTS, why))
+    raise WorkerError(SOURCE_FETCH_FAILED,
+                      "could not fetch bytes {}-{} of source_url in {} attempts: {}".format(
+                          first, last, FETCH_ATTEMPTS, why))
+
+
+def _fetch_single(source_url, destination, on_bytes=None):
+    """Stream the presigned GET to disk — the fetch this worker always made, kept as the single
+    stream the probe falls back to. Returns the bytes received."""
+    relay = _Relay(on_bytes, None)
     try:
         response = requests.get(
             source_url, stream=True, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S)
@@ -124,8 +321,12 @@ def _fetch(source_url, destination):
             for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
                 if chunk:
                     handle.write(chunk)
+                    relay(len(chunk))
     except requests.exceptions.RequestException as exc:
-        raise WorkerError(SOURCE_FETCH_FAILED, "could not fetch source_url: {}".format(exc))
+        # Scrubbed here as well as at every surface (T1a): the surfaces are what hold when the
+        # next error path is added, and this one is known.
+        raise WorkerError(SOURCE_FETCH_FAILED,
+                          "could not fetch source_url: {}".format(redact(str(exc))))
 
     received = os.path.getsize(destination)
     if received == 0:
@@ -138,7 +339,7 @@ def _fetch(source_url, destination):
             SOURCE_FETCH_FAILED,
             "source_url returned {} bytes of a declared {}".format(received, declared),
         )
-    return destination
+    return received
 
 
 def client_for(output):

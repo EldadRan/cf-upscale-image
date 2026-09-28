@@ -179,7 +179,12 @@ def _transfer_block(transfers):
     # bought nothing". None where no master was uploaded.
     master = next((o for o in objects if o.get("direction") == "upload"
                    and o.get("role") == "master"), {})
+    # **How the source came** (T1d): `ranged` or `single`, why not ranged (null when it was), and
+    # the streams and slice size. Decided by the probe before the body, so a failed fetch says too.
+    source = next((o for o in objects if o.get("direction") == "fetch"), {})
     return {"fetch_s": total("fetch", "seconds", 3), "fetch_bytes": total("fetch", "bytes", 0),
+            "fetch_mode": source.get("mode"), "fetch_mode_reason": source.get("mode_reason"),
+            "fetch_streams": source.get("streams"), "fetch_part_bytes": source.get("part_bytes"),
             "upload_s": total("upload", "seconds", 3),
             "upload_bytes": total("upload", "bytes", 0),
             "upload_parts": master.get("parts"), "upload_part_bytes": master.get("part_bytes"),
