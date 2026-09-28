@@ -54,18 +54,29 @@ BUNDLE_HEAD_LINES = 400
 # **A signed query WITHOUT a scheme is the same credential** (T1a, 2026-09-28). urllib3 writes a
 # failed request as `Max retries exceeded with url: /bkt/key?X-Amz-...` — path and query, no
 # host — and every pattern here required `https?://`, so a failed fetch carried the caller's
-# signature into the response, the record and the bundle intact. The last two patterns take the
-# query whatever precedes it; the first two still name a whole URL where there is one.
+# signature into the response, the record and the bundle intact. The two bare patterns take the
+# QUERY, anchored on its own `?` (or, where a message was cut before it, on the signed
+# parameter's `&`); the first two still name a whole URL where there is one.
 #
-# **No backslash inside a match**: the record and the bundle are swept AFTER serialising, and a
-# match that ate the `\` of an escaped quote would leave the JSON unparseable.
+# **Anchored on the query, never on what precedes it** (review): the record and the bundle are
+# swept AFTER serialising, and a match allowed to begin anywhere began inside `\n` or `\u00e9`
+# and left a backslash in front of the replacement — an invalid escape and an unparseable record.
+# The same unanchored prefix was quadratic: 200k characters of a compact list took minutes in
+# the log tee. **No backslash inside a match**, for the escaped-quote half of the same reason.
+#
+# **The whole-URL patterns scan at most `_URL_BEFORE_QUERY` characters to the `?`**, for the same
+# reason: unbounded, a line of compact URLs was quadratic (15 000 of them took 23 s). A URL longer
+# than that before its query keeps its host and path, and the bare pattern still takes the query.
+_URL_BEFORE_QUERY = 2048
 _REDACTIONS = (
-    (re.compile(r"https?://[^\s\"'\\]*[?&]X-Amz-[^\s\"'\\]*", re.I), "<presigned-url-redacted>"),
-    (re.compile(r"https?://[^\s\"'\\]*[?&](?:Signature|token|sig)=[^\s\"'\\]*", re.I),
-     "<signed-url-redacted>"),
-    (re.compile(r"[^\s\"'\\]*[?&]X-Amz-[^\s\"'\\]*", re.I), "<presigned-query-redacted>"),
-    (re.compile(r"[^\s\"'\\]*[?&](?:Signature|token|sig)=[^\s\"'\\]*", re.I),
-     "<signed-query-redacted>"),
+    (re.compile(r"https?://[^\s\"'\\?]{0,%d}\?(?:[^\s\"'\\?]*?&)?X-Amz-[^\s\"'\\]*"
+                % _URL_BEFORE_QUERY, re.I), "<presigned-url-redacted>"),
+    (re.compile(r"https?://[^\s\"'\\?]{0,%d}\?(?:[^\s\"'\\?]*?&)?(?:Signature|token|sig)="
+                r"[^\s\"'\\]*" % _URL_BEFORE_QUERY, re.I), "<signed-url-redacted>"),
+    (re.compile(r"\?(?:[^\s\"'\\?]*?&)?(?:X-Amz-|(?:Signature|token|sig)=)[^\s\"'\\]*",
+                re.I), "?<signed-query-redacted>"),
+    (re.compile(r"&(?:X-Amz-|(?:Signature|token|sig)=)[^\s\"'\\]*", re.I),
+     "&<signed-query-redacted>"),
     (re.compile(r"(?i)(secret_access_key|session_token|access_key_id)[\"']?\s*[:=]\s*[\"']?"
                 r"[A-Za-z0-9/+=_.-]{8,}"), r"\1=<redacted>"),
 )
@@ -144,8 +155,12 @@ def redact_document(value):
         return redact(value)
     if isinstance(value, dict):
         return {key: redact_document(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return type(value)(redact_document(item) for item in value)
+    # Lists and tuples come back as themselves in JSON either way; a namedtuple cannot be rebuilt
+    # from one iterable, so a tuple comes back a plain tuple (review).
+    if isinstance(value, list):
+        return [redact_document(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_document(item) for item in value)
     return value
 
 

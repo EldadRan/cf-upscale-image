@@ -290,7 +290,7 @@ def _fetch_slice(session, url, fd, first, last, total, etag, relay, stop):
                         continue
                     if got + len(chunk) > want:
                         raise _SliceError("more than the {} bytes asked for".format(want))
-                    os.pwrite(fd, chunk, first + got)
+                    _write_at(fd, chunk, first + got)
                     got += len(chunk)
                     relay(len(chunk))
             if got == want:
@@ -305,6 +305,19 @@ def _fetch_slice(session, url, fd, first, last, total, etag, relay, stop):
     raise WorkerError(SOURCE_FETCH_FAILED,
                       "could not fetch bytes {}-{} of source_url in {} attempts: {}".format(
                           first, last, FETCH_ATTEMPTS, why))
+
+
+def _write_at(fd, chunk, offset):
+    """All of `chunk` at `offset`, or `OSError`. **`os.pwrite` may write less than it is handed
+    without raising** — a disk filling under a sparse, pre-sized file is the realistic case — and
+    a count that assumed the whole chunk would read whole over a zero-filled gap (review). A write
+    that makes no progress raises, as the buffered single stream's would."""
+    view = memoryview(chunk)
+    while view:
+        wrote = os.pwrite(fd, view, offset)
+        if wrote <= 0:
+            raise OSError("wrote 0 of {} bytes at offset {}".format(len(view), offset))
+        view, offset = view[wrote:], offset + wrote
 
 
 def _fetch_single(source_url, destination, on_bytes=None):
@@ -524,6 +537,8 @@ def _upload(client, output, name, path, content_type, on_bytes, stats):
     key = "{}{}".format(prefix if prefix.endswith("/") else prefix + "/", name)
     nbytes = _size_or_none(path) or 0
     part = upload_part_bytes(nbytes)
+    # Set only by a success below; a caller's dict must not carry an earlier upload's count.
+    stats["parts"] = None
     config = TransferConfig(
         multipart_threshold=MULTIPART_THRESHOLD_BYTES,
         multipart_chunksize=part,
