@@ -80,6 +80,19 @@ def memory_cards(card_table):
             if entry.get("vram_total_gb") is not None and entry.get("vram_free_gb") is not None}
 
 
+def host_ram_cards(card_table):
+    """`{gpu_name: host_ram_gb}` — the cards the card table gives a host figure (H1, §4).
+
+    **The service is this field's only reader**: the worker plans from its live `hardware`
+    reading. The figure is the lowest the harvest holds for that card, a HOST fact carried on the
+    card — so it is read on the exact name only, never through a VRAM substitution.
+    """
+    if not card_table or estimator.card_table_problem(card_table):
+        return {}
+    return {name: entry["host_ram_gb"] for name, entry in card_table["cards"].items()
+            if entry.get("host_ram_gb") is not None}
+
+
 def service_commit(environ):
     """The commit this service runs: a full 40-hex sha, or None where none can be established.
 
@@ -196,15 +209,11 @@ def read_tier(body, index):
         label = entry.get("label")
         if label is not None and not isinstance(label, str):
             raise Refusal("{}.label".format(card_where), "must be a string when present")
-        card = {"gpu_name": gpu_name, "label": label,
+        card = {"gpu_name": gpu_name, "label": label, "where": card_where,
                 **{k: _optional_number(entry, k, card_where)
                    for k in ("vram_total_gb", "vram_free_gb", "host_ram_gb")}}
-        # **Host RAM is per card, and neither source refuses THAT CARD by name** (§4): the host
-        # slice decides the chunk, and there is nothing conservative to assume.
-        card["host_ram_used_gb"] = card["host_ram_gb"] or host_ram_gb
-        if card["host_ram_used_gb"] is None:
-            raise Refusal("{}.host_ram_gb".format(card_where),
-                          "no host RAM for this card: neither the card nor the tier carries one")
+        # Host RAM is NOT resolved here: its second source is the card table, which is read
+        # after the door (H1). `resolve_host_ram` refuses, once the table is known.
         read_cards.append(card)
 
     return {"tier": body["tier"], "host_ram_gb": host_ram_gb, "cards": read_cards}
@@ -226,6 +235,25 @@ def _worst_measured(names, table_cards):
     if not measured:
         return None
     return min(measured, key=lambda name: (table_cards[name]["vram_total_gb"], name))
+
+
+def resolve_host_ram(card, tier_host_ram_gb, table_host_ram):
+    """`(host_ram_gb, host_ram_source)` — given, then table, then tier (§4 HOST RAM, H1).
+
+    **The table step is the EXACT name CF sent**, whatever memory later resolves to: a card
+    planned on another card's VRAM borrows none of its host. **None of the three refuses THAT
+    CARD by name** — the host slice decides the chunk, and there is nothing conservative to
+    assume.
+    """
+    if card["host_ram_gb"] is not None:
+        return card["host_ram_gb"], "given"
+    if card["gpu_name"] in table_host_ram:
+        return table_host_ram[card["gpu_name"]], "table"
+    if tier_host_ram_gb is not None:
+        return tier_host_ram_gb, "tier"
+    raise Refusal("{}.host_ram_gb".format(card["where"]),
+                  "no host RAM for this card: neither the card, the card table nor the tier "
+                  "carries one")
 
 
 def resolve_card(card, siblings, table_cards):
@@ -260,6 +288,7 @@ def resolve_card(card, siblings, table_cards):
         "hardware": {"gpu_name": planned_name, "vram_total_gb": total, "vram_free_gb": free,
                      "host_ram_gb": card["host_ram_used_gb"]},
         "vram_source": vram_source,
+        "host_ram_source": card["host_ram_source"],
         "resolved_from": resolved_from,
     }
 
@@ -439,7 +468,9 @@ def estimate_core(body, commit, card_table=None, warnings=None):
         raise Refusal("tiers", "required, a non-empty list")
     read = [read_tier(t, i) for i, t in enumerate(tiers)]
 
-    # Tables after the door: a malformed request is refused by name whatever state they are in.
+    # Tables after the door: a malformed request is refused by name whatever state they are in —
+    # **except for host RAM** (H1), whose second source is the table, so a card with none of the
+    # three is refused below, after the table and before any card is planned.
     # **ONE card table for the whole request, both halves** (W6): memory resolves against it
     # here, and the worker times every card against the same object below. **The body's
     # `card_table` is that table when sent and valid** (item 2) — the worker's own resolution,
@@ -464,6 +495,14 @@ def estimate_core(body, commit, card_table=None, warnings=None):
     if not table_cards:
         # Before any card is planned: every fallback below ends in a measured card.
         raise TableUnusable("the card table gives no card's memory")
+
+    # **Every card's host RAM, before any card is planned** (H1): the refusal waited for the
+    # table, and still costs no planning.
+    table_host_ram = host_ram_cards(card_table)
+    for tier in read:
+        for card in tier["cards"]:
+            card["host_ram_used_gb"], card["host_ram_source"] = resolve_host_ram(
+                card, tier["host_ram_gb"], table_host_ram)
 
     if job["canvas"] is not None:
         delivered = job["canvas"]
@@ -494,6 +533,7 @@ def estimate_core(body, commit, card_table=None, warnings=None):
                 label=card["label"],
                 hardware_used=dict(resolved["hardware"]),
                 vram_source=resolved["vram_source"],
+                host_ram_source=resolved["host_ram_source"],
                 resolved_from=resolved["resolved_from"],
             ))
         entries.append({
@@ -516,7 +556,7 @@ TIER_WIRE_FIELDS = ("tier", "fits_any", "fits_all", "output_width", "output_heig
 CARD_WIRE_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds",
                     "prediction_basis",
                     "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
-                    "hardware_used", "vram_source", "resolved_from")
+                    "hardware_used", "vram_source", "host_ram_source", "resolved_from")
 
 
 def project(entry):

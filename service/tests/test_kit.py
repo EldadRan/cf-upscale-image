@@ -46,6 +46,8 @@ H200 = "NVIDIA H200"
 B200 = "NVIDIA B200"
 BLACKWELL = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 MIG = "NVIDIA RTX PRO 6000 Blackwell MIG 2g.48gb"
+#: A card no table names, so nothing but CF can give its memory or its host.
+UNNAMED = "NVIDIA Unlisted 9000"
 
 #: Card answer field -> the rationale key it is the worker's own output of.
 PROJECTED_FROM_RATIONALE = (
@@ -785,17 +787,19 @@ class NoVramStats(unittest.TestCase):
 
 
 class HostRam(unittest.TestCase):
-    """A card's own host_ram_gb wins over the tier's; neither refuses THAT card by name."""
+    """A card's own host_ram_gb wins over the tier's; none of the three refuses THAT card by name
+    (`HostRamOrder` holds the table step between them)."""
 
     def test_card_before_tier(self):
-        cards = [card(A40, host_ram_gb=51.22), card(H200)]
+        cards = [card(A40, host_ram_gb=51.22),
+                 card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)]
         entry = one(request(tiers=[tier(host_ram_gb=46.57, cards=cards)]))
         self.assertEqual(entry["cards"][0]["hardware_used"]["host_ram_gb"], 51.22)
         self.assertEqual(entry["cards"][1]["hardware_used"]["host_ram_gb"], 46.57)
 
     def test_neither_refuses_that_card(self):
-        body = request(tiers=[tier(host_ram_gb=None,
-                                   cards=[card(A40, host_ram_gb=46.57), card(H200)])])
+        body = request(tiers=[tier(host_ram_gb=None, cards=[
+            card(A40, host_ram_gb=46.57), card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)])])
         refused_field(self, body, "tiers[0].cards[1].host_ram_gb")
 
     def test_tier_host_ram_may_be_absent_when_every_card_has_one(self):
@@ -803,6 +807,153 @@ class HostRam(unittest.TestCase):
         del t["host_ram_gb"]
         got = answer(request(tiers=[t]))
         self.assertEqual(got["hardware_used"]["host_ram_gb"], 46.57)
+
+
+def table_with_host_ram(figures):
+    """The shipped table with `host_ram_gb` set to `figures` and taken off every other card."""
+    document = copy.deepcopy(estimator.load_card_table())
+    for name, entry in document["cards"].items():
+        entry.pop("host_ram_gb", None)
+        if name in figures:
+            entry["host_ram_gb"] = figures[name]
+    return document
+
+
+def built_in_host_ram(name):
+    return estimator.load_card_table()["cards"][name].get("host_ram_gb")
+
+
+class HostRamOrder(unittest.TestCase):
+    """**H1: given, then table, then tier** (`cf-planner.md` §4 HOST RAM, §7 `host ram`; CF,
+    2026-10-18). Every case has the next source present and DIFFERENT, so a figure from the wrong
+    step cannot pass by coinciding — and `host_ram_source` names the step."""
+
+    def test_given_wins(self):
+        sent = table_with_host_ram({A40: 123.0})
+        got = answer(dict(request(tiers=[tier(host_ram_gb=377.0,
+                                              cards=[card(A40, host_ram_gb=51.22)])]),
+                          card_table=sent))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 51.22)
+        self.assertEqual(got["host_ram_source"], "given")
+
+    def test_table_next(self):
+        sent = table_with_host_ram({A40: 123.0})
+        got = answer(dict(request(tiers=[tier(host_ram_gb=377.0, cards=[card(A40)])]),
+                          card_table=sent))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 123.0)
+        self.assertEqual(got["host_ram_source"], "table")
+        # **And the built-in table where none is sent** — the shipped figure, read, not pinned.
+        shipped = built_in_host_ram(A40)
+        self.assertIsNotNone(shipped, "the shipped table carries no host_ram_gb for the A40")
+        self.assertNotEqual(shipped, 377.0)
+        got = answer(request(tiers=[tier(host_ram_gb=377.0, cards=[card(A40)])]))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], shipped)
+        self.assertEqual(got["host_ram_source"], "table")
+
+    def test_tier_last(self):
+        sent = table_with_host_ram({name: 123.0 for name in TABLE})
+        got = answer(dict(request(tiers=[tier(host_ram_gb=377.0, cards=[
+            card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)])]), card_table=sent))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 377.0)
+        self.assertEqual(got["host_ram_source"], "tier")
+
+    def test_exact_name_only(self):
+        # Every measured card carries a figure, each different, so whichever card memory
+        # resolves to, borrowing its host RAM would show.
+        figures = {name: 200.0 + n for n, name in enumerate(sorted(TABLE))}
+        sent = table_with_host_ram(figures)
+        entry = one(dict(request(tiers=[tier(host_ram_gb=377.0, cards=[
+            card(UNNAMED, vram_total_gb=44.5), card(UNNAMED)])]), card_table=sent))
+        for got, how in zip(entry["cards"], ("nearest_memory", "pool_floor")):
+            self.assertEqual(got["vram_source"], how)
+            measured = got["resolved_from"]["measured"]
+            self.assertIn(measured, figures, how)
+            self.assertNotEqual(got["hardware_used"]["host_ram_gb"], figures[measured], how)
+            self.assertEqual(got["hardware_used"]["host_ram_gb"], 377.0, how)
+            self.assertEqual(got["host_ram_source"], "tier", how)
+
+    def test_no_refusal_where_the_table_names_the_card(self):
+        sent = table_with_host_ram({A40: 123.0})
+        t = tier(cards=[card(A40)])
+        del t["host_ram_gb"]
+        got = answer(dict(request(tiers=[t]), card_table=sent))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 123.0)
+        self.assertEqual(got["host_ram_source"], "table")
+
+    def test_refusal_names_the_card_with_none_of_the_three(self):
+        # The named card FIRST: a refusal that still ran before the table would stop on it.
+        sent = table_with_host_ram({A40: 123.0})
+        t = tier(cards=[card(A40), card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)])
+        del t["host_ram_gb"]
+        refused_field(self, dict(request(tiers=[t]), card_table=sent),
+                      "tiers[0].cards[1].host_ram_gb")
+
+    def test_a_sent_table_without_it_gives_tier(self):
+        # Sent table, else built-in — for the TABLE, not per field: a sent table that carries no
+        # host RAM never reaches past itself to the in-image figure.
+        self.assertIsNotNone(built_in_host_ram(A40))
+        sent = table_with_host_ram({})
+        got = answer(dict(request(tiers=[tier(host_ram_gb=377.0, cards=[card(A40)])]),
+                          card_table=sent))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 377.0)
+        self.assertEqual(got["host_ram_source"], "tier")
+        # **And with no tier figure either, it refuses** — the built-in figure is not a fourth step.
+        t = tier(cards=[card(A40)])
+        del t["host_ram_gb"]
+        refused_field(self, dict(request(tiers=[t]), card_table=sent),
+                      "tiers[0].cards[0].host_ram_gb")
+
+    def test_a_malformed_figure_is_a_malformed_table(self):
+        from service import app
+        shipped = built_in_host_ram(A40)
+        self.assertIsNotNone(shipped)
+        for bad in (0, -5.0, float("inf"), True, "46"):
+            sent = table_with_host_ram({A40: bad})
+            self.assertIsNotNone(estimator.card_table_problem(sent), repr(bad))
+            if bad == float("inf"):
+                continue  # not JSON; the structural check above is the whole case
+            body = dict(request(tiers=[tier(host_ram_gb=377.0, cards=[card(A40)])]),
+                        card_table=sent)
+            status, payload = app.route("POST", "/estimate", json.dumps(body).encode("utf-8"),
+                                        commit=None)
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(payload.get("warnings"),
+                             [estimator.resolve_card_table(sent, True)[1]], repr(bad))
+            got = payload["tiers"][0]["cards"][0]
+            self.assertEqual(got["hardware_used"]["host_ram_gb"], shipped, repr(bad))
+            self.assertEqual(got["host_ram_source"], "table", repr(bad))
+        # **null is allowed**, as for the VRAM pair: a card the table holds no host for.
+        self.assertIsNone(estimator.card_table_problem(table_with_host_ram({A40: None})))
+
+
+class WorkerNeverReadsTableHostRam(unittest.TestCase):
+    """**H1c: the worker plans from its live `hardware` reading and nothing else.** The same
+    snapshot under a table with an absurd host figure and a table with none plans identically —
+    refusal and fit alike. The service is the table's only host-RAM reader."""
+
+    SNAPSHOT = {"gpu_name": A40, "vram_total_gb": 44.43, "vram_free_gb": 44.08}
+    WORKER_JOB = {"target_short_edge_px": 1480, "source_width": 1920, "source_height": 1080,
+                  "estimated_frames": 90}
+
+    def _planned(self, host_ram_gb, table):
+        try:
+            return estimator.plan(dict(self.WORKER_JOB),
+                                  dict(self.SNAPSHOT, host_ram_gb=host_ram_gb), card_table=table)
+        except estimator.WorkerError as refusal:
+            return ("refused", refusal.code, refusal.message)
+
+    def test_the_table_figure_changes_nothing(self):
+        # A table figure ABOVE the live one, BELOW it, and a snapshot with no live reading at all
+        # (review): a worker taking the lower of the two, or falling back to the table where the
+        # reading is absent, passes the first and fails one of the others.
+        huge = table_with_host_ram({A40: 4096.0})
+        tiny = table_with_host_ram({A40: 1.0})
+        none = table_with_host_ram({})
+        for live in (8.0, 46.57, None):
+            for table in (huge, tiny):
+                self.assertEqual(self._planned(live, table), self._planned(live, none), live)
+        self.assertEqual(self._planned(8.0, huge)[0], "refused",
+                         "the live 8 GiB must refuse whatever the table says")
 
 
 class Refusals(unittest.TestCase):
@@ -821,7 +972,7 @@ class Refusals(unittest.TestCase):
                       "tiers[0].cards[1].gpu_name")
 
     def test_no_host_ram(self):
-        t = tier(cards=[card(A40)])
+        t = tier(cards=[card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)])
         del t["host_ram_gb"]
         refused_field(self, request(tiers=[t]), "tiers[0].cards[0].host_ram_gb")
 
@@ -994,7 +1145,7 @@ class Residency(unittest.TestCase):
     """On a refusal, planner.plan refuses too, and the labels follow planner.fits (§3b)."""
 
     def test_host_refusal_reports_route_up(self):
-        got = answer(request(tiers=[tier(host_ram_gb=8.0)]))
+        got = answer(request(tiers=[tier(cards=[card(A40, host_ram_gb=8.0)])]))
         self.assertFalse(got["fits"])
         self.assertIn("host RAM", got["reason"])
         verdict = got["planner_verdict"]
@@ -1024,7 +1175,7 @@ class Residency(unittest.TestCase):
         planner.plan, estimator.plan = other_reason, estimate_then_flag
         try:
             with self.assertRaises(RuntimeError):
-                answer(request(tiers=[tier(host_ram_gb=8.0)]))
+                answer(request(tiers=[tier(cards=[card(A40, host_ram_gb=8.0)])]))
         finally:
             planner.plan, estimator.plan = real_plan, real_estimate
 
@@ -1046,7 +1197,7 @@ class Residency(unittest.TestCase):
 
     def test_refusal_anchored_at_both_sides_of_the_span(self):
         for name, expected in ((H200, True), (B200, False)):
-            got = answer(request(tiers=[tier(host_ram_gb=8.0, cards=[card(name)])]))
+            got = answer(request(tiers=[tier(cards=[card(name, host_ram_gb=8.0)])]))
             self.assertFalse(got["fits"], name)
             self.assertEqual(got["vram_source"], "table", name)
             hw = got["hardware_used"]
@@ -1059,9 +1210,8 @@ class Residency(unittest.TestCase):
 
     def test_refusal_anchored_on_the_boundary(self):
         # A banked H200 reading (free 139.07) leaves usable exactly at ANCHORED_MAX_USABLE.
-        got = answer(request(tiers=[tier(host_ram_gb=8.0,
-                                         cards=[card(H200, vram_total_gb=139.8,
-                                                     vram_free_gb=139.07)])]))
+        got = answer(request(tiers=[tier(cards=[card(H200, vram_total_gb=139.8,
+                                                     vram_free_gb=139.07, host_ram_gb=8.0)])]))
         self.assertFalse(got["fits"])
         self.assertEqual(estimator._usable_vram(got["hardware_used"]),
                          planner.ANCHORED_MAX_USABLE)
@@ -1238,7 +1388,7 @@ class Projection(unittest.TestCase):
                    "registry_version", "commit")
     CARD_FIELDS = ("gpu_name", "label", "fits", "max_target", "predicted_seconds", "prediction_basis",
                    "rate_from", "timing_unavailable", "reason", "residency", "anchored", "binding_phase", "quality",
-                   "hardware_used", "vram_source", "resolved_from")
+                   "hardware_used", "vram_source", "host_ram_source", "resolved_from")
 
     def _through_http(self, body):
         from service import app
