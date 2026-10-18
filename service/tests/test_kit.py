@@ -48,6 +48,9 @@ BLACKWELL = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
 MIG = "NVIDIA RTX PRO 6000 Blackwell MIG 2g.48gb"
 #: A card no table names, so nothing but CF can give its memory or its host.
 UNNAMED = "NVIDIA Unlisted 9000"
+#: **The MIG as cards.json names it** — `MIG` above is not a name any run has reported. The full
+#: card's name is a PREFIX of this one, which is the trap an exact-name read exists to avoid.
+MIG_SERVER = "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 2g.48gb"
 
 #: Card answer field -> the rationale key it is the worker's own output of.
 PROJECTED_FROM_RATIONALE = (
@@ -871,6 +874,24 @@ class HostRamOrder(unittest.TestCase):
             self.assertNotEqual(got["hardware_used"]["host_ram_gb"], figures[measured], how)
             self.assertEqual(got["hardware_used"]["host_ram_gb"], 377.0, how)
             self.assertEqual(got["host_ram_source"], "tier", how)
+
+    def test_exact_name_is_not_a_prefix(self):
+        # The gate's probe (H1): a prefix match in either direction passed every case above.
+        # **The built-in table, read and not pinned** — the two figures must differ for the case
+        # to see anything, and that is asserted rather than assumed.
+        mig, full = built_in_host_ram(MIG_SERVER), built_in_host_ram(BLACKWELL)
+        self.assertIsNotNone(mig)
+        self.assertNotEqual(mig, full)
+        self.assertNotEqual(mig, 377.0)
+        got = answer(request(tiers=[tier(host_ram_gb=377.0, cards=[card(MIG_SERVER)])]))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], mig)
+        self.assertEqual(got["host_ram_source"], "table")
+        # A name the table does not hold that EXTENDS one it does: the tier's, never the A40's.
+        self.assertNotIn("NVIDIA A40 MIG 1g.22gb", estimator.load_card_table()["cards"])
+        got = answer(request(tiers=[tier(host_ram_gb=377.0, cards=[
+            card("NVIDIA A40 MIG 1g.22gb", vram_total_gb=22.0, vram_free_gb=21.5)])]))
+        self.assertEqual(got["hardware_used"]["host_ram_gb"], 377.0)
+        self.assertEqual(got["host_ram_source"], "tier")
 
     def test_no_refusal_where_the_table_names_the_card(self):
         sent = table_with_host_ram({A40: 123.0})
