@@ -243,7 +243,10 @@ def card_table_problem(document):
             return "a card name is empty"
         if not isinstance(entry, dict):
             return "card {!r} is not an object".format(name)
-        numbers = [(key, entry.get(key)) for key in ("vram_total_gb", "vram_free_gb")]
+        # H1: `host_ram_gb` is checked as the VRAM pair is. **The worker never reads it** — the
+        # planner service is its only reader — but a sent table carrying a bad one is malformed.
+        numbers = [(key, entry.get(key))
+                   for key in ("vram_total_gb", "vram_free_gb", "host_ram_gb")]
         rates = entry.get("mpx_per_s")
         if rates is not None:
             if not isinstance(rates, dict):
