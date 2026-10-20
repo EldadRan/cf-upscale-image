@@ -62,7 +62,8 @@ REQUEST_FIELD = "run_record"
 #: The prefix the minted key sits under. A constant here because the worker does not build the
 #: key — the minter does — but the worker's own tests and the harness both need one name for it,
 #: and the whole point of a separate kind is that it can be enumerated without meeting bundles.
-PREFIX = "runs/"
+#: CF's per-writer scheme (K1, ruled 2026-10-18): `upscale/runs/<date>/<request_id>.json`.
+PREFIX = "upscale/runs/"
 
 #: **The PUT's timeouts and its one gated retry live in `storage.put_small`**, shared with the
 #: bundle (§4d clause 3). They were 5/20 here first, and that is where the bundle's now come from.
