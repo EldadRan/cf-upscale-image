@@ -4,8 +4,8 @@
 kinds and they stay different kinds (F-2026-08-19-36, and the contract amendment of the same day).
 A bundle's *presence* is certified shorthand for "a run struggled" — the R-series verdicts read it
 that way, in evidence — so widening bundles to cover successful runs would retroactively change
-what those verdicts were reading. The run-record therefore lands under its own `runs/` prefix, and
-its presence means only that a run happened.
+what those verdicts were reading. The run-record therefore lands under its own `upscale/runs/`
+prefix, and its presence means only that a run happened.
 
 **Why the worker writes it and not the harness.** Every calibration row this project owns was
 banked client-side by `run_one.py`, which works exactly as long as a person is watching through
@@ -31,8 +31,8 @@ failed job over a bookkeeping object. Every entry point returns a value and rais
 
 **The address arrives with the request, exactly as the failure bundle's always has** (CF, ruled
 2026-08-19, superseding this module's first design). A presigned PUT URL in a `run_record` field
-beside `diagnostics`, its key under `runs/`, minted by whoever builds the request — our harness
-today, CF's front-end tomorrow.
+beside `diagnostics`, its key under `upscale/runs/`, minted by whoever builds the request — our
+harness today, CF's front-end tomorrow.
 
 An endpoint-provisioned standing credential (`RUNS_S3_*`) was built first and rejected, and the
 reasons are worth keeping: the caller owns its telemetry destination and should not have to
