@@ -40,7 +40,13 @@ def route(method, path, body, commit):
         try:
             entries = ps.estimate_core(request, commit=commit, warnings=warnings)
         except ps.Refusal as refusal:
-            return 400, {"refused": {"field": refusal.field, "message": refusal.message}}
+            # **The warning survives a 400 too** (K2b, ruled by CF 2026-10-20): since H1 a
+            # host-RAM refusal can follow a refused sent table, and a 400 without the warning
+            # would leave CF fixing a card when its table was what the service threw out.
+            refused = {"refused": {"field": refusal.field, "message": refusal.message}}
+            if warnings:
+                refused["warnings"] = warnings
+            return 400, refused
         except ps.TableUnusable as broken:
             # The service's own committed table, not the caller's request: 503, never a 400.
             #

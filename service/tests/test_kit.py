@@ -1135,6 +1135,42 @@ class CardTableRidesTheEstimate(unittest.TestCase):
             self.assertNotIn("warnings", payload)
 
 
+class WarningsSurviveA400(unittest.TestCase):
+    """**K2b: a 400 carries `warnings` when it has any** (CF, 2026-10-20; `cf-planner.md` §7
+    `warnings`). Since H1 a host-RAM refusal can follow a refused sent table — and without the
+    warning the refusal tells CF to fix the card when its table was what the service threw out."""
+
+    @staticmethod
+    def _post(body):
+        from service import app
+        return app.route("POST", "/estimate", json.dumps(body).encode("utf-8"), commit=None)
+
+    def test_a_refused_table_then_a_refusal_carries_both(self):
+        broken = table_with_host_ram({A40: 0})
+        t = tier(cards=[card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)])
+        del t["host_ram_gb"]
+        status, payload = self._post(dict(request(tiers=[t]), card_table=broken))
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(payload["refused"]["field"], "tiers[0].cards[0].host_ram_gb")
+        self.assertEqual(payload.get("warnings"),
+                         [estimator.resolve_card_table(broken, True)[1]],
+                         "the 400 dropped the warning that the sent table was refused")
+
+    def test_an_ordinary_refusal_carries_no_warnings_key(self):
+        # **ABSENT, not an empty list** — as on a 200 and a 503.
+        t = tier(cards=[card(UNNAMED, vram_total_gb=80.0, vram_free_gb=79.0)])
+        del t["host_ram_gb"]
+        for extra in ({}, {"card_table": table_with_host_ram({A40: 123.0})}):
+            status, payload = self._post(dict(request(tiers=[t]), **extra))
+            self.assertEqual(status, 400, payload)
+            self.assertIn("refused", payload)
+            self.assertNotIn("warnings", payload, extra)
+        # And a door refusal, before any table is read.
+        status, payload = self._post(request(job(output_size={"width": 2000, "height": 1000})))
+        self.assertEqual(status, 400, payload)
+        self.assertNotIn("warnings", payload)
+
+
 class StartupRefusesABrokenTable(unittest.TestCase):
     """**A broken in-image card table stops the service before the port opens** (review of W6):
     `load_card_table` returns None rather than raising, so the old startup call — `version()` —
