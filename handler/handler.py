@@ -503,6 +503,12 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
         "tile_quality": request.get("tile_quality", "default"),
         "schedule": request.get("schedule", "max_window"),
     }
+    # **The canvas the caller sent, when and only when one was sent** (R1, `api.md` §4b). The
+    # short edge above is derived from it and the plan reads that; this is for the refusal's
+    # resend option, which must name the field the caller used (ruling 1a). The planner service
+    # never sends it, so its options stay short-edge.
+    if exact_size:
+        job_shape["output_size"] = [int(exact_size[0]), int(exact_size[1])]
     # **Before the plan, because planning an impossible frame count is the cost being avoided**
     # (F-2026-08-18-15). `estimated_frames` is duration x fps off container metadata, which an
     # untrusted source controls; the schedule simulation and the chunk arithmetic are both

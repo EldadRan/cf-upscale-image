@@ -472,7 +472,9 @@ def plan(job, snapshot, card_table=None, force_rung=None, timed_as=None):
 
     `job` carries `target_short_edge_px`, `source_width`, `source_height` and `estimated_frames`
     — the last from the source's duration and rate, used for **planning and the ETA only**.
-    Every frame count this worker reports comes from the decode.
+    Every frame count this worker reports comes from the decode. `output_size`, `[w, h]`, is
+    present only when the caller sent a canvas; nothing plans from it, and only the refusal's
+    resend option reads it (`_terminal_options`).
     """
     card_table = load_card_table() if card_table is None else card_table
     width, height = output_dimensions(
@@ -899,28 +901,60 @@ def _terminal_options(job, snapshot, width, height):
     plans either, there is nothing the caller can change and `remedy: larger_gpu` beside it is
     the whole of the advice. Nothing indexes this list -- the only consumer is the `shortfall`
     dict below.
-    """
-    options = []
 
+    **`resend` is the option as a field** (R1, `api.md` §4b, CF 2026-11-11): the request field
+    exactly as the caller named it, so CF can merge it into `params` without parsing `how`.
+    **A caller who sent `output_size` is offered an `output_size`** (ruling 1a) -- never a short
+    edge it did not send. The canvas keeps the CALLER's aspect, not the source's: its short side
+    steps down the same 32 px grid, snapped even, the long side follows the canvas aspect,
+    snapped even, and each candidate plans at `short_edge_covering` exactly as the handler would
+    derive it. `job["output_size"]` is present only when the caller sent one (handler.py).
+    """
     source_w = job["source_width"]
     source_h = job["source_height"]
+    frames = max(1, int(job.get("estimated_frames") or 1))
+
+    def plans_at(short_edge):
+        return planner.plan(
+            (source_w, source_h), frames, short_edge,
+            usable_gb=_usable_vram(snapshot), host_ram_gb=snapshot.get("host_ram_gb"),
+            gpu_name=snapshot.get("gpu_name"))
+
+    canvas = job.get("output_size")
+    if canvas:
+        canvas_w, canvas_h = int(canvas[0]), int(canvas[1])
+        canvas_short, canvas_long = min(canvas_w, canvas_h), max(canvas_w, canvas_h)
+        short_side = canvas_short
+        while short_side > 64:
+            short_side = (short_side - 32) // 2 * 2
+            long_side = int(round(short_side * canvas_long / float(canvas_short))) // 2 * 2
+            out_w, out_h = ((long_side, short_side) if canvas_w >= canvas_h
+                            else (short_side, long_side))
+            answer = plans_at(short_edge_covering(source_w, source_h, out_w, out_h))
+            if answer["action"] == "plan":
+                return [{
+                    "option": "reduce_target_resolution",
+                    "resend": {"output_size": {"width": out_w, "height": out_h}},
+                    "how": "resend with output_size {}x{}".format(out_w, out_h),
+                    "cost": "delivers {}x{} instead of {}x{}, at a window of {} frames".format(
+                        out_w, out_h, canvas_w, canvas_h, answer["w"]),
+                }]
+        return []
+
     short_edge = int(job["target_short_edge_px"])
     while short_edge > 64:
         short_edge = (short_edge - 32) // 2 * 2
         out_w, out_h = output_dimensions(source_w, source_h, short_edge)
-        answer = planner.plan(
-            (source_w, source_h), max(1, int(job.get("estimated_frames") or 1)), short_edge,
-            usable_gb=_usable_vram(snapshot), host_ram_gb=snapshot.get("host_ram_gb"),
-            gpu_name=snapshot.get("gpu_name"))
+        answer = plans_at(short_edge)
         if answer["action"] == "plan":
-            options.insert(0, {
+            return [{
                 "option": "reduce_target_resolution",
+                "resend": {"target_short_edge_px": short_edge},
                 "how": "resend with target_short_edge_px={}".format(short_edge),
                 "cost": "delivers {}x{} instead of {}x{}, at a window of {} frames".format(
                     out_w, out_h, width, height, answer["w"]),
-            })
-            break
-    return options
+            }]
+    return []
 
 
 class DeadlineWatch:
