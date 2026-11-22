@@ -1528,7 +1528,7 @@ class Isolation(unittest.TestCase):
         self.assertEqual(_git("status", "--porcelain", "--", "handler/"), "")
 
     def test_image_context_is_handler(self):
-        with open(os.path.join(REPO_ROOT, ".github", "workflows", "docker-publish.yml"),
+        with open(os.path.join(REPO_ROOT, ".github", "workflows", "build.yml"),
                   encoding="utf-8") as handle:
             workflow = handle.read()
         contexts = set(re.findall(r"^\s*context:\s*(\S+)", workflow, re.M))
