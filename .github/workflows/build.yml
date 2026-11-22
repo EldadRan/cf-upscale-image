@@ -39,6 +39,10 @@ on:
         description: "SEEDVR2_MODEL build argument — the one checkpoint baked into the image"
         type: string
         required: true
+      bake_weights:
+        description: "BAKE_WEIGHTS build argument — \"1\" bakes the weights, \"0\" fetches them at start (X4)"
+        type: string
+        default: "1"
 
 env:
   # Python 3.11 because that is what the base image ships. **It has exactly one consumer left:**
@@ -338,6 +342,7 @@ jobs:
           PACKAGE: ${{ inputs.package }}
           BASE_INPUT: ${{ inputs.base_image }}
           MODEL_INPUT: ${{ inputs.seedvr2_model }}
+          BAKE_INPUT: ${{ inputs.bake_weights }}
         run: |
           set -euo pipefail
           refuse() { echo "$*" >&2; exit 1; }
@@ -374,6 +379,16 @@ jobs:
              && { [ "$BASE_INPUT" != "$default_base" ] || [ "$MODEL_INPUT" != "$default_model" ]; }; then
             refuse "cf-upscale-7b-fp16-runpod is the Dockerfile's no-argument build; got $BASE_INPUT / $MODEL_INPUT"
           fi
+          # **Which images bake (X4, CF 2026-11-22)**: the RunPod image always does — it is the
+          # Dockerfile's no-argument build; the Vast image never does, it fetches at start.
+          case "$BAKE_INPUT" in
+            0|1) ;;
+            *) refuse "bake_weights must be 0 or 1, got '$BAKE_INPUT'" ;;
+          esac
+          case "$base_label:$BAKE_INPUT" in
+            runpod:1|vast-mini:0) ;;
+            *) refuse "$PACKAGE with bake_weights=$BAKE_INPUT — runpod images bake (1), vast-mini images fetch (0)" ;;
+          esac
           IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$PACKAGE"
           ref="$IMAGE:sha-$GITHUB_SHA"
           {
@@ -381,6 +396,7 @@ jobs:
             echo "BASE_IMAGE=$BASE_INPUT"
             echo "SEEDVR2_MODEL=$MODEL_INPUT"
             echo "PYTHON_VENV=$venv"
+            echo "BAKE_WEIGHTS=$BAKE_INPUT"
             echo "IMAGE_REF=$ref"
             echo "TAGS<<TAGS_EOF"
             echo "$IMAGE:latest"
@@ -391,6 +407,7 @@ jobs:
           echo "base:    $BASE_INPUT"
           echo "model:   $MODEL_INPUT"
           echo "venv:    ${venv:-(none)}"
+          echo "bake:    $BAKE_INPUT"
           echo "tags:    $IMAGE:latest $ref"
 
       # **THREE ATTEMPTS, AND ONLY THE LAST ONE IS COLD (C13, CF 2026-08-31).** One dropped
@@ -427,6 +444,7 @@ jobs:
             BASE_IMAGE=${{ env.BASE_IMAGE }}
             SEEDVR2_MODEL=${{ env.SEEDVR2_MODEL }}
             PYTHON_VENV=${{ env.PYTHON_VENV }}
+            BAKE_WEIGHTS=${{ env.BAKE_WEIGHTS }}
             IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
@@ -457,6 +475,7 @@ jobs:
             BASE_IMAGE=${{ env.BASE_IMAGE }}
             SEEDVR2_MODEL=${{ env.SEEDVR2_MODEL }}
             PYTHON_VENV=${{ env.PYTHON_VENV }}
+            BAKE_WEIGHTS=${{ env.BAKE_WEIGHTS }}
             IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
@@ -478,6 +497,7 @@ jobs:
             BASE_IMAGE=${{ env.BASE_IMAGE }}
             SEEDVR2_MODEL=${{ env.SEEDVR2_MODEL }}
             PYTHON_VENV=${{ env.PYTHON_VENV }}
+            BAKE_WEIGHTS=${{ env.BAKE_WEIGHTS }}
             IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}

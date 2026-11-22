@@ -62,6 +62,7 @@ import progress as progress_module
 import runrecord
 import storage
 import validation
+import weights
 from errors import FIELD_NOT_SUPPORTED, WorkerError
 
 WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
@@ -820,6 +821,27 @@ def _run(request, job, machine, warnings, attempts, workdir, progress, captured,
     import_s = time.time() - load_started
     load_strip["import_s"] = round(import_s, 1)
     print("[load] vendored import complete in {:.1f}s".format(import_s))
+
+    # **The weights, present and verified before anything loads them (X4, CF 2026-11-22).** An
+    # image that baked them says so and this is a no-op recorded as `baked`; one that did not —
+    # the Vast fp8 image — fetches them from HuggingFace at the pinned revision, checks size and
+    # sha256, and refuses cleanly if it cannot. **Its time is recorded apart from the strip's
+    # `prepare_s` and from the job's phases** (`load_strip.weights.download_s` / `verify_s`), so
+    # a download is never read as a slow card. Placed after the vendored import because the
+    # repository each file lives in is read from the vendored registry.
+    weights_record = load_strip.setdefault("weights", {})
+    if weights.fetching():
+        progress.phase("load", pct=2, force=True, note="weights_fetch")
+        print("[load] weights are not baked into this image: fetching and verifying them")
+    weights.ensure(pipeline._model_dir(), MODEL_BUILD, into=weights_record,
+                   on_bytes=lambda done: progress.phase("load", pct=2, note="weights_fetch",
+                                                        weights_bytes=done))
+    if weights_record.get("source") == "fetched":
+        print("[load] weights ready: {} bytes downloaded in {:.1f}s, verified in {:.1f}s ({})"
+              .format(weights_record.get("bytes"), weights_record.get("download_s") or 0,
+                      weights_record.get("verify_s") or 0,
+                      ", ".join("{} {}".format(name, entry.get("how"))
+                                for name, entry in weights_record.get("files", {}).items())))
 
     # **The weights are measured on every run, whether or not anyone is watching.** The strip's
     # two halves have very different causes — an import that is CPU and page-cache bound, and a

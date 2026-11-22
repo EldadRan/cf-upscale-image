@@ -205,8 +205,19 @@ print('release seams OK: colour pyramid patchable, bfloat16 handoff removed, wei
 # This is the only place the real cost of the weights is visible: every earlier disk figure in
 # docs/decisions.md 3.5 is about the base, and no build had reached this line when the size
 # projections there were written.
+#
+# **Whether to bake at all is a build argument (X4, CF 2026-11-22), on by default.** The Vast fp8
+# image turns it off and fetches the weights at start instead (`weights.py`): a Docker layer retry
+# restarts a 6.66 GB blob from zero, and the X1 test spent 20+ minutes on exactly that, where a
+# resumable fetch picks up where it stopped. Off, this RUN writes nothing — an empty layer — and
+# `bake_weights.py` is still copied, because it is where the runtime fetch reads its pins.
+ARG BAKE_WEIGHTS=1
 COPY bake_weights.py ./
 RUN set -eux; \
+    if [ "$BAKE_WEIGHTS" != "1" ]; then \
+        echo "BAKE_WEIGHTS=$BAKE_WEIGHTS: no weights baked; the worker fetches and verifies them at start"; \
+        exit 0; \
+    fi; \
     echo "--- disk before the bake ---"; df -h /; \
     python3 bake_weights.py; \
     echo "--- disk after the bake ---"; df -h /; \
@@ -225,7 +236,12 @@ RUN set -eux; \
 # bake is ever made conditional, this must move with it: an image that claims baked weights it
 # does not have would skip the validation of a file that really is missing — which the patch's
 # surviving `os.path.exists` guard then catches, but the honest place to be right is here.
-ENV SEEDVR2_WEIGHTS_BAKED=1
+#
+# **It follows `BAKE_WEIGHTS` (X4)**: `1` when the layer above holds the weights, `0` when it does
+# not. A single-stage Dockerfile cannot leave an `ENV` unset on one branch, so the unbaked image
+# carries `0` — and every reader of the flag (the vendored skip in `vendor_patch.py`, `weights.py`)
+# tests for exactly `"1"`, so `0` claims nothing.
+ENV SEEDVR2_WEIGHTS_BAKED=${BAKE_WEIGHTS}
 
 # ── build identity ──────────────────────────────────────────────────────────────────────────
 # **An image that cannot say what it is makes every measurement taken on it an assertion.** The

@@ -52,7 +52,12 @@ Each has its own workflow, dispatched by hand with no inputs, and its own packag
 | `publish-7b-fp8-vast-mini.yml` | `cf-upscale-7b-fp8-vast-mini` | Vast `vastai/pytorch` mini | 7B fp8 mixed — Vast stills |
 
 Both call one reusable build, `.github/workflows/build.yml`, which refuses a package name that
-does not describe the pair it is given. The older `cf-upscale-image` package is left as it was;
+does not describe the pair it is given.
+
+**The RunPod image bakes its weights; the Vast image does not (X4).** It builds with
+`BAKE_WEIGHTS=0` and `handler/weights.py` fetches the checkpoint and VAE from HuggingFace at start
+— pinned revision, size and sha256 from `bake_weights.py`, resumable ranges, hashed once per host,
+the fetch's bytes and seconds in the run record under `load_strip.weights`. The older `cf-upscale-image` package is left as it was;
 the endpoints pinned to it stay pinned until they are re-pinned.
 
 The workflows have **no `push` trigger, deliberately** — not every commit is meant to become an
@@ -77,7 +82,7 @@ and `BUILD_UTC` at build time and reports them in every run record, so a measure
 be traced to the bytes that produced it.
 
 Expect a build to take tens of minutes. The 7B fp16 RunPod image is roughly 24 GiB compressed and
-the 7B fp8 Vast image roughly 12.5 GiB; the weights are most of either.
+the 7B fp8 Vast image, which carries no weights, is the base and code alone.
 
 To build the RunPod image locally (the Dockerfile's no-argument build):
 

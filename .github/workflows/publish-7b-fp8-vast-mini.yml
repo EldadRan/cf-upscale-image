@@ -27,3 +27,6 @@ jobs:
       package: cf-upscale-7b-fp8-vast-mini
       base_image: vastai/pytorch:2.8.0-cu128-cuda-12.9-mini-py311-2026-10-23
       seedvr2_model: seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors
+      # **No weights layer (X4, CF 2026-11-22)**: the worker fetches them from HuggingFace at start,
+      # resumably, where a Docker layer retry restarts from zero.
+      bake_weights: "0"

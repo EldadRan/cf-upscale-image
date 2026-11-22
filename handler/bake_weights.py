@@ -23,13 +23,17 @@ script runs.
 large to bake two, so a different checkpoint is a different build of this repo. Anything not
 baked would download at runtime on first use and, with no volume, re-download on every cold
 start — a per-job cost, billed, on a path nobody chose.
+
+**Except where it is chosen (X4, CF 2026-11-22).** The Vast fp8 image builds with
+`BAKE_WEIGHTS=0` and `weights.py` fetches the two files at start instead — resumably, verified
+against the same `REVISIONS` and `EXPECTED` below, hashed once per host. **This file stays the
+one home of the pins**: the bake runs `main()` as a script; the fetch imports the constants.
 """
 
 import hashlib
 import os
 import sys
 
-from huggingface_hub import hf_hub_download
 
 #: **The weights are pinned by commit, not by branch — one commit per repository.** Without this
 #: the build took whatever `main` held on the day, and an upstream content change would have been
@@ -87,104 +91,114 @@ def sha256_of(path):
 #: Shared across every DiT variant, so it is baked whichever checkpoint is selected.
 VAE_FILE = "ema_vae_fp16.safetensors"
 
-model_dir = os.environ["SEEDVR2_MODEL_DIR"]
-dit_file = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
 
-# **REFUSED HERE, BEFORE ANYTHING IS FETCHED (CF's ruling, 2026-08-28).** Naming the shared VAE as
-# the DiT is the one build-arg value that makes this script ship an image with no model in it and
-# report success. The whole chain is below and every link works as written:
-#
-#   `files` collapses to a single entry, so only the VAE is ever downloaded;
-#   the size and hash assertions pass, because the VAE really is the VAE;
-#   the total is right, the listing is right, and every printed line is true;
-#   and the final guard asks `isfile(model_dir/dit_file)` -- which is the VAE's own path, present
-#   because it was just fetched. **The guard is satisfied BY the file whose presence is the
-#   evidence that the DiT is missing.**
-#
-# **CF ruled the fix here rather than at that guard**, and the reason is that the guard is not
-# wrong. `dit_file` names a checkpoint; asking whether the named checkpoint arrived is exactly
-# the right question, and it answers correctly for every input except one that is a category
-# error before it is a bug. Hardening it would encode "the DiT must not be the VAE" as a
-# post-download detection, which treats a nonsensical request as a configuration to be caught
-# late instead of one to be rejected on sight. A build-arg naming the VAE as the model is never
-# a thing anyone meant.
-if dit_file == VAE_FILE:
-    # **`dit_file`, not `VAE_FILE`, even though this branch proves them equal.** Reporting the
-    # constant back instead of what the caller actually passed is correct only for as long as the
-    # comparison stays exact string equality — and the obvious next change here is to loosen it.
-    # A message that echoes a constant is a number belonging to something else.
-    sys.exit(
-        "SEEDVR2_MODEL={0} names the shared VAE as the DiT checkpoint, which is not a "
-        "configuration this image can have.\n"
-        "  The VAE is baked unconditionally alongside whichever DiT is selected, so this would "
-        "download one file, verify it correctly, and produce an image with no model in it -- and "
-        "every check downstream would pass, because the checkpoint's own presence test would be "
-        "satisfied by the VAE sitting at that path.\n"
-        "  Pass a DiT checkpoint name, or omit the build-arg for the default.".format(dit_file))
+def main():
+    """The bake. **Only when run as a script**: `weights.py` imports this module for its pins
+    (X4, CF 2026-11-22), and an import that downloaded 16 GB would be a strange side effect."""
+    from huggingface_hub import hf_hub_download  # noqa: PLC0415 — build-time only
 
-# The vendored registry is a package under the SeedVR2 tree, imported as `src.utils...` the way
-# the Dockerfile's own checks import it.
-sys.path.insert(0, os.environ["SEEDVR2_DIR"])
-from src.utils.model_registry import get_model_repo  # noqa: E402
+    model_dir = os.environ["SEEDVR2_MODEL_DIR"]
+    dit_file = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
 
-os.makedirs(model_dir, exist_ok=True)
+    # **REFUSED HERE, BEFORE ANYTHING IS FETCHED (CF's ruling, 2026-08-28).** Naming the shared VAE as
+    # the DiT is the one build-arg value that makes this script ship an image with no model in it and
+    # report success. The whole chain is below and every link works as written:
+    #
+    #   `files` collapses to a single entry, so only the VAE is ever downloaded;
+    #   the size and hash assertions pass, because the VAE really is the VAE;
+    #   the total is right, the listing is right, and every printed line is true;
+    #   and the final guard asks `isfile(model_dir/dit_file)` -- which is the VAE's own path, present
+    #   because it was just fetched. **The guard is satisfied BY the file whose presence is the
+    #   evidence that the DiT is missing.**
+    #
+    # **CF ruled the fix here rather than at that guard**, and the reason is that the guard is not
+    # wrong. `dit_file` names a checkpoint; asking whether the named checkpoint arrived is exactly
+    # the right question, and it answers correctly for every input except one that is a category
+    # error before it is a bug. Hardening it would encode "the DiT must not be the VAE" as a
+    # post-download detection, which treats a nonsensical request as a configuration to be caught
+    # late instead of one to be rejected on sight. A build-arg naming the VAE as the model is never
+    # a thing anyone meant.
+    if dit_file == VAE_FILE:
+        # **`dit_file`, not `VAE_FILE`, even though this branch proves them equal.** Reporting the
+        # constant back instead of what the caller actually passed is correct only for as long as the
+        # comparison stays exact string equality — and the obvious next change here is to loosen it.
+        # A message that echoes a constant is a number belonging to something else.
+        sys.exit(
+            "SEEDVR2_MODEL={0} names the shared VAE as the DiT checkpoint, which is not a "
+            "configuration this image can have.\n"
+            "  The VAE is baked unconditionally alongside whichever DiT is selected, so this would "
+            "download one file, verify it correctly, and produce an image with no model in it -- and "
+            "every check downstream would pass, because the checkpoint's own presence test would be "
+            "satisfied by the VAE sitting at that path.\n"
+            "  Pass a DiT checkpoint name, or omit the build-arg for the default.".format(dit_file))
 
-total = 0.0
-# **Two files, always, because the collision that made this a branch is now refused above.**
-#
-# This line used to read `(dit_file,) if dit_file == VAE_FILE else (dit_file, VAE_FILE)`, and the
-# history is kept because the collision it de-duplicated is real and the reason it mattered is not
-# obvious: `dit_file` is whatever the build-arg names and `VAE_FILE` is a constant, so the two
-# could be the same string, and the tuple then iterated it twice. `hf_hub_download` short-circuits
-# on the second pass, so nothing was fetched twice and nothing failed — **only `total` was wrong,
-# too large by one file, in the number CF reads for cold-start and container-disk cost.**
-#
-# **De-duplicating was the wrong layer, and that is the whole finding.** It made the collision
-# survivable and therefore silent, which is what let it go on to produce a model-less image that
-# reported success. The refusal above removes the collision instead of accommodating it, so this
-# branch has nothing left to decide.
-files = (dit_file, VAE_FILE)
-for filename in files:
-    repo = get_model_repo(filename)
-    if repo not in REVISIONS:
-        sys.exit("{}: the vendored registry places it in {}, which has no pinned revision here. "
-                 "Pin one in REVISIONS rather than fetching whatever its main holds.".format(
-                     filename, repo))
-    print("fetching {} from {} @ {}".format(filename, repo, REVISIONS[repo]), flush=True)
-    path = hf_hub_download(repo_id=repo, filename=filename, local_dir=model_dir,
-                           revision=REVISIONS[repo])
-    size = os.path.getsize(path)
-    size_gb = size / (1024 ** 3)
-    total += size_gb
+    # The vendored registry is a package under the SeedVR2 tree, imported as `src.utils...` the way
+    # the Dockerfile's own checks import it.
+    sys.path.insert(0, os.environ["SEEDVR2_DIR"])
+    from src.utils.model_registry import get_model_repo  # noqa: E402
 
-    # **The assertion is what gives the recorded hash a job.** A number written down and never
-    # compared against is the shape of a fact that rots unnoticed; this is the comparison. Size
-    # first because it is free and a truncated download is the common failure, then the hash.
-    expected = EXPECTED.get(filename)
-    if expected is None:
-        print("WARNING: {} has no recorded size or hash — baked UNVERIFIED. The calibration key "
-              "names the 7B model and the shared VAE; a different --build-arg SEEDVR2_MODEL is "
-              "a different checkpoint and nothing here can vouch for it.".format(filename),
-              flush=True)
-    else:
-        want_size, want_sha = expected
-        if size != want_size:
-            sys.exit("{}: expected {} bytes, got {}. The pin resolved to different content than "
-                     "the calibration measured.".format(filename, want_size, size))
-        got_sha = sha256_of(path)
-        if got_sha != want_sha:
-            sys.exit("{}: sha256 mismatch.\n  expected {}\n  got      {}\nThe pin resolved to "
-                     "different content than the calibration measured.".format(
-                         filename, want_sha, got_sha))
-        print("verified {} {} bytes sha256 {}".format(filename, size, got_sha), flush=True)
+    os.makedirs(model_dir, exist_ok=True)
 
-    print("baked {} -> {} ({:.2f} GB)".format(filename, path, size_gb), flush=True)
+    total = 0.0
+    # **Two files, always, because the collision that made this a branch is now refused above.**
+    #
+    # This line used to read `(dit_file,) if dit_file == VAE_FILE else (dit_file, VAE_FILE)`, and the
+    # history is kept because the collision it de-duplicated is real and the reason it mattered is not
+    # obvious: `dit_file` is whatever the build-arg names and `VAE_FILE` is a constant, so the two
+    # could be the same string, and the tuple then iterated it twice. `hf_hub_download` short-circuits
+    # on the second pass, so nothing was fetched twice and nothing failed — **only `total` was wrong,
+    # too large by one file, in the number CF reads for cold-start and container-disk cost.**
+    #
+    # **De-duplicating was the wrong layer, and that is the whole finding.** It made the collision
+    # survivable and therefore silent, which is what let it go on to produce a model-less image that
+    # reported success. The refusal above removes the collision instead of accommodating it, so this
+    # branch has nothing left to decide.
+    files = (dit_file, VAE_FILE)
+    for filename in files:
+        repo = get_model_repo(filename)
+        if repo not in REVISIONS:
+            sys.exit("{}: the vendored registry places it in {}, which has no pinned revision here. "
+                     "Pin one in REVISIONS rather than fetching whatever its main holds.".format(
+                         filename, repo))
+        print("fetching {} from {} @ {}".format(filename, repo, REVISIONS[repo]), flush=True)
+        path = hf_hub_download(repo_id=repo, filename=filename, local_dir=model_dir,
+                               revision=REVISIONS[repo])
+        size = os.path.getsize(path)
+        size_gb = size / (1024 ** 3)
+        total += size_gb
 
-# Reported because image size is a cold-start cost and a container-disk cost, and CF is waiting
-# on both figures (handoff §9). A number printed by the build is one nobody has to estimate.
-print("baked {:.2f} GB into {} -> {}".format(total, model_dir, sorted(os.listdir(model_dir))),
-      flush=True)
+        # **The assertion is what gives the recorded hash a job.** A number written down and never
+        # compared against is the shape of a fact that rots unnoticed; this is the comparison. Size
+        # first because it is free and a truncated download is the common failure, then the hash.
+        expected = EXPECTED.get(filename)
+        if expected is None:
+            print("WARNING: {} has no recorded size or hash — baked UNVERIFIED. The calibration key "
+                  "names the 7B model and the shared VAE; a different --build-arg SEEDVR2_MODEL is "
+                  "a different checkpoint and nothing here can vouch for it.".format(filename),
+                  flush=True)
+        else:
+            want_size, want_sha = expected
+            if size != want_size:
+                sys.exit("{}: expected {} bytes, got {}. The pin resolved to different content than "
+                         "the calibration measured.".format(filename, want_size, size))
+            got_sha = sha256_of(path)
+            if got_sha != want_sha:
+                sys.exit("{}: sha256 mismatch.\n  expected {}\n  got      {}\nThe pin resolved to "
+                         "different content than the calibration measured.".format(
+                             filename, want_sha, got_sha))
+            print("verified {} {} bytes sha256 {}".format(filename, size, got_sha), flush=True)
 
-if not os.path.isfile(os.path.join(model_dir, dit_file)):
-    print("the requested checkpoint is not present after the download", file=sys.stderr)
-    raise SystemExit(1)
+        print("baked {} -> {} ({:.2f} GB)".format(filename, path, size_gb), flush=True)
+
+    # Reported because image size is a cold-start cost and a container-disk cost, and CF is waiting
+    # on both figures (handoff §9). A number printed by the build is one nobody has to estimate.
+    print("baked {:.2f} GB into {} -> {}".format(total, model_dir, sorted(os.listdir(model_dir))),
+          flush=True)
+
+    if not os.path.isfile(os.path.join(model_dir, dit_file)):
+        print("the requested checkpoint is not present after the download", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
