@@ -68,6 +68,12 @@ jobs:
   # worth knowing when reading what it does and does not check.
   toolchain-gate:
     runs-on: ubuntu-latest
+    # **Read-only, explicitly (X2 review).** A called job with no `permissions:` of its own takes
+    # the caller's grant, and the callers grant `packages: write` for `publish`. This job runs
+    # third-party code — the drift job an UNPINNED ffmpeg master — after a checkout that stores the
+    # token, so it must not hold a token that can push an image.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -150,6 +156,12 @@ jobs:
   # reports them; it runs no tests, and never usefully did.
   toolchain-drift:
     runs-on: ubuntu-latest
+    # **Read-only, explicitly (X2 review).** A called job with no `permissions:` of its own takes
+    # the caller's grant, and the callers grant `packages: write` for `publish`. This job runs
+    # third-party code — the drift job an UNPINNED ffmpeg master — after a checkout that stores the
+    # token, so it must not hold a token that can push an image.
+    permissions:
+      contents: read
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
