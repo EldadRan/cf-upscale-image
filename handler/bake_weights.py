@@ -6,11 +6,18 @@ datacentres, which often do not overlap with GPU availability**, so baking is wh
 endpoint run wherever there is a free card. On a worker whose whole design is about landing on a
 card with enough memory, being able to use any datacentre's free cards is the point.
 
-**Downloaded directly from HuggingFace rather than through SeedVR2's own downloader**, which
-imports the model registry and with it the DiT/VAE torch classes and their optional attention
-backends — a chain that can fail at build time for reasons unrelated to the files. Downloading
-plain files avoids it. The repo id and filenames mirror `src/utils/model_registry.py` at the
-pinned commit, and the destination is what the runtime pipeline reads.
+**Downloaded directly from HuggingFace rather than through SeedVR2's own downloader**, which adds
+its own validation and cache on top of the fetch. The filenames mirror
+`src/utils/model_registry.py` at the pinned commit, and the destination is what the runtime
+pipeline reads.
+
+**The repository each file comes from is READ from that registry** (`get_model_repo`, X1b, CF
+2026-11-22), not written down a second time here: the 7B fp8 mixed checkpoint lives in
+`AInVFX/`, the fp16 one and the VAE in `numz/`, and a hard-coded repo would be a second copy of a
+fact the vendored tree already holds. Importing the registry pulls the DiT/VAE torch classes, which
+used to be the reason to avoid it — but the Dockerfile's `import inference_cli` check above the
+bake already imports that chain and stops the build if it cannot, so the risk is paid before this
+script runs.
 
 **One model per image**, and which one is `--build-arg SEEDVR2_MODEL=…`. The weights are too
 large to bake two, so a different checkpoint is a different build of this repo. Anything not
@@ -24,14 +31,19 @@ import sys
 
 from huggingface_hub import hf_hub_download
 
-REPO = "numz/SeedVR2_comfyUI"
-
-#: **The weights are pinned by commit, not by branch.** Without this the build took whatever
-#: `main` held on the day, and an upstream content change would have been invisible: same
-#: filename, same size class, same green build, different numbers out of every coefficient in
-#: the calibration. A commit sha cannot be force-pushed to different contents, so this is the
-#: strong half of the pin; the hashes below are what make it checkable from inside the build.
-REVISION = "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
+#: **The weights are pinned by commit, not by branch — one commit per repository.** Without this
+#: the build took whatever `main` held on the day, and an upstream content change would have been
+#: invisible: same filename, same size class, same green build, different numbers out of every
+#: coefficient in the calibration. A commit sha cannot be force-pushed to different contents, so
+#: this is the strong half of the pin; the hashes below are what make it checkable from inside the
+#: build. **A repository with no revision here is refused**, never fetched from `main`.
+#:
+#: `AInVFX/`'s commit was read from HuggingFace on 2026-11-22: its tree at that commit lists the
+#: fp8 mixed file at the size and sha256 `EXPECTED` records.
+REVISIONS = {
+    "numz/SeedVR2_comfyUI": "09ced71023636e9bc8cdf9cdecfb2625d1e691e8",
+    "AInVFX/SeedVR2_comfyUI": "ac66d6d98fa49975d893b58c55bff7677191c862",
+}
 
 #: filename -> (bytes, sha256).
 #:
@@ -42,12 +54,20 @@ REVISION = "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
 #: out on the runner at all. Anything that changes there has to be brought here by hand until
 #: something generates this block.
 #:
-#: The pair sums to 15.81 GiB, which is what `deployment.md` records as the baked weight size —
-#: so these identify the files in the live image rather than an intention.
+#: The fp16 pair sums to 15.81 GiB, which is what `deployment.md` records as the baked weight
+#: size — so those identify the files in the live image rather than an intention.
+#:
+#: **The fp8 mixed entry is NOT a calibration copy** (X1b, CF 2026-11-22). It is the vendored
+#: registry's 7B fp8 (`model_registry.py`, sha256 there) with HuggingFace's byte count, for the
+#: Vast stills build; nothing has been calibrated on it. No other checkpoint is added.
 EXPECTED = {
     "seedvr2_ema_7b_fp16.safetensors": (
         16479334424,
         "7b8241aa957606ab6cfb66edabc96d43234f9819c5392b44d2492d9f0b0bbe4a",
+    ),
+    "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors": (
+        8466296338,
+        "3d68b5ec0b295ae28092e355c8cad870edd00b817b26587d0cb8f9dd2df19bb2",
     ),
     "ema_vae_fp16.safetensors": (
         501324814,
@@ -102,6 +122,11 @@ if dit_file == VAE_FILE:
         "satisfied by the VAE sitting at that path.\n"
         "  Pass a DiT checkpoint name, or omit the build-arg for the default.".format(dit_file))
 
+# The vendored registry is a package under the SeedVR2 tree, imported as `src.utils...` the way
+# the Dockerfile's own checks import it.
+sys.path.insert(0, os.environ["SEEDVR2_DIR"])
+from src.utils.model_registry import get_model_repo  # noqa: E402
+
 os.makedirs(model_dir, exist_ok=True)
 
 total = 0.0
@@ -120,8 +145,14 @@ total = 0.0
 # branch has nothing left to decide.
 files = (dit_file, VAE_FILE)
 for filename in files:
-    path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir,
-                           revision=REVISION)
+    repo = get_model_repo(filename)
+    if repo not in REVISIONS:
+        sys.exit("{}: the vendored registry places it in {}, which has no pinned revision here. "
+                 "Pin one in REVISIONS rather than fetching whatever its main holds.".format(
+                     filename, repo))
+    print("fetching {} from {} @ {}".format(filename, repo, REVISIONS[repo]), flush=True)
+    path = hf_hub_download(repo_id=repo, filename=filename, local_dir=model_dir,
+                           revision=REVISIONS[repo])
     size = os.path.getsize(path)
     size_gb = size / (1024 ** 3)
     total += size_gb

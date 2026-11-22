@@ -24,7 +24,21 @@ on:
   # **cancelled it**. A stray commit killed a build that had been asked for on purpose, twice in
   # one session.
   pull_request:
+  # **Two inputs, defaulting to what ships today (X1c, CF 2026-11-22)**: the base image and the
+  # baked checkpoint, both Dockerfile build arguments. **The defaults are copies of the
+  # Dockerfile's `ARG` defaults and `tests/run_local.py` asserts they agree**; the tag step below
+  # also compares the inputs against the Dockerfile itself, so a drifted default is a refused or
+  # renamed build rather than a quiet one. A dispatch with no inputs is the RunPod build, unchanged.
   workflow_dispatch:
+    inputs:
+      base_image:
+        description: "BASE_IMAGE build argument — a pinned, dated tag; never :latest"
+        type: string
+        default: runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+      seedvr2_model:
+        description: "SEEDVR2_MODEL build argument — the one checkpoint baked into the image"
+        type: string
+        default: seedvr2_ema_7b_fp16.safetensors
 
 # **One build per ref at a time, and the newest wins.** Two pushes in quick succession otherwise
 # run two publishes concurrently, racing to push the same `:latest` tag — the loser can land last
@@ -303,6 +317,74 @@ jobs:
           # value on every layer rebuild and would invalidate everything below it.
           echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
+      # **A non-default build can never be mistaken for the RunPod image (X1c).** The default pair
+      # gets today's tags, `:latest` and `:sha-<commit>`. The 7B fp8 mixed checkpoint gets
+      # `:sha-<commit>-stills-7b-fp8` and NEVER `:latest` — `:latest` is also the build cache
+      # every RunPod publish reads. **Any other pair is refused**, because no tag names it.
+      #
+      # "Default" is read from `handler/Dockerfile`, not from the input defaults above, so this
+      # compares against what a no-argument build would actually bake. `IMAGE_REF` is what the
+      # image reports as `build.image` on every run record, so the test job names its own tag.
+      #
+      # Inputs arrive through `env:`, never interpolated into the script, so a value cannot run.
+      - name: Compute the tags, and refuse a combination no tag names
+        env:
+          BASE_INPUT: ${{ inputs.base_image }}
+          MODEL_INPUT: ${{ inputs.seedvr2_model }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          default_base=$(sed -n 's/^ARG BASE_IMAGE=//p' handler/Dockerfile)
+          default_model=$(sed -n 's/^ARG SEEDVR2_MODEL=//p' handler/Dockerfile)
+          if [ -z "$default_base" ] || [ -z "$default_model" ]; then
+            echo "could not read the BASE_IMAGE / SEEDVR2_MODEL defaults from handler/Dockerfile" >&2
+            exit 1
+          fi
+          if [ -z "$BASE_INPUT" ] || [ -z "$MODEL_INPUT" ]; then
+            echo "base_image and seedvr2_model must both be set (got '$BASE_INPUT' / '$MODEL_INPUT')" >&2
+            exit 1
+          fi
+          # A base is pinned to a dated tag. `latest`, or no tag at all, moves under the build.
+          case "$BASE_INPUT" in
+            *:latest|*@latest) echo "base_image $BASE_INPUT is :latest — pin a dated tag" >&2; exit 1 ;;
+          esac
+          # The last path segment holds the tag or the digest; a bare name holds neither.
+          case "${BASE_INPUT##*/}" in
+            *:*) ;;
+            *) echo "base_image $BASE_INPUT carries no tag — pin a dated one" >&2; exit 1 ;;
+          esac
+          if [ "$BASE_INPUT" = "$default_base" ] && [ "$MODEL_INPUT" = "$default_model" ]; then
+            ref="$IMAGE:sha-$GITHUB_SHA"
+            tags="$IMAGE:latest
+          $ref"
+          elif [ "$MODEL_INPUT" = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors" ]; then
+            ref="$IMAGE:sha-$GITHUB_SHA-stills-7b-fp8"
+            tags="$ref"
+          else
+            echo "no tag names base=$BASE_INPUT model=$MODEL_INPUT — the default pair or the 7B fp8" >&2
+            echo "mixed checkpoint only (X1c). Naming a new variant is an order, not an input." >&2
+            exit 1
+          fi
+          # **Vast's images keep Python in `/venv/main`** (the Dockerfile's `PYTHON_VENV` note).
+          # Empty for every other base, which is the Dockerfile's own default.
+          case "$BASE_INPUT" in
+            vastai/*) venv=/venv/main ;;
+            *) venv= ;;
+          esac
+          {
+            echo "BASE_IMAGE=$BASE_INPUT"
+            echo "SEEDVR2_MODEL=$MODEL_INPUT"
+            echo "PYTHON_VENV=$venv"
+            echo "IMAGE_REF=$ref"
+            echo "TAGS<<TAGS_EOF"
+            echo "$tags" | sed 's/^ *//'
+            echo "TAGS_EOF"
+          } >> "$GITHUB_ENV"
+          echo "base:  $BASE_INPUT"
+          echo "model: $MODEL_INPUT"
+          echo "venv:  ${venv:-(none)}"
+          echo "tags:"; echo "$tags" | sed 's/^ */  /'
+
       # **THREE ATTEMPTS, AND ONLY THE LAST ONE IS COLD (C13, CF 2026-08-31).** One dropped
       # connection inside a ~4 minute transfer of the 15.68 GB weights layer ended a publish that
       # had both toolchain gates already paid for:
@@ -332,11 +414,12 @@ jobs:
           context: ./handler
           push: true
           platforms: linux/amd64
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          tags: ${{ env.TAGS }}
           build-args: |
-            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            SEEDVR2_MODEL=${{ env.SEEDVR2_MODEL }}
+            PYTHON_VENV=${{ env.PYTHON_VENV }}
+            IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
           # **Registry cache, never type=gha.** The weights layer is ~17 GB and GitHub's Actions
@@ -361,11 +444,12 @@ jobs:
           context: ./handler
           push: true
           platforms: linux/amd64
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          tags: ${{ env.TAGS }}
           build-args: |
-            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            SEEDVR2_MODEL=${{ env.SEEDVR2_MODEL }}
+            PYTHON_VENV=${{ env.PYTHON_VENV }}
+            IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:latest
@@ -381,11 +465,12 @@ jobs:
           context: ./handler
           push: true
           platforms: linux/amd64
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          tags: ${{ env.TAGS }}
           build-args: |
-            IMAGE_REF=${{ env.IMAGE }}:sha-${{ github.sha }}
+            BASE_IMAGE=${{ env.BASE_IMAGE }}
+            SEEDVR2_MODEL=${{ env.SEEDVR2_MODEL }}
+            PYTHON_VENV=${{ env.PYTHON_VENV }}
+            IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
           cache-to: type=inline
@@ -450,7 +535,7 @@ jobs:
       # cannot tell you what it is running — neither can RunPod.
       - name: The tag to pin
         run: |
-          echo "Pin the endpoint to: ${IMAGE}:sha-${GITHUB_SHA}"
+          echo "Pin the endpoint to: ${IMAGE_REF}"
           echo "Record it in docs/deployment.md — RunPod's API will not tell anyone what an endpoint is."
 
       # **The half of the image's identity the image cannot hold.** A digest exists only once the
@@ -466,7 +551,7 @@ jobs:
             echo
             echo '| field | value |'
             echo '|---|---|'
-            echo "| reference | \`${IMAGE}:sha-${GITHUB_SHA}\` |"
+            echo "| reference | \`${IMAGE_REF}\` |"
             # **LAST attempt first.** An earlier attempt that failed after its push completed
             # could still carry a digest, and reading `build` first would record a digest from a
             # build that did not publish while a later one did — every visible signal correct and

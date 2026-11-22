@@ -20,7 +20,21 @@
 # *floor on the host driver*, so a newer CUDA admits fewer machines, not more. Measured when most
 # of the fleet refused to start the container while the sibling worker's `cuda12.4.1` build ran on
 # the same cards. The `NVIDIA_REQUIRE_CUDA` override below is what recovers the pool.
-FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+#
+# **The base is a build argument (X1a, CF 2026-11-22), and its default is the line above byte for
+# byte**, so a build with no arguments is the RunPod image that ships. The one other base ruled is
+# Vast's `mini` PyTorch image for the stills build, pinned to one dated tag and never `latest` —
+# Vast re-dates those monthly. Everything this file asserts below is asserted on either base.
+ARG BASE_IMAGE=runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
+
+# **Where a base keeps its Python in a venv, `python3` and `pip` resolve to it.** Vast's `mini`
+# images install Python 3.11 and their torch into `/venv/main` and leave it off `PATH`, so the
+# Python every assertion below checks would be whatever the Ubuntu underneath ships — the wrong
+# interpreter, with no torch. Pointing `PATH` at the venv is the fix; loosening the 3.11
+# assertion is not. **Empty by default, which leaves the RunPod build's `PATH` byte-identical.**
+ARG PYTHON_VENV=""
+ENV PATH=${PYTHON_VENV:+${PYTHON_VENV}/bin:}${PATH}
 
 # The pinned SeedVR2 commit. The handler drives this exact source's entry points, so a moving
 # checkout would move the worker's accepted values underneath it.
@@ -252,6 +266,22 @@ ENV IMAGE_TAG=${IMAGE_REF} \
 # directory later. `tests/run_local.py` asserts every non-`.py` file here is covered by a line
 # below, so adding a data file and forgetting this is a red suite rather than a quiet floor.
 COPY *.py cards.json ./
+
+# **The torch that runs is the base's, said in the build log (X1a).** SeedVR2's requirements leave
+# `torch` unpinned, which is what lets the base's CUDA build survive the install above — and also
+# what would let a resolver quietly replace it with a PyPI default. So the version, its CUDA and
+# where it was imported from are printed on every build, and **a base that declares its torch
+# (`PYTORCH_VERSION` / `PYTORCH_BACKEND`, as Vast's images do) is held to it.** The RunPod base
+# declares neither, so there this is a reading and not an assertion.
+#
+# Down here rather than beside the install: anything above the bake re-downloads the weights.
+RUN python3 -c "\
+import os, torch; \
+v, c = torch.__version__, torch.version.cuda; \
+print('torch', v, 'cuda', c, 'from', torch.__file__); \
+want, backend = os.environ.get('PYTORCH_VERSION'), os.environ.get('PYTORCH_BACKEND'); \
+assert not want or v.split('+')[0] == want, 'torch %s is not the base image torch %s' % (v, want); \
+assert not backend or v.endswith('+' + backend), 'torch %s is not the base image backend %s' % (v, backend)"
 
 # The handler must import with the heavy chain still lazy — if this ever pulls in torch, the
 # rung-1 suite stops running in CI and nobody finds out until a GPU-less runner fails.
