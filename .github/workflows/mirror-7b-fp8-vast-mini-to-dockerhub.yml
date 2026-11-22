@@ -55,7 +55,7 @@ jobs:
       - name: The source tag still names the pinned digest
         run: |
           set -euo pipefail
-          skopeo inspect --raw "docker://$SOURCE_REPO:$SOURCE_TAG" > /tmp/source-by-tag.json
+          skopeo inspect --raw --no-creds "docker://$SOURCE_REPO:$SOURCE_TAG" > /tmp/source-by-tag.json
           got="sha256:$(sha256sum /tmp/source-by-tag.json | cut -d' ' -f1)"
           echo "source $SOURCE_REPO:$SOURCE_TAG -> $got"
           [ "$got" = "$SOURCE_DIGEST" ] || { echo "the tag now names $got, not the pinned $SOURCE_DIGEST" >&2; exit 1; }
@@ -77,13 +77,18 @@ jobs:
 
       # **Both digests, read back from both registries, anonymously.** The Docker Hub read is
       # anonymous on purpose: it is also the check that Vast can pull it without credentials.
+      # `--no-creds` on every read, so that does not depend on the logout above having run.
       - name: Both registries serve the pinned digest
         run: |
           set -euo pipefail
-          skopeo inspect --raw "docker://$SOURCE_REPO@$SOURCE_DIGEST" > /tmp/source.json
+          skopeo inspect --raw --no-creds "docker://$SOURCE_REPO@$SOURCE_DIGEST" > /tmp/source.json
           source="sha256:$(sha256sum /tmp/source.json | cut -d' ' -f1)"
-          if ! skopeo inspect --raw "docker://$DEST_REPO:$SOURCE_TAG" > /tmp/dest.json; then
-            echo "Docker Hub would not serve $DEST_REPO:$SOURCE_TAG anonymously — is the repository public?" >&2
+          if ! skopeo inspect --raw --no-creds "docker://$DEST_REPO:$SOURCE_TAG" > /tmp/dest.json 2> /tmp/dest.err; then
+            # skopeo's own words first: a 429, a network error and a private repository all land
+            # here, and only one of them is fixed by changing the repository's visibility.
+            cat /tmp/dest.err >&2
+            echo "Docker Hub would not serve $DEST_REPO:$SOURCE_TAG anonymously (skopeo's error above;" >&2
+            echo "a 401/403/404 means the repository is private or missing, a 429 is a rate limit)." >&2
             exit 1
           fi
           dest="sha256:$(sha256sum /tmp/dest.json | cut -d' ' -f1)"
