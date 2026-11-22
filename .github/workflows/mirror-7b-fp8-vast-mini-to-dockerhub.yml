@@ -1,0 +1,101 @@
+# Mirror the BAKED fp8 Vast image from GHCR to Docker Hub — copied, never rebuilt (X5, CF 2026-11-22).
+#
+# **A test, not a move.** The X4 survey measured GHCR at ~73-100 Mbps in Japan, Korea and Taiwan
+# on hosts that pulled 8.97 GB from HuggingFace at 701-830 Mbps. Docker Hub is served from a
+# different CDN; whether it is faster there is what one survey answers. GHCR stays the home of
+# every image until the survey says otherwise.
+#
+# **No inputs.** The source is pinned here by tag AND digest, as X2's callers pin their pairs. The
+# destination namespace is CF's Docker Hub account, read from the repository variable
+# `DOCKERHUB_NAMESPACE`; the credential is the secret pair `DOCKERHUB_USERNAME` /
+# `DOCKERHUB_TOKEN`, read only in the copy step and never echoed.
+#
+# **Same bytes or nothing.** `skopeo copy --all --preserve-digests` copies the index and every
+# manifest under it as they are, and refuses rather than rewrite one; the job then reads both
+# registries and fails unless both digests equal the pin. A rebuilt image would test a different
+# image.
+#
+# **Caveat, by ruling:** the image's `IMAGE_TAG` ENV names the GHCR ref, so a job run from Docker
+# Hub reports the GHCR `build.image`. The digest is identical, so it is the same image.
+name: mirror cf-upscale-7b-fp8-vast-mini to Docker Hub
+run-name: mirror cf-upscale-7b-fp8-vast-mini sha-83444701 to Docker Hub
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# Read-only: nothing here writes to this repository or to GHCR.
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: ghcr.io/eldadran/cf-upscale-7b-fp8-vast-mini
+  SOURCE_TAG: sha-83444701abda72e880dc28e59332a6f7458c6a04
+  SOURCE_DIGEST: sha256:87d9ca024f797eb11be53830c91e7ec0cbe031bcf1297b6361cc1ff1b60a763d
+  DEST_NAME: cf-upscale-7b-fp8-vast-mini
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the destination
+        env:
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: |
+          set -euo pipefail
+          [ -n "$NAMESPACE" ] || { echo "set the repository variable DOCKERHUB_NAMESPACE to CF's Docker Hub account" >&2; exit 1; }
+          echo "DEST_REPO=docker.io/$NAMESPACE/$DEST_NAME" >> "$GITHUB_ENV"
+          echo "destination: docker.io/$NAMESPACE/$DEST_NAME:$SOURCE_TAG"
+
+      # **The pin still holds at the source**: the tag must resolve to the digest written above, or
+      # the copy would mirror whatever the tag points at today.
+      - name: The source tag still names the pinned digest
+        run: |
+          set -euo pipefail
+          skopeo inspect --raw "docker://$SOURCE_REPO:$SOURCE_TAG" > /tmp/source-by-tag.json
+          got="sha256:$(sha256sum /tmp/source-by-tag.json | cut -d' ' -f1)"
+          echo "source $SOURCE_REPO:$SOURCE_TAG -> $got"
+          [ "$got" = "$SOURCE_DIGEST" ] || { echo "the tag now names $got, not the pinned $SOURCE_DIGEST" >&2; exit 1; }
+
+      # **The only step that holds the credential.** Logged in through stdin, never on a command
+      # line, never echoed; the copy reads the auth file the login wrote.
+      - name: Copy by digest
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ] \
+            || { echo "set the secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN" >&2; exit 1; }
+          printf '%s' "$DOCKERHUB_TOKEN" | skopeo login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
+          skopeo copy --all --preserve-digests --retry-times 3 \
+            "docker://$SOURCE_REPO@$SOURCE_DIGEST" "docker://$DEST_REPO:$SOURCE_TAG"
+          skopeo logout docker.io
+
+      # **Both digests, read back from both registries, anonymously.** The Docker Hub read is
+      # anonymous on purpose: it is also the check that Vast can pull it without credentials.
+      - name: Both registries serve the pinned digest
+        run: |
+          set -euo pipefail
+          skopeo inspect --raw "docker://$SOURCE_REPO@$SOURCE_DIGEST" > /tmp/source.json
+          source="sha256:$(sha256sum /tmp/source.json | cut -d' ' -f1)"
+          if ! skopeo inspect --raw "docker://$DEST_REPO:$SOURCE_TAG" > /tmp/dest.json; then
+            echo "Docker Hub would not serve $DEST_REPO:$SOURCE_TAG anonymously — is the repository public?" >&2
+            exit 1
+          fi
+          dest="sha256:$(sha256sum /tmp/dest.json | cut -d' ' -f1)"
+          echo "GHCR       $SOURCE_REPO@$source"
+          echo "Docker Hub $DEST_REPO:$SOURCE_TAG -> $dest"
+          [ "$source" = "$SOURCE_DIGEST" ] && [ "$dest" = "$SOURCE_DIGEST" ] \
+            || { echo "digests differ: pinned $SOURCE_DIGEST, GHCR $source, Docker Hub $dest" >&2; exit 1; }
+          {
+            echo "## Mirrored"
+            echo
+            echo '| registry | reference | digest |'
+            echo '|---|---|---|'
+            echo "| GHCR | \`$SOURCE_REPO:$SOURCE_TAG\` | \`$source\` |"
+            echo "| Docker Hub (anonymous read) | \`$DEST_REPO:$SOURCE_TAG\` | \`$dest\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
