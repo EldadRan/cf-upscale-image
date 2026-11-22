@@ -48,7 +48,9 @@ on:
 # group. Two publishes on one ref still supersede each other — which is what this is for, since
 # they race to push the same `:latest` tag — but nothing that does not publish can cancel one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  # **And on the checkpoint (X1c)**: a stills dispatch and a RunPod dispatch push different tags,
+  # so neither may cancel the other. Empty on a pull request, which publishes nothing.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.seedvr2_model }}
   cancel-in-progress: true
 
 env:
@@ -357,12 +359,16 @@ jobs:
             ref="$IMAGE:sha-$GITHUB_SHA"
             tags="$IMAGE:latest
           $ref"
-          elif [ "$MODEL_INPUT" = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors" ]; then
+          # **The stills tag names a PAIR, so both halves are checked**: the fp8 checkpoint on a Vast
+          # `mini` PyTorch base, as ruled. fp8 on any other base would publish a different image
+          # under the same name and every run record would report it as this one.
+          elif [ "$MODEL_INPUT" = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors" ] \
+               && case "$BASE_INPUT" in vastai/pytorch:*-mini-*) true ;; *) false ;; esac; then
             ref="$IMAGE:sha-$GITHUB_SHA-stills-7b-fp8"
             tags="$ref"
           else
-            echo "no tag names base=$BASE_INPUT model=$MODEL_INPUT — the default pair or the 7B fp8" >&2
-            echo "mixed checkpoint only (X1c). Naming a new variant is an order, not an input." >&2
+            echo "no tag names base=$BASE_INPUT model=$MODEL_INPUT — the default pair, or the 7B fp8" >&2
+            echo "mixed checkpoint on vastai/pytorch:*-mini-* (X1c). A new variant is an order, not an input." >&2
             exit 1
           fi
           # **Vast's images keep Python in `/venv/main`** (the Dockerfile's `PYTHON_VENV` note).
