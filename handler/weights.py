@@ -231,6 +231,9 @@ def _fetch_range(session, url, headers, part, start, end, fetch, attempts, backo
                     block = read(chunk)
                     if not block:
                         break
+                    # Checked again before the write: a range left running after a refusal
+                    # (see `_download`) must not add a byte to a part a later fetch resumes.
+                    fetch.check()
                     handle.write(block)
                     fetch.add(len(block))
             if os.path.getsize(part) == want:
@@ -268,11 +271,11 @@ def _download(url, path, size, token, deadline, max_fetch_s, on_bytes=None, stre
     if os.path.exists(tmp):
         os.remove(tmp)
 
-    # **Room for the download AND the join, checked before a byte moves** (X4 review). Peak use
-    # is the whole file in parts plus the largest part being copied into the joined file.
+    # **Room for the download AND the join, checked before a byte moves** (X4 review). The parts
+    # are kept until the joined file is in place — so a join that fails loses nothing and the
+    # next attempt only joins again — which makes the peak the whole file twice.
     held = sum(os.path.getsize(p) for p in parts if os.path.exists(p))
-    largest = max(end - start + 1 for start, end in spans)
-    need = (size - held) + largest + DISK_MARGIN_BYTES
+    need = (size - held) + size + DISK_MARGIN_BYTES
     free = shutil.disk_usage(os.path.dirname(path) or ".").free
     if free < need:
         raise errors.WorkerError(
@@ -283,7 +286,9 @@ def _download(url, path, size, token, deadline, max_fetch_s, on_bytes=None, stre
     fetch = _Fetch(deadline, max_fetch_s)
     started = time.time()
     reported = -1
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(spans)) as pool:
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(spans))
+    futures, finished = [], False
+    try:
         futures = [pool.submit(_fetch_range, session, url, headers, part, start, end, fetch,
                                attempts or RANGE_ATTEMPTS, backoff or _backoff, chunk or CHUNK,
                                read_timeout or READ_TIMEOUT_S)
@@ -303,17 +308,24 @@ def _download(url, path, size, token, deadline, max_fetch_s, on_bytes=None, stre
                 exc = future.exception()
                 if exc is not None and not isinstance(exc, _Cancelled) and failure is None:
                     failure = exc
+            if failure is None and not pending:
+                break
             if failure is None and time.time() > deadline:
                 failure = TimeoutError("the weights fetch passed its {:.0f} s ceiling".format(
                     max_fetch_s))
             if failure is not None:
-                # One range failed or the ceiling passed: stop the siblings now and close their
-                # sockets, so the refusal does not wait on the slowest of them.
-                fetch.stop()
-                concurrent.futures.wait(futures)
                 raise failure
-            if not pending:
-                break
+        finished = True
+    finally:
+        if not finished:
+            # One range failed, the ceiling passed, or something interrupted this loop: stop the
+            # siblings and shut their sockets, give them a moment, and **do not wait for the
+            # rest**. A range still connecting or waiting for headers has no socket to shut yet
+            # and would hold the refusal for its own timeouts; it is left to exit on its own, and
+            # it writes nothing more, because every write checks the cancel first.
+            fetch.stop()
+            concurrent.futures.wait(futures, timeout=WATCH_S * 2)
+        pool.shutdown(wait=finished, cancel_futures=not finished)
     download_s = time.time() - started
 
     verify_started = time.time()
@@ -325,12 +337,14 @@ def _download(url, path, size, token, deadline, max_fetch_s, on_bytes=None, stre
                     for block in iter(lambda: handle.read(16 * 1024 * 1024), b""):
                         digest.update(block)
                         out.write(block)
-                os.remove(part)
         os.replace(tmp, path)
     except BaseException:
+        # The parts are intact, so the next attempt joins again without downloading anything.
         if os.path.exists(tmp):
             os.remove(tmp)
         raise
+    for part in parts:
+        os.remove(part)
     return fetch.bytes, download_s, digest.hexdigest(), time.time() - verify_started
 
 
@@ -425,16 +439,26 @@ def ensure(model_dir, dit_file, into=None, on_bytes=None, repo_of=None, expected
             url = "{}/{}/resolve/{}/{}".format(endpoint, repo, revision, filename)
             for attempt in range(1, HASH_ATTEMPTS + 1):
                 done_before = record["bytes"]
-                got_bytes, download_s, got_sha, verify_s = _download(
-                    url, path, size, token, deadline, max_fetch_s,
-                    on_bytes=(lambda n, base=done_before: on_bytes(base + n))
-                    if on_bytes else None,
-                    streams=streams, min_range=min_range, attempts=attempts, backoff=backoff,
-                    chunk=chunk, read_timeout=read_timeout)
-                record["bytes"] += got_bytes
+                entry["attempts"] = attempt
+
+                # **The record moves with the bytes**, so a refusal at 8 GB says 8 GB, not 0.
+                def account(n, base=done_before):
+                    record["bytes"] = base + n
+                    if on_bytes is not None:
+                        on_bytes(base + n)
+
+                fetch_started = time.time()
+                try:
+                    got_bytes, download_s, got_sha, verify_s = _download(
+                        url, path, size, token, deadline, max_fetch_s, on_bytes=account,
+                        streams=streams, min_range=min_range, attempts=attempts,
+                        backoff=backoff, chunk=chunk, read_timeout=read_timeout)
+                except BaseException:
+                    record["download_s"] += time.time() - fetch_started
+                    raise
+                record["bytes"] = done_before + got_bytes
                 record["download_s"] += download_s
                 record["verify_s"] += verify_s
-                entry["attempts"] = attempt
                 if os.path.getsize(path) == size and got_sha == sha:
                     _write_marker(path, size, sha, repo, revision)
                     entry["how"] = "downloaded"
