@@ -445,7 +445,7 @@ def build_banner():
     """Which build is running, in the worker's own log.
 
     **The image has always known this and the log has never said it.** `BUILD_COMMIT` is baked
-    into every image's config by CI (`Dockerfile:223`, `docker-publish.yml:282`) and the gate
+    into every image's config by CI (the Dockerfile's build-identity `ARG`s, set by `.github/workflows/build.yml`) and the gate
     reads it back off the registry blob on every verification — but that answers *what did we
     publish*, from outside. A worker log answers *what am I*, from inside, and until now it could
     not: a log pulled off a running endpoint named the host, the slice and the data centre, and

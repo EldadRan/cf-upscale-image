@@ -1,0 +1,29 @@
+# Publish `ghcr.io/<owner>/cf-upscale-7b-fp16-runpod` — the RunPod worker: 7B fp16 on `runpod/pytorch`, the Dockerfile's no-argument build.
+#
+# **X2 (CF, 2026-11-22): one workflow per image, named by the model it holds and the base it is built
+# on**, so every row in the Actions list says which image it made. No inputs: the pair is written
+# here, and `build.yml` refuses a package name that does not describe it. The build itself is
+# `build.yml`, shared by every caller; nothing about HOW an image is built belongs in this file.
+name: publish cf-upscale-7b-fp16-runpod
+run-name: publish cf-upscale-7b-fp16-runpod @ ${{ github.ref_name }} ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+
+# **Its own group, so the two images never cancel each other**; two dispatches of THIS image on one
+# ref still supersede, since they race to push the same `:latest`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      package: cf-upscale-7b-fp16-runpod
+      base_image: runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+      seedvr2_model: seedvr2_ema_7b_fp16.safetensors

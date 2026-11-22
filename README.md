@@ -43,7 +43,19 @@ producing a different image.
 
 ## Building
 
-The workflow has **no `push` trigger, deliberately** — not every commit is meant to become an
+**One image per model and base, each named for both (X2, CF 2026-11-22): `cf-upscale-<model>-<base>`.**
+Each has its own workflow, dispatched by hand with no inputs, and its own package:
+
+| workflow | package | base | checkpoint |
+|---|---|---|---|
+| `publish-7b-fp16-runpod.yml` | `cf-upscale-7b-fp16-runpod` | `runpod/pytorch` | 7B fp16 — the RunPod worker |
+| `publish-7b-fp8-vast-mini.yml` | `cf-upscale-7b-fp8-vast-mini` | Vast `vastai/pytorch` mini | 7B fp8 mixed — Vast stills |
+
+Both call one reusable build, `.github/workflows/build.yml`, which refuses a package name that
+does not describe the pair it is given. The older `cf-upscale-image` package is left as it was;
+the endpoints pinned to it stay pinned until they are re-pinned.
+
+The workflows have **no `push` trigger, deliberately** — not every commit is meant to become an
 image. Builds are dispatched on purpose, from the Actions tab, and a pull request never publishes.
 
 `publish` is gated on `toolchain-gate` (`needs: toolchain-gate`), which installs the pinned ffmpeg
@@ -51,11 +63,12 @@ and asserts that `libwebp`, `libx264` and `use_metadata_tags` are present before
 A bad pin costs seconds that way rather than a full build — and the assertion is only meaningful
 because the gate installs the exact binary the image will carry, not a distribution's.
 
-A dispatched build publishes two tags to GHCR:
+A dispatched build publishes two tags into its own package on GHCR, and caches from its own
+`:latest`:
 
 ```
-ghcr.io/<owner>/cf-upscale-image:latest
-ghcr.io/<owner>/cf-upscale-image:sha-<commit>
+ghcr.io/<owner>/cf-upscale-<model>-<base>:latest
+ghcr.io/<owner>/cf-upscale-<model>-<base>:sha-<commit>
 ```
 
 **Endpoints pin the `sha-` tag, never `latest`.** `latest` moves, and a worker that pulled it
@@ -63,10 +76,10 @@ cannot say afterwards which build it ran. The image stamps its own `BUILD_COMMIT
 and `BUILD_UTC` at build time and reports them in every run record, so a measurement can always
 be traced to the bytes that produced it.
 
-Expect a build to take tens of minutes and produce an image of roughly 24 GiB; the weights are
-most of it.
+Expect a build to take tens of minutes. The 7B fp16 RunPod image is roughly 24 GiB compressed and
+the 7B fp8 Vast image roughly 12.5 GiB; the weights are most of either.
 
-To build the same thing locally:
+To build the RunPod image locally (the Dockerfile's no-argument build):
 
 ```
 docker build handler/

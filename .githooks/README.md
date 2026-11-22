@@ -52,7 +52,7 @@ the hook itself and is not fixed by the narrowing.
 so the `handler/vendor/` exclusion has never been exercised by a real range. A commit invented
 to turn it green would test the invention, so the note stays instead.
 
-**Nothing here enters the image.** `docker-publish.yml` builds with `context: ./handler`, so a
+**Nothing here enters the image.** `.github/workflows/build.yml` builds with `context: ./handler`, so a
 top-level directory is outside the build context by construction.
 
 Bypass for a genuine emergency is git's own: `git push --no-verify`.

@@ -1,4 +1,4 @@
-# Build and publish the CF upscale worker to GHCR.
+# Build and publish one CF upscale worker image to GHCR — called by a publish-<model>-<base> workflow.
 #
 # **The toolchain gates the publish**, so a bad ffmpeg pin ships nothing and a pull request never
 # publishes. CI publishes; the endpoint is pinned to a sha; that sha is the only link between
@@ -9,49 +9,36 @@
 # locally before a dispatch is ordered — its green run is quoted in the dispatch order, which
 # makes it evidence rather than a claim. What CI keeps is the half of the old gate that needs no
 # test tree: the pinned ffmpeg and the capabilities the encode path depends on.
-name: cf-upscale-image
+name: build (reusable)
 
+# **X2 (CF, 2026-11-22): this file is the one build, and it publishes nothing on its own.** Each
+# image has its own caller, named by the model it holds and the base it is built on —
+# `publish-7b-fp16-runpod.yml`, `publish-7b-fp8-vast-mini.yml` — and each publishes into its own
+# package, `cf-upscale-<model>-<base>`. The callers are a few lines each and carry no inputs: the
+# base and the checkpoint are written in the caller, so the Actions list and the package page both
+# say which image a run made. **The build logic stays here, in one file.**
+#
+# **No `concurrency` here, deliberately.** Each caller holds its own group, keyed on its own name,
+# so the two images never cancel each other; a group repeated in a called workflow with the same
+# key deadlocks against its caller.
+#
+# **No `pull_request` trigger any more.** It used to run the toolchain gate on a pull request;
+# the callers are dispatch-only by ruling. The suite runs locally before a dispatch is ordered.
 on:
-  # **No `push` trigger, deliberately.** Not every push is meant to be tested on CI and none of
-  # them is meant to produce an image: work lands in several commits and gets built once, when
-  # somebody decides it is ready. The suite runs on a laptop in seconds, which is where a push
-  # should be checked.
-  #
-  # It used to trigger on pushes touching `handler/**` or `tests/**` back when both lived here,
-  # and the `publish` job was
-  # already gated to `workflow_dispatch` — so those runs never built anything. They still did
-  # damage: a one-minute test run shares the concurrency group below with an in-flight publish and
-  # **cancelled it**. A stray commit killed a build that had been asked for on purpose, twice in
-  # one session.
-  pull_request:
-  # **Two inputs, defaulting to what ships today (X1c, CF 2026-11-22)**: the base image and the
-  # baked checkpoint, both Dockerfile build arguments. **The defaults are copies of the
-  # Dockerfile's `ARG` defaults and `tests/run_local.py` asserts they agree**; the tag step below
-  # also compares the inputs against the Dockerfile itself, so a drifted default is a refused or
-  # renamed build rather than a quiet one. A dispatch with no inputs is the RunPod build, unchanged.
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      package:
+        description: "the package this build publishes into: cf-upscale-<model>-<base>"
+        type: string
+        required: true
       base_image:
         description: "BASE_IMAGE build argument — a pinned, dated tag; never :latest"
         type: string
-        default: runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+        required: true
       seedvr2_model:
         description: "SEEDVR2_MODEL build argument — the one checkpoint baked into the image"
         type: string
-        default: seedvr2_ema_7b_fp16.safetensors
-
-# **One build per ref at a time, and the newest wins.** Two pushes in quick succession otherwise
-# run two publishes concurrently, racing to push the same `:latest` tag — the loser can land last
-# and leave `:latest` pointing at the older commit. It also doubles a ~40 minute build's cost for
-# a result nobody wants. Superseded runs are cancelled rather than left to finish.
-# **Keyed on the event as well as the ref**, so a test run and a publish are never in the same
-# group. Two publishes on one ref still supersede each other — which is what this is for, since
-# they race to push the same `:latest` tag — but nothing that does not publish can cancel one.
-concurrency:
-  # **And on the checkpoint (X1c)**: a stills dispatch and a RunPod dispatch push different tags,
-  # so neither may cancel the other. Empty on a pull request, which publishes nothing.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.seedvr2_model }}
-  cancel-in-progress: true
+        required: true
 
 env:
   # Python 3.11 because that is what the base image ships. **It has exactly one consumer left:**
@@ -219,7 +206,7 @@ jobs:
     # So: `workflow_dispatch` from `main`, behind the toolchain gate, and a pull request still
     # never publishes. **The contract suite is green before a dispatch is ordered, not because
     # this workflow ran it** — it runs locally against the private repository's harness and its
-    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run docker-publish.yml -R eldadran/cf-upscale-image --ref main`.
+    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run publish-7b-fp16-runpod.yml -R eldadran/cf-upscale-image --ref main` (or `publish-7b-fp8-vast-mini.yml`).
     # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
     # it can only be pinned to a sha that somebody chose to build.
     # **Two conditions, and neither is the redundant one.** The ref refuses a `workflow_dispatch`
@@ -227,7 +214,9 @@ jobs:
     # event refuses a trigger that fires on its own: it held while `push:` was live (see `on:`
     # above) and would hold again if one returned. Trim the ref and a dispatch from any branch
     # publishes, today. Trim the event and nothing stops a self-firing trigger the day one is
-    # added back.
+    # added back. **In a called workflow both read the CALLER's run** — `github.event_name` is the
+    # caller's `workflow_dispatch` and `github.ref` the ref it was dispatched on — so the two
+    # conditions mean exactly what they meant when this was one workflow.
     if: >-
       github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -312,95 +301,85 @@ jobs:
       # A GHCR repository name must be lowercase and a GitHub owner name need not be, so the
       # name is folded rather than interpolated — otherwise the build runs and *then* fails on
       # the push with `repository name must be lowercase`.
-      - name: Compute the image name
+      - name: Stamp the build time
         run: |
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           # Stamped here rather than in the Dockerfile: a `date` inside a RUN would be a new
           # value on every layer rebuild and would invalidate everything below it.
           echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
-      # **A non-default build can never be mistaken for the RunPod image (X1c).** The default pair
-      # gets today's tags, `:latest` and `:sha-<commit>`. The 7B fp8 mixed checkpoint gets
-      # `:sha-<commit>-stills-7b-fp8` and NEVER `:latest` — `:latest` is also the build cache
-      # every RunPod publish reads.
+      # **The package is named by the pair it holds, and this step refuses any other (X2, CF
+      # 2026-11-22).** The caller names the package; this step derives the name the pair SHOULD have
+      # — `cf-upscale-<model>-<base>`, model `7b-fp16` / `7b-fp8`, base `runpod` (`runpod/pytorch`)
+      # / `vast-mini` (`vastai/pytorch:*-mini-*`) — and refuses a mismatch, so a package can never
+      # hold an image its name does not describe. A new pair is a new name and a new caller, by order.
       #
-      # **Each variant caches from its own moving tag (X1d, CF 2026-11-22).** `:latest` is the RunPod
-      # image on another base, so a stills build reading it matched nothing and was cold every time.
-      # A stills build therefore also tags `:stills-7b-fp8`, that variant's `:latest`: what its
-      # next build reads its cache from, never a pin. `CACHE_REF` is chosen here, beside the tags,
-      # and attempts one and two read it; attempt three stays cold. **Any other pair is refused**, because no tag names it.
+      # **Every package gets plain `:latest` and `:sha-<commit>`, and caches from its own `:latest`.**
+      # The package is the variant, so no tag suffix and no cache choice. `IMAGE_REF` — what the
+      # image reports as `build.image` on every run record — names its own package.
       #
-      # "Default" is read from `handler/Dockerfile`, not from the input defaults above, so this
-      # compares against what a no-argument build would actually bake. `IMAGE_REF` is what the
-      # image reports as `build.image` on every run record, so the test job names its own tag.
+      # **`cf-upscale-7b-fp16-runpod` is the Dockerfile's no-argument build**, read from
+      # `handler/Dockerfile` itself, so a drifted caller is refused rather than shipped.
       #
       # Inputs arrive through `env:`, never interpolated into the script, so a value cannot run.
-      - name: Compute the tags, and refuse a combination no tag names
+      - name: Compute the tags, and refuse a pair the package name does not describe
         env:
+          PACKAGE: ${{ inputs.package }}
           BASE_INPUT: ${{ inputs.base_image }}
           MODEL_INPUT: ${{ inputs.seedvr2_model }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          refuse() { echo "$*" >&2; exit 1; }
           default_base=$(sed -n 's/^ARG BASE_IMAGE=//p' handler/Dockerfile)
           default_model=$(sed -n 's/^ARG SEEDVR2_MODEL=//p' handler/Dockerfile)
-          if [ -z "$default_base" ] || [ -z "$default_model" ]; then
-            echo "could not read the BASE_IMAGE / SEEDVR2_MODEL defaults from handler/Dockerfile" >&2
-            exit 1
-          fi
-          if [ -z "$BASE_INPUT" ] || [ -z "$MODEL_INPUT" ]; then
-            echo "base_image and seedvr2_model must both be set (got '$BASE_INPUT' / '$MODEL_INPUT')" >&2
-            exit 1
-          fi
+          [ -n "$default_base" ] && [ -n "$default_model" ] \
+            || refuse "could not read the BASE_IMAGE / SEEDVR2_MODEL defaults from handler/Dockerfile"
+          [ -n "$PACKAGE" ] && [ -n "$BASE_INPUT" ] && [ -n "$MODEL_INPUT" ] \
+            || refuse "package, base_image and seedvr2_model must all be set"
           # A base is pinned to a dated tag. `latest`, or no tag at all, moves under the build.
           case "$BASE_INPUT" in
-            *:latest|*@latest) echo "base_image $BASE_INPUT is :latest — pin a dated tag" >&2; exit 1 ;;
+            *:latest|*@latest) refuse "base_image $BASE_INPUT is :latest — pin a dated tag" ;;
           esac
           # The last path segment holds the tag or the digest; a bare name holds neither.
           case "${BASE_INPUT##*/}" in
             *:*) ;;
-            *) echo "base_image $BASE_INPUT carries no tag — pin a dated one" >&2; exit 1 ;;
+            *) refuse "base_image $BASE_INPUT carries no tag — pin a dated one" ;;
           esac
-          if [ "$BASE_INPUT" = "$default_base" ] && [ "$MODEL_INPUT" = "$default_model" ]; then
-            ref="$IMAGE:sha-$GITHUB_SHA"
-            cache="$IMAGE:latest"
-            tags="$IMAGE:latest
-          $ref"
-          # **The stills tag names a PAIR, so both halves are checked**: the fp8 checkpoint on a Vast
-          # `mini` PyTorch base, as ruled. fp8 on any other base would publish a different image
-          # under the same name and every run record would report it as this one.
-          elif [ "$MODEL_INPUT" = "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors" ] \
-               && case "$BASE_INPUT" in vastai/pytorch:*-mini-*) true ;; *) false ;; esac; then
-            ref="$IMAGE:sha-$GITHUB_SHA-stills-7b-fp8"
-            cache="$IMAGE:stills-7b-fp8"
-            tags="$ref
-          $cache"
-          else
-            echo "no tag names base=$BASE_INPUT model=$MODEL_INPUT — the default pair, or the 7B fp8" >&2
-            echo "mixed checkpoint on vastai/pytorch:*-mini-* (X1c). A new variant is an order, not an input." >&2
-            exit 1
-          fi
+          case "$MODEL_INPUT" in
+            seedvr2_ema_7b_fp16.safetensors) model_label=7b-fp16 ;;
+            seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors) model_label=7b-fp8 ;;
+            *) refuse "no model label for $MODEL_INPUT — a new checkpoint is an order, not an input" ;;
+          esac
           # **Vast's images keep Python in `/venv/main`** (the Dockerfile's `PYTHON_VENV` note).
-          # Empty for every other base, which is the Dockerfile's own default.
           case "$BASE_INPUT" in
-            vastai/*) venv=/venv/main ;;
-            *) venv= ;;
+            runpod/pytorch:*) base_label=runpod; venv= ;;
+            vastai/pytorch:*-mini-*) base_label=vast-mini; venv=/venv/main ;;
+            *) refuse "no base label for $BASE_INPUT — a new base is an order, not an input" ;;
           esac
+          want="cf-upscale-$model_label-$base_label"
+          [ "$PACKAGE" = "$want" ] \
+            || refuse "package $PACKAGE does not describe this pair — it would be $want"
+          if [ "$PACKAGE" = "cf-upscale-7b-fp16-runpod" ] \
+             && { [ "$BASE_INPUT" != "$default_base" ] || [ "$MODEL_INPUT" != "$default_model" ]; }; then
+            refuse "cf-upscale-7b-fp16-runpod is the Dockerfile's no-argument build; got $BASE_INPUT / $MODEL_INPUT"
+          fi
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$PACKAGE"
+          ref="$IMAGE:sha-$GITHUB_SHA"
           {
+            echo "IMAGE=$IMAGE"
             echo "BASE_IMAGE=$BASE_INPUT"
             echo "SEEDVR2_MODEL=$MODEL_INPUT"
             echo "PYTHON_VENV=$venv"
             echo "IMAGE_REF=$ref"
-            echo "CACHE_REF=$cache"
             echo "TAGS<<TAGS_EOF"
-            echo "$tags" | sed 's/^ *//'
+            echo "$IMAGE:latest"
+            echo "$ref"
             echo "TAGS_EOF"
           } >> "$GITHUB_ENV"
-          echo "base:  $BASE_INPUT"
-          echo "model: $MODEL_INPUT"
-          echo "venv:  ${venv:-(none)}"
-          echo "cache: $cache"
-          echo "tags:"; echo "$tags" | sed 's/^ */  /'
+          echo "package: $PACKAGE"
+          echo "base:    $BASE_INPUT"
+          echo "model:   $MODEL_INPUT"
+          echo "venv:    ${venv:-(none)}"
+          echo "tags:    $IMAGE:latest $ref"
 
       # **THREE ATTEMPTS, AND ONLY THE LAST ONE IS COLD (C13, CF 2026-08-31).** One dropped
       # connection inside a ~4 minute transfer of the 15.68 GB weights layer ended a publish that
@@ -444,13 +423,12 @@ jobs:
           # while evicting whatever else was there. The media worker uses type=gha and is right
           # to; it has nothing large to cache. Do not copy that line from it.
           #
-          # **Inline, against the variant's own moving tag (`CACHE_REF`: `:latest` for the RunPod
-          # build, `:stills-7b-fp8` for stills — X1d), not a separate `:buildcache` tag.** `mode=max` to a second
+          # **Inline, against this package's own `:latest` (X2), not a separate `:buildcache` tag.** `mode=max` to a second
           # tag exports every intermediate layer — but this Dockerfile is single-stage and linear,
           # so every one of those layers is already in the published image. It bought a duplicate
           # ~42 GB push and the disk to stage it, to cache what the image caches for free. Inline
           # metadata rides in the image itself and gives the same handler-only rebuild.
-          cache-from: type=registry,ref=${{ env.CACHE_REF }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
           cache-to: type=inline
 
       # Attempt two, identical to attempt one. This is where a dropped connection is meant to end.
@@ -470,7 +448,7 @@ jobs:
             IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
-          cache-from: type=registry,ref=${{ env.CACHE_REF }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
           cache-to: type=inline
 
       # **Attempt three has no `cache-from` at all**, so a cache that cannot be read stops being
@@ -505,11 +483,11 @@ jobs:
             echo
             echo "| attempt | cache | outcome |"
             echo "|---|---|---|"
-            echo "| 1 | registry, from ${CACHE_REF} | ${{ steps.build.outcome }} |"
+            echo "| 1 | registry, from ${IMAGE}:latest | ${{ steps.build.outcome }} |"
             # `skipped` is what a step that did not run reports, and it is a non-empty string —
             # so a `|| 'not needed'` fallback beside it never fired and the table did not say
             # what it looked like it said. The outcome is printed as it is.
-            echo "| 2 (retry) | registry, from ${CACHE_REF} | ${{ steps.retry.outcome }} |"
+            echo "| 2 (retry) | registry, from ${IMAGE}:latest | ${{ steps.retry.outcome }} |"
             echo "| 3 (cold) | NONE — weights rebuilt | ${{ steps.cold.outcome }} |"
             echo
             if [ "${{ steps.cold.outcome }}" = "success" ]; then
